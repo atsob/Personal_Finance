@@ -49,7 +49,21 @@ def get_hist_net_worth_data(start_date):
             ), 0) as balance_at_date
         FROM dates dt
         CROSS JOIN Accounts a
-        WHERE a.Accounts_Type IN ('Cash', 'Checking', 'Savings', 'Credit Card', 'Loan', 'Other')
+        WHERE a.Accounts_Type NOT IN ('Brokerage', 'Pension', 'Other Investment', 'Margin', 'Real Estate', 'Vehicle', 'Asset', 'Liability')
+        UNION ALL
+        SELECT 
+            dt.d as date,
+            a.Accounts_Id,
+            a.Currencies_Id,
+            a.Account_Balance - COALESCE((
+                SELECT SUM(Total_Amount) 
+                FROM Bank_Transactions 
+                WHERE Accounts_Id = a.Accounts_Id 
+                AND Date > dt.d
+            ), 0) as balance_at_date
+        FROM dates dt
+        CROSS JOIN Accounts a
+        WHERE a.Accounts_Type IN ('Other Investment')        
     ),
     historical_pension AS (
         SELECT 

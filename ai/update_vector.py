@@ -9,6 +9,7 @@ from config.settings import ENV_CONFIG, OLLAMA_URL
 client = Client(host=OLLAMA_URL)
 
 def update_embeddings(table_name, text_template, id_col, conn, cur):
+    CHUNK_SIZE = 25  # Small size for devices with low memory (Pi/Mobile)
     # text_template: a function that creates the string
     try:
         if table_name == "Bank_Transactions":
@@ -154,30 +155,42 @@ def update_embeddings(table_name, text_template, id_col, conn, cur):
         columns = [desc[0] for desc in cur.description]
         rows = cur.fetchall()
 
-        for row in rows:
-            data = dict(zip(columns, row))
-            # We create a human-readable description from the row data
-            context_text = text_template(data)
+        if not rows:
+            return
+
+        data_list = [dict(zip(columns, row)) for row in rows]
+        total_rows = len(data_list)
+        
+        print(f"Processing {total_rows} rows for {table_name} in chunks of {CHUNK_SIZE}...")
+
+        # Divide the list in chunks of {CHUNK_SIZE}
+        for i in range(0, total_rows, CHUNK_SIZE):
+            chunk = data_list[i : i + CHUNK_SIZE]
+            chunk_texts = [text_template(item) for item in chunk]
             
-            print(f"Embedding for: {context_text}")
+            # Κλήση στο Ollama για το τρέχον πακέτο
+            response = client.embed(
+                model="nomic-embed-text", 
+                input=chunk_texts
+            )
             
-        #    # CORRECTION: Usage of context_text instead of text
-        #    response = client.embeddings(model="nomic-embed-text", prompt=context_text)
+            embeddings_list = response["embeddings"]
 
-            response_new = client.embed(model="nomic-embed-text", input=context_text)
-            embedding = response_new["embeddings"][0]
+            # Update in the database for each item in the current chunk
+            for idx, item in enumerate(chunk):
+                cur.execute(
+                    f"UPDATE {table_name} SET embedding = %s WHERE {id_col} = %s", 
+                    (embeddings_list[idx], item[id_col])
+                )
+            
+            # Commit per chunk to save the results incrementally
+            conn.commit()
+            print(f"   Completed {min(i + CHUNK_SIZE, total_rows)}/{total_rows} rows...")
 
-        #    cur.execute(f"UPDATE {table_name} SET embedding = %s WHERE {id_col} = %s", 
-        #                (response["embedding"], data[id_col]))
-
-            cur.execute(f"UPDATE {table_name} SET embedding = %s WHERE {id_col} = %s", 
-                        (embedding, data[id_col]))
-
-
-        conn.commit()
     except Exception as e:
         print(f"Warning: Could not update embeddings for {table_name}: {e}")
         conn.rollback()
+
 
 # --- Example templates for your database ---
 
