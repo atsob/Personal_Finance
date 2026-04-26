@@ -3,104 +3,113 @@ import streamlit as st
 from psycopg2.extras import execute_values
 from database.connection import get_connection
 
+def execute_db_save(df_original, df_edited, table_name, id_col, current_acc_id=None, conn=None):
+    """Save changes from data editor to database."""
+    if conn is None:
+        conn = get_connection()
+    cur = conn.cursor()
+    try:
+        original_ids = set(df_original[id_col].dropna().unique())
+        edited_ids = set(df_edited[id_col].dropna().unique())
+        ids_to_delete = [int(x) for x in (original_ids - edited_ids) if pd.notna(x)]
+        
+        # If deleting Transactions, also handle mirrored transfers
+        if ids_to_delete and table_name == "Transactions":
+            for deleted_id in ids_to_delete:
+                deleted_row = df_original[df_original[id_col] == deleted_id].iloc[0]
+                if pd.notna(deleted_row.get('transfers_id')) and deleted_row['transfers_id']:
+                    # It's a transfer, find and delete the mirrored transaction using Transfers_Id
+                    transfers_id = deleted_row['transfers_id']
+                    # Find the other transaction in this transfer pair
+                    cur.execute("""
+                        SELECT transactions_id FROM Transactions 
+                        WHERE transfers_id = %s AND transactions_id != %s
+                    """, (int(transfers_id), int(deleted_id)))
+                    mirrored_row = cur.fetchone()
+                    if mirrored_row:
+                        mirrored_id = mirrored_row[0]
+                        cur.execute("DELETE FROM Splits WHERE transactions_id = %s", (mirrored_id,))
+                        cur.execute("DELETE FROM Transactions WHERE transactions_id = %s", (mirrored_id,))
+            
+            if ids_to_delete:
+                cur.execute("DELETE FROM Splits WHERE transactions_id IN %s", (tuple(ids_to_delete),))
+                cur.execute(f"DELETE FROM {table_name} WHERE {id_col} IN %s", (tuple(ids_to_delete),))
+        elif ids_to_delete:
+            if table_name == "Transactions":
+                cur.execute("DELETE FROM Splits WHERE transactions_id IN %s", (tuple(ids_to_delete),))
+            cur.execute(f"DELETE FROM {table_name} WHERE {id_col} IN %s", (tuple(ids_to_delete),))
+        
+        df_new = df_edited[df_edited[id_col].isna() | df_edited[id_col].isnull()].copy()
+        df_updates = df_edited[df_edited[id_col].notna()].copy()
+        
+        if not df_updates.empty:
+            cols = [c for c in df_updates.columns.tolist() if c != id_col]
+            for _, row in df_updates.iterrows():
+                set_clause = ", ".join([f"{c} = %s" for c in cols])
+                sql_upd = f"UPDATE {table_name} SET {set_clause} WHERE {id_col} = %s"
+
+            #    vals = [None if pd.isna(row[c]) else row[c] for c in cols]
+
+                # Instead of vals = [None if pd.isna(row[c]) else row[c] for c in cols]
+                vals = []
+                for c in cols:
+                    val = row[c]
+                    if pd.isna(val):
+                        vals.append(None)
+                    elif hasattr(val, 'item'): # Μετατρέπει numpy types σε python types
+                        vals.append(val.item())
+                    else:
+                        vals.append(val)
+
+
+                vals.append(int(row[id_col]))
+                cur.execute(sql_upd, tuple(vals))
+        
+        if not df_new.empty:
+            cols_new = [c for c in df_new.columns.tolist() if c != id_col]
+            for _, row in df_new.iterrows():
+                placeholders = ", ".join(["%s"] * len(cols_new))
+                sql_ins = f"INSERT INTO {table_name} ({', '.join(cols_new)}) VALUES ({placeholders})"
+
+            #    vals = [None if pd.isna(row[c]) else row[c] for c in cols_new]
+
+                # Instead of: vals = [None if pd.isna(row[c]) else row[c] for c in cols_new]
+                vals = []
+                for c in cols_new:
+                    val = row[c]
+                    if pd.isna(val):
+                        vals.append(None)
+                    elif hasattr(val, 'item'):
+                        vals.append(val.item())
+                    else:
+                        vals.append(val)
+
+
+                cur.execute(sql_ins, tuple(vals))
+        
+        conn.commit()
+        
+        if table_name == "Transactions" and current_acc_id:
+            update_accounts_balances(current_acc_id)
+            st.session_state.balance_update_counter = st.session_state.get('balance_update_counter', 0) + 1
+        
+        st.success(f"Saved: {len(df_updates)} updates, {len(df_new)} new, {len(ids_to_delete)} deletions")
+        st.rerun()
+        
+    except Exception as e:
+        conn.rollback()
+        st.error(f"Error: {e}")
+        st.exception(e)
+
 def save_changes(df_original, df_edited, table_name, id_col, current_acc_id=None, conn=None):
     """Save changes from data editor to database."""
     if st.button(f"💾 Save {table_name}"):
-        if conn is None:
-            conn = get_connection()
-        cur = conn.cursor()
-        try:
-            original_ids = set(df_original[id_col].dropna().unique())
-            edited_ids = set(df_edited[id_col].dropna().unique())
-            ids_to_delete = [int(x) for x in (original_ids - edited_ids) if pd.notna(x)]
-            
-            # If deleting Bank_Transactions, also handle mirrored transfers
-            if ids_to_delete and table_name == "Bank_Transactions":
-                for deleted_id in ids_to_delete:
-                    deleted_row = df_original[df_original[id_col] == deleted_id].iloc[0]
-                    if pd.notna(deleted_row.get('transfer_id')) and deleted_row['transfer_id']:
-                        # It's a transfer, find and delete the mirrored transaction using Transfer_Id
-                        transfer_id = deleted_row['transfer_id']
-                        # Find the other transaction in this transfer pair
-                        cur.execute("""
-                            SELECT bank_transactions_id FROM Bank_Transactions 
-                            WHERE transfer_id = %s AND bank_transactions_id != %s
-                        """, (int(transfer_id), int(deleted_id)))
-                        mirrored_row = cur.fetchone()
-                        if mirrored_row:
-                            mirrored_id = mirrored_row[0]
-                            cur.execute("DELETE FROM Bank_Transaction_Splits WHERE bank_transactions_id = %s", (mirrored_id,))
-                            cur.execute("DELETE FROM Bank_Transactions WHERE bank_transactions_id = %s", (mirrored_id,))
-                
-                if ids_to_delete:
-                    cur.execute("DELETE FROM Bank_Transaction_Splits WHERE bank_transactions_id IN %s", (tuple(ids_to_delete),))
-                    cur.execute(f"DELETE FROM {table_name} WHERE {id_col} IN %s", (tuple(ids_to_delete),))
-            elif ids_to_delete:
-                if table_name == "Bank_Transactions":
-                    cur.execute("DELETE FROM Bank_Transaction_Splits WHERE bank_transactions_id IN %s", (tuple(ids_to_delete),))
-                cur.execute(f"DELETE FROM {table_name} WHERE {id_col} IN %s", (tuple(ids_to_delete),))
-            
-            df_new = df_edited[df_edited[id_col].isna() | df_edited[id_col].isnull()].copy()
-            df_updates = df_edited[df_edited[id_col].notna()].copy()
-            
-            if not df_updates.empty:
-                cols = [c for c in df_updates.columns.tolist() if c != id_col]
-                for _, row in df_updates.iterrows():
-                    set_clause = ", ".join([f"{c} = %s" for c in cols])
-                    sql_upd = f"UPDATE {table_name} SET {set_clause} WHERE {id_col} = %s"
-
-                #    vals = [None if pd.isna(row[c]) else row[c] for c in cols]
-
-                    # Instead of vals = [None if pd.isna(row[c]) else row[c] for c in cols]
-                    vals = []
-                    for c in cols:
-                        val = row[c]
-                        if pd.isna(val):
-                            vals.append(None)
-                        elif hasattr(val, 'item'): # Μετατρέπει numpy types σε python types
-                            vals.append(val.item())
-                        else:
-                            vals.append(val)
-
-
-                    vals.append(int(row[id_col]))
-                    cur.execute(sql_upd, tuple(vals))
-            
-            if not df_new.empty:
-                cols_new = [c for c in df_new.columns.tolist() if c != id_col]
-                for _, row in df_new.iterrows():
-                    placeholders = ", ".join(["%s"] * len(cols_new))
-                    sql_ins = f"INSERT INTO {table_name} ({', '.join(cols_new)}) VALUES ({placeholders})"
-
-                #    vals = [None if pd.isna(row[c]) else row[c] for c in cols_new]
-
-                    # Instead of: vals = [None if pd.isna(row[c]) else row[c] for c in cols_new]
-                    vals = []
-                    for c in cols_new:
-                        val = row[c]
-                        if pd.isna(val):
-                            vals.append(None)
-                        elif hasattr(val, 'item'):
-                            vals.append(val.item())
-                        else:
-                            vals.append(val)
-
-
-                    cur.execute(sql_ins, tuple(vals))
-            
-            conn.commit()
-            
-            if table_name == "Bank_Transactions" and current_acc_id:
-                update_account_balances(current_acc_id)
-                st.session_state.balance_update_counter = st.session_state.get('balance_update_counter', 0) + 1
-            
-            st.success(f"Saved: {len(df_updates)} updates, {len(df_new)} new, {len(ids_to_delete)} deletions")
+        success, msg = execute_db_save(df_original, df_edited, table_name, id_col, current_acc_id, conn)
+        if success:
+            st.success(msg)
             st.rerun()
-            
-        except Exception as e:
-            conn.rollback()
-            st.error(f"Error: {e}")
-            st.exception(e)
+        else:
+            st.error(msg)
 
 def save_changes_no_serial(df_original, df_edited, table_name, id_col):
     """Save changes for tables without serial ID."""
@@ -110,7 +119,7 @@ def save_changes_no_serial(df_original, df_edited, table_name, id_col):
         try:
             if table_name == "Historical_FX":
                 def get_keys(df):
-                    return set(df.apply(lambda r: f"{int(r['base_currency_id'])}|{int(r['target_currency_id'])}|{r['fx_date']}", axis=1))
+                    return set(df.apply(lambda r: f"{int(r['currencies_id_1'])}|{int(r['currencies_id_2'])}|{r['date']}", axis=1))
                 
                 original_keys = get_keys(df_original)
                 edited_keys = get_keys(df_edited)
@@ -120,14 +129,14 @@ def save_changes_no_serial(df_original, df_edited, table_name, id_col):
                     b_id, t_id, f_date = key.split('|')
                     cur.execute(f"""
                         DELETE FROM {table_name} 
-                        WHERE base_currency_id = %s AND target_currency_id = %s AND fx_date = %s
+                        WHERE currencies_id_1 = %s AND currencies_id_2 = %s AND date = %s
                     """, (int(b_id), int(t_id), f_date))
             
             cols = df_edited.columns.tolist()
             data_tuples = [tuple(None if pd.isna(v) else v for v in row) for row in df_edited.values]
             
             if table_name == "Historical_FX":
-                conflict_target = "base_currency_id, target_currency_id, fx_date"
+                conflict_target = "currencies_id_1, currencies_id_2, date"
                 update_cols = ["fx_rate"]
             else:
                 conflict_target = id_col
@@ -154,9 +163,9 @@ def save_changes_mid(df_edited, table_name, id_cols, filter_col=None, filter_val
         cur = conn.cursor()
         try:
             if filter_col and filter_val:
-                current_dates = df_edited['price_date'].dropna().tolist()
+                current_dates = df_edited['date'].dropna().tolist()
                 if current_dates:
-                    cur.execute(f"DELETE FROM {table_name} WHERE {filter_col} = %s AND price_date NOT IN %s",
+                    cur.execute(f"DELETE FROM {table_name} WHERE {filter_col} = %s AND date NOT IN %s",
                                 (filter_val, tuple(current_dates)))
                 else:
                     cur.execute(f"DELETE FROM {table_name} WHERE {filter_col} = %s", (filter_val,))
@@ -189,7 +198,7 @@ def save_changes_mid(df_edited, table_name, id_cols, filter_col=None, filter_val
         finally:
             conn.close()
 
-def update_account_balances(target_acc_id=None):
+def update_accounts_balances(target_acc_id=None):
     """Update account balances based on transactions."""
     conn = get_connection()
     cur = conn.cursor()
@@ -197,9 +206,9 @@ def update_account_balances(target_acc_id=None):
         if target_acc_id:
             sql = """
                 UPDATE Accounts a
-                SET Account_Balance = COALESCE((
+                SET Accounts_Balance = COALESCE((
                     SELECT SUM(Total_Amount) 
-                    FROM Bank_Transactions t 
+                    FROM Transactions t 
                     WHERE t.Accounts_Id = a.Accounts_Id
                 ), 0)
                 WHERE a.Accounts_Id = %s;
@@ -208,9 +217,9 @@ def update_account_balances(target_acc_id=None):
         else:
             sql = """
                 UPDATE Accounts a
-                SET Account_Balance = COALESCE((
+                SET Accounts_Balance = COALESCE((
                     SELECT SUM(Total_Amount) 
-                    FROM Bank_Transactions t 
+                    FROM Transactions t 
                     WHERE t.Accounts_Id = a.Accounts_Id
                 ), 0)
                 WHERE a.Accounts_Type NOT IN ('Pension');
@@ -230,12 +239,12 @@ def update_pension_balances():
     try:
         cur.execute("""
             UPDATE Accounts a
-            SET Account_Balance = COALESCE((
+            SET Accounts_Balance = COALESCE((
                 SELECT  
                     SUM(CASE WHEN Action IN ('CashIn', 'IntInc') THEN Total_Amount 
                              WHEN Action IN ('CashOut') THEN -Total_Amount 
                              ELSE 0 END)
-                FROM Investment_Transactions t 
+                FROM Investments t 
                 WHERE t.Accounts_Id = a.Accounts_Id
             ), 0)
             WHERE a.Accounts_Type IN ('Pension');
@@ -254,12 +263,19 @@ def update_investment_balances():
     try:
         cur.execute("""
             UPDATE Accounts a
-            SET Account_Balance = COALESCE((
+            SET Accounts_Balance = COALESCE((
                 SELECT  
-                    SUM(CASE WHEN Action IN ('Dividend', 'CashIn', 'IntInc') THEN Total_Amount 
-                             WHEN Action IN ('CashOut') THEN -Total_Amount 
+                --    SUM(CASE WHEN Action IN ('Dividend', 'CashIn', 'IntInc') THEN Total_Amount 
+                --             WHEN Action IN ('CashOut') THEN -Total_Amount 
+                --             ELSE 0 END)
+                    SUM(CASE WHEN Action IN ('Dividend', 'CashIn', 'IntInc', 'Sell') THEN Total_Amount 
+                             WHEN Action IN ('CashOut', 'Buy') THEN -Total_Amount 
                              ELSE 0 END)
-                FROM Investment_Transactions t 
+                --    SUM(CASE WHEN Action IN ('Buy', 'Reinvest', 'ShrIn') THEN Quantity ELSE 0 END) 
+                --        OVER (PARTITION BY Accounts_Id, Securities_Id) as total_buys,
+                --    SUM(CASE WHEN Action IN ('Sell', 'ShrOut') THEN Quantity ELSE 0 END) 
+                --        OVER (PARTITION BY Accounts_Id, Securities_Id) as total_sells
+                FROM Investments t 
                 WHERE t.Accounts_Id = a.Accounts_Id
             ), 0)
             WHERE a.Accounts_Type IN ('Brokerage', 'Other Investment', 'Margin');
@@ -277,12 +293,18 @@ def update_holdings():
     cur = conn.cursor()
     try:
         cur.execute("""
+            DELETE FROM Holdings
+            WHERE (Accounts_Id, Securities_Id) NOT IN (
+                SELECT Accounts_Id, Securities_Id 
+                FROM Investments
+            );
+
             WITH TransactionFlow AS (
                 SELECT 
                     Accounts_Id, 
                     Securities_Id,
                     Date,
-                    Inv_Transactions_Id,
+                    Investments_Id,
                     Action,
                     Quantity,
                     Price_Per_Share,
@@ -291,15 +313,15 @@ def update_holdings():
                         OVER (PARTITION BY Accounts_Id, Securities_Id) as simple_avg_cost,
                     -- Cumulative Purchases & Sales
                     SUM(CASE WHEN Action IN ('Buy', 'Reinvest', 'ShrIn') THEN Quantity ELSE 0 END) 
-                        OVER (PARTITION BY Accounts_Id, Securities_Id ORDER BY Date, Inv_Transactions_Id) as running_buys,
+                        OVER (PARTITION BY Accounts_Id, Securities_Id ORDER BY Date, Investments_Id) as running_buys,
                     SUM(CASE WHEN Action IN ('Sell', 'ShrOut') THEN Quantity ELSE 0 END) 
-                        OVER (PARTITION BY Accounts_Id, Securities_Id ORDER BY Date, Inv_Transactions_Id) as running_sells,
+                        OVER (PARTITION BY Accounts_Id, Securities_Id ORDER BY Date, Investments_Id) as running_sells,
                     -- Total Amounts
                     SUM(CASE WHEN Action IN ('Buy', 'Reinvest', 'ShrIn') THEN Quantity ELSE 0 END) 
                         OVER (PARTITION BY Accounts_Id, Securities_Id) as total_buys,
                     SUM(CASE WHEN Action IN ('Sell', 'ShrOut') THEN Quantity ELSE 0 END) 
                         OVER (PARTITION BY Accounts_Id, Securities_Id) as total_sells
-                FROM Investment_Transactions
+                FROM Investments
                 WHERE Action IN ('Buy', 'Reinvest', 'ShrIn', 'Sell', 'ShrOut')
             ),
             FIFO_Positions AS (
@@ -354,6 +376,35 @@ def update_holdings():
                 Simple_Avg_Price = EXCLUDED.Simple_Avg_Price, 
                 Fifo_Avg_Price = EXCLUDED.Fifo_Avg_Price, -- Update and the new column
                 Last_Update = CURRENT_TIMESTAMP;
+        """)
+        conn.commit()
+    except Exception as e:
+        st.error(f"❌ Error: {e}")
+    finally:
+        cur.close()
+        conn.close()
+        
+
+def update_payee_default_category():
+    """Update payee default category based on usage and when not defined."""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            UPDATE payees p
+            SET categories_id_default = top_cat.Categories_Id
+            FROM (
+                SELECT DISTINCT ON (t.Payees_Id)
+                    t.Payees_Id, 
+                    s.Categories_Id
+                FROM transactions t
+                JOIN splits s ON t.transactions_id = s.transactions_id 
+                WHERE s.Categories_Id IS NOT NULL 
+                GROUP BY t.Payees_Id, s.Categories_Id 
+                ORDER BY t.Payees_Id, COUNT(*) DESC
+            ) AS top_cat
+            WHERE p.payees_id = top_cat.Payees_Id
+              AND p.categories_id_default IS NULL;
         """)
         conn.commit()
     except Exception as e:

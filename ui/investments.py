@@ -9,9 +9,9 @@ def render_investments(conn):
     df_inv_accs = pd.read_sql("""
         SELECT Accounts_Id, Accounts_Name, 
             (SELECT SUM(CASE WHEN Action IN ('Buy', 'Reinvest', 'ShrIn') THEN Quantity WHEN Action IN ('Sell', 'ShrOut') THEN -Quantity ELSE 0 END) 
-             FROM Investment_Transactions WHERE Investment_Transactions.Accounts_Id = Accounts.Accounts_Id) Account_Position, 
+             FROM Investments WHERE Investments.Accounts_Id = Accounts.Accounts_Id) Account_Position, 
             (SELECT SUM(CASE WHEN Action IN ('Dividend', 'CashIn', 'IntInc') THEN Total_Amount WHEN Action IN ('CashOut') THEN -Total_Amount ELSE 0 END) 
-             FROM Investment_Transactions WHERE Investment_Transactions.Accounts_Id = Accounts.Accounts_Id) Account_Amount 
+             FROM Investments WHERE Investments.Accounts_Id = Accounts.Accounts_Id) Account_Amount 
         FROM Accounts WHERE Accounts_Type IN ('Brokerage', 'Pension', 'Other Investment', 'Margin')
     """, conn)
     
@@ -27,14 +27,29 @@ def render_investments(conn):
     )
     inv_acc_id = selected_inv_acc['accounts_id']
     
-    df_sec_list = pd.read_sql("SELECT Securities_Id, Security_Name FROM Securities", conn)
-    sec_options = df_sec_list.set_index('securities_id')['security_name'].to_dict()
+    df_sec_list = pd.read_sql("SELECT Securities_Id, Securities_Name FROM Securities", conn)
+    sec_options = df_sec_list.set_index('securities_id')['securities_name'].to_dict()
     
     tab_reg, tab_hold = st.tabs(["📓 Investment Register", "📊 Current Holdings"])
     
     with tab_reg:
         st.subheader(f"Transaction History: {selected_inv_acc['accounts_name']}")
-        df_inv_tx = pd.read_sql(f"SELECT * FROM Investment_Transactions WHERE Accounts_Id = {inv_acc_id} ORDER BY Date DESC", conn)
+        df_inv_tx = pd.read_sql(f"SELECT * FROM Investments WHERE Accounts_Id = {inv_acc_id} ORDER BY Date DESC", conn)
+
+        column_order = [
+            "investments_id", 
+            "accounts_id",        
+            "date",               
+            "securities_id",      
+            "action", 
+            "quantity", 
+            "price_per_share", 
+            "commission", 
+            "total_amount", 
+            "description",
+            "embedding"
+        ]
+        df_inv_tx = df_inv_tx[[col for col in column_order if col in df_inv_tx.columns]]
         
         edited_inv_tx = st.data_editor(
             df_inv_tx,
@@ -42,11 +57,20 @@ def render_investments(conn):
             key=f"inv_tx_editor_{inv_acc_id}",
             width="stretch",
             column_config={
-                "inv_transactions_id": st.column_config.NumberColumn("ID", disabled=True),
+                "investments_id": st.column_config.NumberColumn(
+                    "Transaction ID", 
+                    disabled=True
+                ),
+                "accounts_id": None, # Hiding the accounts_id since it's redundant with the selected account
+                "date": st.column_config.DateColumn(
+                    "Date",
+                    format="DD/MM/YYYY"
+                ),
                 "securities_id": st.column_config.SelectboxColumn(
                     "Security",
                     options=list(sec_options.keys()),
                     format_func=lambda x: sec_options.get(x, "Unknown"),
+                    width="large",
                     required=True
                 ),
                 "action": st.column_config.SelectboxColumn(
@@ -54,12 +78,30 @@ def render_investments(conn):
                     options=['Buy', 'Sell', 'Dividend', 'Reinvest', 'Split', 'ShrIn', 'ShrOut', 'IntInc', 'CashIn', 'CashOut', 'Vest', 'Expire', 'Grant', 'Exercise', 'MiscExp', 'RtrnCap'],
                     required=True
                 ),
-                "quantity": st.column_config.NumberColumn("Shares", format="%.8f"),
-                "price_per_share": st.column_config.NumberColumn("Price", format="%.4f"),
-                "total_amount": st.column_config.NumberColumn("Total Cash", format="%.2f")
+                "quantity": st.column_config.NumberColumn(
+                    "Quantity", 
+                    format="%.8f"
+                ),
+                "price_per_share": st.column_config.NumberColumn(
+                    "Price", 
+                    format="%.4f"
+                ),
+                "commission": st.column_config.NumberColumn(
+                    "Commission", 
+                    format="%.4f"
+                ),
+                "total_amount": st.column_config.NumberColumn(
+                    "Total Amount", 
+                    format="%.4f"
+                ),
+                "description": st.column_config.TextColumn(
+                    "Memo",  
+                    width="large"
+                ),
+                "embedding": None # Hiding the column embedding since it's huge and not needed for editing
             }
         )
-        save_changes(df_inv_tx, edited_inv_tx, "Investment_Transactions", "inv_transactions_id")
+        save_changes(df_inv_tx, edited_inv_tx, "Investments", "investments_id")
     
     with tab_hold:
         st.subheader(f"Current Holdings: {selected_inv_acc['accounts_name']}")
@@ -79,10 +121,10 @@ def render_investments(conn):
                 ),
                 # Format numbers
                 "quantity": st.column_config.NumberColumn("Quantity", format="%.8f"),
-                "simple_avg_price": st.column_config.NumberColumn("Simple Avg", format="%.4f"),
-                "fifo_avg_price": st.column_config.NumberColumn("FIFO Avg", format="%.4f")
+                "simple_avg_price": st.column_config.NumberColumn("Simple Avg Price", format="%.4f"),
+                "fifo_avg_price": st.column_config.NumberColumn("FIFO Avg Price", format="%.4f")
             },
-            hide_index=True,
+            hide_index=True
         )
 
         save_changes(df_h, edited_h, "Holdings", "holdings_id")

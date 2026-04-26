@@ -17,10 +17,10 @@ def get_sql_database():
     return SQLDatabase.from_uri(
         DB_URI,
         include_tables=[
-            'accounts', 'bank_transactions', 'bank_transaction_splits',
-            'categories', 'currencies', 'financialinstitutions',
+            'accounts', 'transactions', 'splits',
+            'categories', 'currencies', 'institutions',
             'historical_fx', 'historical_prices', 'holdings',
-            'investment_transactions', 'payees', 'securities'
+            'investments', 'payees', 'securities'
         ],
         sample_rows_in_table_info=30
     )

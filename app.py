@@ -93,7 +93,7 @@ def main():
         [
             "🏛️ Dashboard",
             "📝 Register",
-            "🥧 Investments",
+            "🥧 Investments (DEPRECIATED)",
             "⏳ Reports",
             "🌍 Market Data",
             "🧠 AI Assistant",
@@ -109,7 +109,7 @@ def main():
             render_dashboard(conn)
         elif menu == "📝 Register":
             render_register(conn)
-        elif menu == "🥧 Investments":
+        elif menu == "🥧 Investments (DEPRECIATED)":
             render_investments(conn)
         elif menu == "⏳ Reports":
             render_reports(conn)

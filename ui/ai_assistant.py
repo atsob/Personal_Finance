@@ -1,6 +1,7 @@
 import os
 import threading
 import streamlit as st
+from streamlit.runtime.scriptrunner import add_script_run_ctx
 from langchain_community.callbacks.streamlit import StreamlitCallbackHandler
 from langchain_community.chat_message_histories import StreamlitChatMessageHistory
 from langchain_core.messages import HumanMessage, AIMessage
@@ -126,8 +127,13 @@ def render_ai_assistant(llm, agent_with_history, rag_engine):
         if st.session_state['rag_status'] == 'idle':
             if st.button("🚀 Start Indexing (Background)"):
                 st.session_state['rag_status'] = 'running'
+
                 thread = threading.Thread(target=run_indexing_thread)
+                add_script_run_ctx(thread) # Αυτό επιτρέπει στο thread να βλέπει το st.session_state
                 thread.start()
+
+            #    thread = threading.Thread(target=run_indexing_thread)
+            #    thread.start()
                 st.rerun()
         
         if st.session_state['rag_status'] == 'running':

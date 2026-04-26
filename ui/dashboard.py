@@ -1,66 +1,80 @@
 import streamlit as st
 import pandas as pd
 from ui.components import format_qty_display, color_negative_red, style_qty_display
-from database.crud import update_account_balances, update_holdings, update_investment_balances, update_pension_balances
+from database.queries import get_hist_net_worth_data
+from database.crud import update_accounts_balances, update_holdings, update_investment_balances, update_pension_balances
 
 def render_dashboard(conn):
     """Render the Dashboard page."""
-    st.title("🏛 Net Worth")
-    
+#    st.title("🏛 Net Worth (incl. future registered transactions)")
+    st.markdown(
+        f"<h1>🏛 Net Worth <span style='font-size: 0.6em; opacity: 0.7;'>(incl. future registered transactions)</span></h1>", 
+        unsafe_allow_html=True
+    )
+
     query_combined = """
         WITH Latest_FX AS (
-            SELECT DISTINCT ON (Base_Currency_Id) Base_Currency_Id, FX_Rate 
+            SELECT DISTINCT ON (Currencies_Id_1) Currencies_Id_1, FX_Rate 
             FROM Historical_FX 
-            ORDER BY Base_Currency_Id, FX_Date DESC
+            ORDER BY Currencies_Id_1, Date DESC
         ),
         Latest_Prices AS (
-            SELECT DISTINCT ON (Securities_Id) Securities_Id, Price_Close 
+            SELECT DISTINCT ON (Securities_Id) Securities_Id, Close 
             FROM Historical_Prices 
-            ORDER BY Securities_Id, Price_Date DESC
+            ORDER BY Securities_Id, Date DESC
         )
-        SELECT a.Accounts_Name as name, 'Assets' as type, c.Currencies_ShortName as curr, a.Account_Balance as qty,
-               CASE WHEN c.Currencies_ShortName = 'EUR' THEN a.Account_Balance ELSE a.Account_Balance * COALESCE(fx.FX_Rate, 1) END as value_eur
+            -- ASSETS
+        SELECT a.Accounts_Name as name, 'Assets' as type, c.Currencies_ShortName as curr, a.Accounts_Balance as qty,
+               CASE WHEN c.Currencies_ShortName = 'EUR' THEN a.Accounts_Balance ELSE a.Accounts_Balance * COALESCE(fx.FX_Rate, 1) END as value_eur
         FROM Accounts a 
         LEFT JOIN Currencies c ON a.Currencies_Id = c.Currencies_Id 
-        LEFT JOIN Latest_FX fx ON a.Currencies_Id = fx.Base_Currency_Id 
+        LEFT JOIN Latest_FX fx ON a.Currencies_Id = fx.Currencies_Id_1 
         WHERE a.Is_Active = TRUE AND a.Accounts_Type NOT IN ('Cash', 'Checking', 'Savings', 'Credit Card', 'Brokerage', 'Pension', 'Other Investment', 'Margin', 'Loan', 'Other')
         UNION ALL
-        SELECT a.Accounts_Name as name, 'Cash' as type, c.Currencies_ShortName as curr, a.Account_Balance as qty,
-               CASE WHEN c.Currencies_ShortName = 'EUR' THEN a.Account_Balance ELSE a.Account_Balance * COALESCE(fx.FX_Rate, 1) END as value_eur
+            -- CASH FROM NON-INVESTMENT ACCOUNTS
+        SELECT a.Accounts_Name as name, 'Cash' as type, c.Currencies_ShortName as curr, a.Accounts_Balance as qty,
+               CASE WHEN c.Currencies_ShortName = 'EUR' THEN a.Accounts_Balance ELSE a.Accounts_Balance * COALESCE(fx.FX_Rate, 1) END as value_eur
         FROM Accounts a 
         LEFT JOIN Currencies c ON a.Currencies_Id = c.Currencies_Id 
-        LEFT JOIN Latest_FX fx ON a.Currencies_Id = fx.Base_Currency_Id 
+        LEFT JOIN Latest_FX fx ON a.Currencies_Id = fx.Currencies_Id_1 
         WHERE a.Is_Active = TRUE AND a.Accounts_Type NOT IN ('Brokerage', 'Pension', 'Other Investment', 'Margin', 'Real Estate', 'Vehicle', 'Asset', 'Liability')
         UNION ALL
-        SELECT a.Accounts_Name as name, 'Cash' as type, c.Currencies_ShortName as curr, a.Account_Balance as qty,
-               CASE WHEN c.Currencies_ShortName = 'EUR' THEN a.Account_Balance ELSE a.Account_Balance * COALESCE(fx.FX_Rate, 1) END as value_eur
+            -- CASH FROM OTHER INVESTMENT ACCOUNTS
+        SELECT a.Accounts_Name as name, 'Cash' as type, c.Currencies_ShortName as curr, a.Accounts_Balance as qty,
+               CASE WHEN c.Currencies_ShortName = 'EUR' THEN a.Accounts_Balance ELSE a.Accounts_Balance * COALESCE(fx.FX_Rate, 1) END as value_eur
         FROM Accounts a 
         LEFT JOIN Currencies c ON a.Currencies_Id = c.Currencies_Id 
-        LEFT JOIN Latest_FX fx ON a.Currencies_Id = fx.Base_Currency_Id 
+        LEFT JOIN Latest_FX fx ON a.Currencies_Id = fx.Currencies_Id_1 
         WHERE a.Is_Active = TRUE AND a.Accounts_Type IN ('Other Investment')
         UNION ALL
-        SELECT a.Accounts_Name as name, 'Pension' as type, c.Currencies_ShortName as curr, a.Account_Balance as qty,
-               CASE WHEN c.Currencies_ShortName = 'EUR' THEN a.Account_Balance ELSE a.Account_Balance * COALESCE(fx.FX_Rate, 1) END as value_eur
+            -- PENSION ACCOUNTS
+        SELECT a.Accounts_Name as name, 'Pension' as type, c.Currencies_ShortName as curr, a.Accounts_Balance as qty,
+               CASE WHEN c.Currencies_ShortName = 'EUR' THEN a.Accounts_Balance ELSE a.Accounts_Balance * COALESCE(fx.FX_Rate, 1) END as value_eur
         FROM Accounts a 
         LEFT JOIN Currencies c ON a.Currencies_Id = c.Currencies_Id 
-        LEFT JOIN Latest_FX fx ON a.Currencies_Id = fx.Base_Currency_Id 
+        LEFT JOIN Latest_FX fx ON a.Currencies_Id = fx.Currencies_Id_1 
         WHERE a.Is_Active = TRUE AND a.Accounts_Type IN ('Pension')
         UNION ALL
+            -- INVESTMENTS
         SELECT 
-            COALESCE(s.Security_Name, 'Unknown Security') as name, 
+            s.Securities_Name as name, 
             'Investment' as type, 
-            COALESCE(c.Currencies_ShortName, 'EUR') as curr, 
-            h.Quantity as qty,
-            CASE 
-                WHEN COALESCE(c.Currencies_ShortName, 'EUR') = 'EUR' THEN h.Quantity * COALESCE(lp.Price_Close, 0) 
-                ELSE (h.Quantity * COALESCE(lp.Price_Close, 0)) * COALESCE(fx.FX_Rate, 1) 
-            END as value_eur
-        FROM Holdings h 
-        LEFT JOIN Securities s ON h.Securities_Id = s.Securities_Id 
-        LEFT JOIN Currencies c ON s.Currencies_Id = c.Currencies_Id 
-        LEFT JOIN Latest_Prices lp ON s.Securities_Id = lp.Securities_Id 
-        LEFT JOIN Latest_FX fx ON c.Currencies_Id = fx.Base_Currency_Id
+            c.Currencies_ShortName as curr, 
+            SUM(h.Quantity) as qty,
+            SUM(CASE 
+                WHEN c.Currencies_ShortName = 'EUR' THEN h.Quantity * COALESCE(lp.Close, 0) 
+                ELSE (h.Quantity * COALESCE(lp.Close, 0)) * COALESCE(fx.FX_Rate, 1) 
+            END) as value_eur
+        FROM Holdings h
+        JOIN Securities s ON s.Securities_Id = h.Securities_Id
+        JOIN Currencies c ON c.Currencies_Id = s.Currencies_Id
+        -- Χρησιμοποιούμε INNER JOIN για τις τιμές ώστε να μην φέρνει holdings χωρίς τιμή
+        JOIN Latest_Prices lp ON lp.Securities_Id = h.Securities_Id
+        -- To LEFT JOIN με την Latest_FX είναι πλέον ασφαλές λόγω του DISTINCT ON
+        LEFT JOIN Latest_FX fx ON s.Currencies_Id = fx.Currencies_Id_1
         WHERE h.Quantity <> 0
+        GROUP BY name, type, curr
+        ORDER BY type ASC, value_eur DESC
     """
     
     df_net = pd.read_sql(query_combined, conn)
@@ -108,42 +122,51 @@ def render_dashboard(conn):
     )
 
     # Update buttons
+    # Custom CSS to center the "Update All" button row and add spacing
+    st.markdown("""
+        <style>
+        div.stButton > button {
+            border-radius: 5px;
+            height: 3em;
+            font-weight: bold;
+        }
+        </style>
+    """, unsafe_allow_html=True)
 
-    row1_col1, row1_col2 = st.columns(2)
+    st.subheader("Balances Synchronization")
 
-    with row1_col1:
-        if st.button("🔄 Update Bank & Cash Accounts"):
-            with st.spinner("Processing..."):
-                update_account_balances()
-                st.balloons()
+    # Create a 2x2 grid for specific updates
+    grid = st.columns(2)
 
-    with row1_col2:
-        if st.button("🔄 Update Investment Cash Accounts"):
-            with st.spinner("Processing..."):
+    # Define the buttons in a list to keep code DRY (Don't Repeat Yourself)
+    tasks = [
+        ("Bank & Cash Accounts", update_accounts_balances),
+        ("Investment Cash Accounts", update_investment_balances),
+        ("Pension Accounts", update_pension_balances),
+        ("Security Holdings", update_holdings)
+    ]
+
+    for i, (label, func) in enumerate(tasks):
+        with grid[i % 2]:
+            if st.button(f"🔄 Update {label}", use_container_width=True):
+                with st.spinner(f"Updating {label}..."):
+                    func()
+                    st.toast(f"{label} updated!") # Less intrusive than balloons for small tasks
+                    st.rerun()  # Refresh the page to show updated data
+
+    st.markdown("---")
+
+    # Center the "Update All" button and make it prominent
+    _, center_col, _ = st.columns([1, 2, 1])
+
+    with center_col:
+        # use 'primary' type to give it the brand color
+        if st.button("🚀 Run Full Update", type="primary", use_container_width=True):
+            with st.spinner("Processing full update..."):
+                update_accounts_balances()
                 update_investment_balances()
-                st.balloons()
-
-    row2_col1, row2_col2 = st.columns(2)
-
-    with row2_col1:
-        if st.button("🔄 Update Pension Accounts"):
-            with st.spinner("Processing..."):
                 update_pension_balances()
-                st.balloons()
-
-    with row2_col2:
-        if st.button("🔄 Update Security Holdings"):
-            with st.spinner("Processing..."):
                 update_holdings()
                 st.balloons()
-
-    row3_col1, row3_col2, row3_col3 = st.columns(3)
-
-    with row3_col2:
-        if st.button("🔄 Update All"):
-            with st.spinner("Processing..."):
-                update_account_balances()
-                update_investment_balances()
-                update_pension_balances()
-                update_holdings()
-                st.balloons()
+                st.success("All balances up to date!")
+                st.rerun()

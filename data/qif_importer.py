@@ -11,7 +11,7 @@ import tempfile
 import os
 from datetime import datetime
 from database.connection import get_connection
-from database.crud import update_account_balances, update_investment_balances, update_pension_balances, update_holdings
+from database.crud import update_accounts_balances, update_investment_balances, update_pension_balances, update_holdings
 
 class QIFImporter:
     """Handles QIF file import operations"""
@@ -91,12 +91,12 @@ class QIFImporter:
             # Search for existing category
             if parent_id is None:
                 self.cur.execute(
-                    "SELECT Categories_Id FROM Categories WHERE Categories_Name = %s AND Parent_Category_Id IS NULL",
+                    "SELECT Categories_Id FROM Categories WHERE Categories_Name = %s AND Categories_Id_Parent IS NULL",
                     (part,)
                 )
             else:
                 self.cur.execute(
-                    "SELECT Categories_Id FROM Categories WHERE Categories_Name = %s AND Parent_Category_Id = %s",
+                    "SELECT Categories_Id FROM Categories WHERE Categories_Name = %s AND Categories_Id_Parent = %s",
                     (part, parent_id)
                 )
             
@@ -106,7 +106,7 @@ class QIFImporter:
             else:
                 # Insert new category
                 self.cur.execute("""
-                    INSERT INTO Categories (Categories_Name, Parent_Category_Id, Category_Type)
+                    INSERT INTO Categories (Categories_Name, Categories_Id_Parent, Categories_Type)
                     VALUES (%s, %s, %s) RETURNING Categories_Id
                 """, (part, parent_id, cat_type))
                 current_id = self.cur.fetchone()[0]
@@ -119,8 +119,8 @@ class QIFImporter:
         """Disable triggers for faster import"""
         st.info("⏸️ Disabling triggers for faster import...")
         try:
-            self.cur.execute("ALTER TABLE Bank_Transactions DISABLE TRIGGER trg_update_balance;")
-            self.cur.execute("ALTER TABLE Investment_Transactions DISABLE TRIGGER trg_update_holdings;")
+            self.cur.execute("ALTER TABLE Transactions DISABLE TRIGGER trg_update_balance;")
+            self.cur.execute("ALTER TABLE Investments DISABLE TRIGGER trg_update_holdings;")
             self.conn.commit()
         except Exception as e:
             st.warning(f"Could not disable triggers (they may not exist): {e}")
@@ -129,8 +129,8 @@ class QIFImporter:
         """Re-enable triggers after import"""
         st.info("▶️ Re-enabling triggers...")
         try:
-            self.cur.execute("ALTER TABLE Bank_Transactions ENABLE TRIGGER trg_update_balance;")
-            self.cur.execute("ALTER TABLE Investment_Transactions ENABLE TRIGGER trg_update_holdings;")
+            self.cur.execute("ALTER TABLE Transactions ENABLE TRIGGER trg_update_balance;")
+            self.cur.execute("ALTER TABLE Investments ENABLE TRIGGER trg_update_holdings;")
             self.conn.commit()
         except Exception as e:
             st.warning(f"Could not enable triggers (they may not exist): {e}")
@@ -192,9 +192,13 @@ class QIFImporter:
             # Check if security already exists
             existing_id = self.get_id("Securities", "securities_id", "ticker", ticker)
             if not existing_id:
+                # Set EUR as the default Security Currency
+                self.cur.execute("SELECT Currencies_Id FROM Currencies WHERE Currencies_ShortName = %s", ("EUR",))                
+                account_currency_id = self.cur.fetchone()[0]
+
                 self.get_or_create_id(
                     "Securities", "securities_id", "ticker", ticker,
-                    {"security_name": name, "security_type": sectype}
+                    {"securities_name": name, "securities_type": sectype, "currencies_id": account_currency_id}
                 )
                 sec_count += 1
         
@@ -226,81 +230,142 @@ class QIFImporter:
             acc_count += 1
             
             c_acc_id = self.clean_id(acc_id)
-            
+
+            # 1. Πρώτα ανακτούμε το Currencies_Id του τρέχοντος λογαριασμού
+            # Υποθέτουμε ότι το c_acc_id είναι το ID του λογαριασμού που επεξεργάζεστε
+            self.cur.execute("SELECT Currencies_Id FROM Accounts WHERE Accounts_Id = %s", (c_acc_id,))
+            account_currency_id = self.cur.fetchone()[0]
+
             # Process transactions
             for tx_list in acc_obj.transactions.values():
                 for tx in tx_list:
                     # Bank Transaction
                     if hasattr(tx, 'payee'):
-                        # Get or create payee
-                        p_id = None
-                        if tx.payee:
-                            p_id = self.get_or_create_id(
-                                "Payees", "payees_id", "payees_name", tx.payee
+                        # Παράλειψη αν το συνολικό ποσό της συναλλαγής είναι 0 (προαιρετικό, ανάλογα με τη λογική σας)
+                        if tx.amount == 0:
+                            continue
+
+                        # 1. Ανίχνευση Μεταφοράς
+                        is_transfer = False
+                        target_acc_id = None
+                        raw_cat = str(tx.category) if tx.category else ""
+
+                        if raw_cat.startswith('[') and raw_cat.endswith(']'):
+                            is_transfer = True
+                            target_acc_name = raw_cat[1:-1]
+                            target_acc_id = self.get_or_create_id(
+                                "Accounts", "Accounts_Id", "Accounts_Name", target_acc_name
                             )
+
+                        # 2. Έλεγχος για Διπλότυπη Μεταφορά (Matching)
+                        existing_transfer_id = None
+                        if is_transfer:
+                            self.cur.execute("""
+                                SELECT Transfers_Id FROM Transactions 
+                                WHERE Accounts_Id = %s AND Accounts_Id_Target = %s 
+                                AND Date = %s AND Total_Amount = %s
+                                LIMIT 1
+                            """, (target_acc_id, c_acc_id, tx.date, -tx.amount))
+                            
+                            res = self.cur.fetchone()
+                            if res:
+                                existing_transfer_id = res[0]
+                                
+                        # 3. Payee & Cleared status
+                        p_id = self.get_or_create_id("Payees", "payees_id", "payees_name", tx.payee) if tx.payee else None
                         c_payee_id = self.clean_id(p_id)
                         is_cleared = True if tx.cleared in ['X', '*', 'R'] else False
-                        
-                        # Insert transaction
+
+                        # 4. Καθορισμός Transfers_Id
+                        current_transfer_id = existing_transfer_id
+                        if is_transfer and not current_transfer_id:
+                            # Χρήση sequence για παραγωγή νέου ID μεταφοράς
+                            self.cur.execute("SELECT nextval('transactions_transactions_id_seq')") 
+                            current_transfer_id = self.cur.fetchone()[0]
+
+                        # 5. Εισαγωγή στην Transactions
                         self.cur.execute("""
-                            INSERT INTO Bank_Transactions (Accounts_Id, Date, Payees_Id, Description, Total_Amount, Cleared)
-                            VALUES (%s, %s, %s, %s, %s, %s)
-                            RETURNING Bank_Transactions_Id
-                        """, (c_acc_id, tx.date, c_payee_id, tx.memo or tx.payee, tx.amount, is_cleared))
-                        
+                            INSERT INTO Transactions (
+                                Accounts_Id, Date, Payees_Id, Description, 
+                                Total_Amount, Cleared, Accounts_Id_Target, 
+                                Total_Amount_Target, Transfers_Id
+                            )
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            RETURNING Transactions_Id
+                        """, (
+                            c_acc_id, tx.date, c_payee_id, tx.memo or tx.payee, 
+                            tx.amount, is_cleared, target_acc_id, 
+                            -tx.amount if is_transfer else None,
+                            current_transfer_id
+                        ))
+
                         bt_id = self.cur.fetchone()[0]
                         bank_tx_count += 1
-                        
-                        # Process splits
+
+                        # 6. Εισαγωγή Splits με έλεγχο μηδενικού ποσού
                         if hasattr(tx, 'splits') and tx.splits:
                             for split in tx.splits:
-                                cat_id = None
-                                if split.category:
-                                    if hasattr(split.category, 'hierarchy') and split.category.hierarchy:
-                                        cat_name = split.category.hierarchy
-                                    elif hasattr(split.category, 'name'):
-                                        cat_name = split.category.name
-                                    else:
-                                        cat_name = str(split.category)
+                                # ΕΔΩ: Έλεγχος για split amount != 0
+                                if split.amount != 0:
+                                    cat_id = None
+                                    if split.category:
+                                        if hasattr(split.category, 'hierarchy') and split.category.hierarchy:
+                                            cat_name = split.category.hierarchy
+                                        elif hasattr(split.category, 'name'):
+                                            cat_name = split.category.name
+                                        else:
+                                            cat_name = str(split.category)
+                                        
+                                        cat_id = self.get_or_create_category_recursive(cat_name, cat_type='Expense')
                                     
-                                    cat_id = self.get_or_create_category_recursive(cat_name, cat_type='Expense')
-                                
-                                self.cur.execute("""
-                                    INSERT INTO Bank_Transaction_Splits (Bank_Transactions_Id, Categories_Id, Amount, Memo)
-                                    VALUES (%s, %s, %s, %s)
-                                """, (bt_id, self.clean_id(cat_id), split.amount, split.memo))
+                                    self.cur.execute("""
+                                        INSERT INTO Splits (Transactions_Id, Categories_Id, Amount, Memo)
+                                        VALUES (%s, %s, %s, %s)
+                                    """, (bt_id, self.clean_id(cat_id), split.amount, split.memo))
+
                         else:
-                            # No splits - create single split with transaction category
-                            cat_id = None
-                            if hasattr(tx, 'category') and tx.category:
-                                if hasattr(tx.category, 'hierarchy') and tx.category.hierarchy:
-                                    cat_name = tx.category.hierarchy
-                                elif hasattr(tx.category, 'name'):
-                                    cat_name = tx.category.name
-                                else:
-                                    cat_name = str(tx.category)
-                                
-                                cat_id = self.get_or_create_category_recursive(cat_name, cat_type='Expense')
-                            
-                            self.cur.execute("""
-                                INSERT INTO Bank_Transaction_Splits (Bank_Transactions_Id, Categories_Id, Amount, Memo)
-                                VALUES (%s, %s, %s, %s)
-                            """, (bt_id, self.clean_id(cat_id), tx.amount, tx.memo))
-                    
+                            # Single split logic (αν δεν υπάρχουν splits)
+                            # ΕΔΩ: Έλεγχος για transaction amount != 0
+                            if tx.amount != 0:
+                                cat_id = None
+                                if hasattr(tx, 'category') and tx.category and not is_transfer: # Αν είναι μεταφορά, συνήθως δεν βάζουμε split κατηγορίας
+                                    if hasattr(tx.category, 'hierarchy') and tx.category.hierarchy:
+                                        cat_name = tx.category.hierarchy
+                                    elif hasattr(tx.category, 'name'):
+                                        cat_name = tx.category.name
+                                    else:
+                                        cat_name = str(tx.category)
+                                    
+                                    cat_id = self.get_or_create_category_recursive(cat_name, cat_type='Expense')                                
+                                self.cur.execute("""
+                                    INSERT INTO Splits (Transactions_Id, Categories_Id, Amount, Memo)
+                                    VALUES (%s, %s, %s, %s)
+                                """, (bt_id, self.clean_id(cat_id), tx.amount, tx.memo))
+
                     # Investment Transaction
                     elif hasattr(tx, 'security'):
                         ticker_val = (tx.security or "UNKNOWN")[:255]
-                      #  ticker_val = (tx.security or None)[:255]
                         
-                        # Get security ID
-                        s_id = self.get_id("Securities", "securities_id", "security_name", ticker_val)
-                      #  if not s_id:
-                        if not s_id and ticker_val is not None and ticker_val != "UNKNOWN":
-                            # Create security if doesn't exist
+                        # Προσπάθεια εύρεσης του security
+                        s_id = self.get_id("Securities", "securities_id", "securities_name", ticker_val)
+                        
+                    #    if not s_id and ticker_val is not None and ticker_val != "UNKNOWN":
+                        if not s_id and ticker_val != "UNKNOWN":
+                            # 2. Δημιουργία security με το νόμισμα του λογαριασμού
+                            # Προσαρμόζουμε το dictionary των extra πεδίων για να περιλαμβάνει το Currencies_Id
+                            extra_fields = {
+                                "ticker": ticker_val[:10], 
+                                "securities_type": 'Stock',
+                                "currencies_id": account_currency_id,  # Εδώ μπαίνει το νόμισμα του λογαριασμού
+                                "is_active": True
+                            }
+                            
+                            # Χρήση της get_or_create_id (βεβαιωθείτε ότι η μέθοδος δέχεται extra_fields για το INSERT)
                             s_id = self.get_or_create_id(
-                                "Securities", "securities_id", "security_name", ticker_val,
-                                {"ticker": ticker_val[:10], "security_type": 'Stock'}
+                                "Securities", "securities_id", "securities_name", ticker_val,
+                                extra_fields
                             )
+                   
                         
                         c_sec_id = self.clean_id(s_id)
                         
@@ -325,7 +390,7 @@ class QIFImporter:
                         amt = tx.amount if hasattr(tx, 'amount') and tx.amount else 0
                         
                         self.cur.execute("""
-                            INSERT INTO Investment_Transactions 
+                            INSERT INTO Investments 
                             (Accounts_Id, Securities_Id, Date, Action, Quantity, Price_Per_Share, Commission, Total_Amount, Description)
                             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """, (c_acc_id, c_sec_id, tx.date, my_action, qnt, prc, comm, amt, 
@@ -361,15 +426,15 @@ class QIFImporter:
                         # Get security ID
                         s_id = self.get_id("Securities", "securities_id", "ticker", ticker)
                         if not s_id:
-                            s_id = self.get_id("Securities", "securities_id", "security_name", ticker)
+                            s_id = self.get_id("Securities", "securities_id", "securities_name", ticker)
                         
                         if s_id:
                             c_sec_id = self.clean_id(s_id)
                             
                             self.cur.execute("""
-                                INSERT INTO Historical_Prices (Securities_Id, Price_Date, Price_Close)
+                                INSERT INTO Historical_Prices (Securities_Id, Date, Close)
                                 VALUES (%s, %s, %s)
-                                ON CONFLICT (Securities_Id, Price_Date) 
+                                ON CONFLICT (Securities_Id, Date) 
                                 DO NOTHING
                             """, (c_sec_id, date_obj.date(), float(price_value)))
                             
@@ -418,7 +483,7 @@ class QIFImporter:
             # Automatic post-processing based on what was imported
             if has_bank_tx or import_options.get('force_update_balances', False):
                 st.info("🔄 Automatically updating account balances (bank & cash accounts)...")
-                update_account_balances()
+                update_accounts_balances()
                 st.info("🔄 Automatically updating pension account balances...")
                 update_pension_balances()
                 st.info("🔄 Automatically updating investment cash balances...")
@@ -488,11 +553,11 @@ def render_qif_importer():
         if clear_categories:
             tables_to_clear.append("Categories")
         if clear_bank_tx:
-            tables_to_clear.append("Bank_Transactions")
+            tables_to_clear.append("Transactions")
         if clear_bank_splits:
-            tables_to_clear.append("Bank_Transaction_Splits")
+            tables_to_clear.append("Splits")
         if clear_inv_tx:
-            tables_to_clear.append("Investment_Transactions")
+            tables_to_clear.append("Investments")
         if clear_holdings:
             tables_to_clear.append("Holdings")
         

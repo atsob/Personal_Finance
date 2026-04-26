@@ -1,5 +1,5 @@
 """
-Database Backup and Restore Module for Finance OS
+Database Backup and Restore Module for Personal Finance
 Handles backing up and restoring PostgreSQL database in Docker
 """
 
@@ -67,6 +67,8 @@ class DatabaseBackup:
         
         # Common PostgreSQL installation paths
         common_paths = [
+            os.path.join(os.environ.get('LOCALAPPDATA', ''), r'Programs\pgAdmin 4\runtime'),
+            os.path.join(os.environ.get('LOCALAPPDATA', ''), r'Programs\pgAdmin 4\bin'),
             r"C:\Program Files\PostgreSQL\16\bin",
             r"C:\Program Files\PostgreSQL\15\bin",
             r"C:\Program Files\PostgreSQL\14\bin",
@@ -113,6 +115,7 @@ class DatabaseBackup:
     def get_backup_history(self):
         """Get list of existing backups with metadata"""
         backups = []
+        print(f"Looking for backups in: {self.backup_dir}")     ## Debugging line to check backup directory
         if os.path.exists(self.backup_dir):
             for filename in os.listdir(self.backup_dir):
                 if filename.endswith('.dump'):

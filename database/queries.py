@@ -2,6 +2,44 @@ import pandas as pd
 import streamlit as st
 from database.connection import get_connection
 
+from datetime import datetime, timedelta
+
+def get_category_hierarchy():
+    """Get category hierarchy with full paths"""
+    conn = get_connection()
+
+    query = """
+    WITH RECURSIVE CategoryHierarchy AS (
+        SELECT 
+            Categories_Id, 
+            Categories_Name::TEXT as Full_Path,
+            Categories_Name::TEXT as Name,
+            Categories_Type,
+            Categories_Id_Parent,
+            0 as Level
+        FROM Categories 
+        WHERE Categories_Id_Parent IS NULL
+        
+        UNION ALL
+        
+        SELECT 
+            c.Categories_Id, 
+            ch.Full_Path || ' : ' || c.Categories_Name as Full_Path,
+            c.Categories_Name as Name,
+            c.Categories_Type,
+            c.Categories_Id_Parent,
+            ch.Level + 1 as Level
+        FROM Categories c
+        JOIN CategoryHierarchy ch ON c.Categories_Id_Parent = ch.Categories_Id
+    )
+    SELECT * FROM CategoryHierarchy ORDER BY Full_Path
+    """
+
+    df = pd.read_sql(query, conn)
+    conn.close()
+    return df
+
+
 @st.cache_data(ttl=3600)
 def get_hist_net_worth_data(start_date):
     """Get historical net worth data."""
@@ -26,9 +64,9 @@ def get_hist_net_worth_data(start_date):
             dt.d as date,
             a.Accounts_Id,
             a.Currencies_Id,
-            a.Account_Balance - COALESCE((
+            a.Accounts_Balance - COALESCE((
                 SELECT SUM(Total_Amount) 
-                FROM Bank_Transactions 
+                FROM Transactions 
                 WHERE Accounts_Id = a.Accounts_Id 
                 AND Date > dt.d
             ), 0) as balance_at_date
@@ -41,9 +79,9 @@ def get_hist_net_worth_data(start_date):
             dt.d as date,
             a.Accounts_Id,
             a.Currencies_Id,
-            a.Account_Balance - COALESCE((
+            a.Accounts_Balance - COALESCE((
                 SELECT SUM(Total_Amount) 
-                FROM Bank_Transactions 
+                FROM Transactions 
                 WHERE Accounts_Id = a.Accounts_Id 
                 AND Date > dt.d
             ), 0) as balance_at_date
@@ -55,9 +93,9 @@ def get_hist_net_worth_data(start_date):
             dt.d as date,
             a.Accounts_Id,
             a.Currencies_Id,
-            a.Account_Balance - COALESCE((
+            a.Accounts_Balance - COALESCE((
                 SELECT SUM(Total_Amount) 
-                FROM Bank_Transactions 
+                FROM Transactions 
                 WHERE Accounts_Id = a.Accounts_Id 
                 AND Date > dt.d
             ), 0) as balance_at_date
@@ -70,12 +108,12 @@ def get_hist_net_worth_data(start_date):
             dt.d as date,
             a.Accounts_Id,
             a.Currencies_Id,
-            a.Account_Balance - COALESCE((
+            a.Accounts_Balance - COALESCE((
                 SELECT  
                     SUM(CASE WHEN Action IN ('CashIn', 'IntInc') THEN Total_Amount 
                              WHEN Action IN ('CashOut') THEN -Total_Amount 
                              ELSE 0 END)
-                FROM Investment_Transactions
+                FROM Investments
                 WHERE Accounts_Id = a.Accounts_Id
                 AND Date > dt.d
             ), 0) as balance_at_date
@@ -89,7 +127,7 @@ def get_hist_net_worth_data(start_date):
             h.Securities_Id,
             h.Quantity - COALESCE((
                 SELECT SUM(CASE WHEN Action = 'Buy' THEN Quantity WHEN Action = 'Sell' THEN -Quantity ELSE 0 END)
-                FROM Investment_Transactions 
+                FROM Investments 
                 WHERE Securities_Id = h.Securities_Id 
                 AND Date > dt.d
             ), 0) as qty_at_date
@@ -98,12 +136,12 @@ def get_hist_net_worth_data(start_date):
     ),
     daily_fx AS (
         SELECT dt.d as date, c.Currencies_Id,
-            (SELECT FX_Rate FROM Historical_FX WHERE FX_Date <= dt.d AND Base_Currency_Id = c.Currencies_Id ORDER BY FX_Date DESC LIMIT 1) as fx_rate
+            (SELECT FX_Rate FROM Historical_FX WHERE Date <= dt.d AND Currencies_Id_1 = c.Currencies_Id ORDER BY Date DESC LIMIT 1) as fx_rate
         FROM dates dt CROSS JOIN Currencies c
     ),
     daily_prices AS (
         SELECT dt.d as date, s.Securities_Id,
-            (SELECT Price_Close FROM Historical_Prices WHERE Price_Date <= dt.d AND Securities_Id = s.Securities_Id ORDER BY Price_Date DESC LIMIT 1) as price_close
+            (SELECT Close FROM Historical_Prices WHERE Date <= dt.d AND Securities_Id = s.Securities_Id ORDER BY Date DESC LIMIT 1) as close
         FROM dates dt CROSS JOIN Securities s
     ),
     final_calculation AS (
@@ -133,7 +171,7 @@ def get_hist_net_worth_data(start_date):
              JOIN Currencies cur ON hp.Currencies_Id = cur.Currencies_Id
              LEFT JOIN daily_fx dfx ON hp.date = dfx.date AND hp.Currencies_Id = dfx.Currencies_Id
              WHERE hp.date = dt.d) as total_pension,
-            (SELECT SUM(hi.qty_at_date * COALESCE(dp.price_close, 0) * 
+            (SELECT SUM(hi.qty_at_date * COALESCE(dp.close, 0) * 
                 CASE WHEN cs.Currencies_ShortName = 'EUR' THEN 1 ELSE COALESCE(dfx_inv.fx_rate, 1) END
              )
              FROM historical_inv hi
@@ -185,7 +223,7 @@ def get_hist_inv_positions_data(start_date):
             h.Accounts_Id,
             h.Quantity - COALESCE((
                 SELECT SUM(CASE WHEN Action = 'Buy' THEN Quantity WHEN Action = 'Sell' THEN -Quantity ELSE 0 END)
-                FROM Investment_Transactions 
+                FROM Investments 
                 WHERE Securities_Id = h.Securities_Id AND Accounts_Id = h.Accounts_Id
                 AND Date > dt.d
             ), 0) as qty_at_date
@@ -194,18 +232,18 @@ def get_hist_inv_positions_data(start_date):
     ),
     daily_fx AS (
         SELECT dt.d as date, c.Currencies_Id,
-            (SELECT FX_Rate FROM Historical_FX WHERE FX_Date <= dt.d AND Base_Currency_Id = c.Currencies_Id ORDER BY FX_Date DESC LIMIT 1) as fx_rate
+            (SELECT FX_Rate FROM Historical_FX WHERE Date <= dt.d AND Currencies_Id_1 = c.Currencies_Id ORDER BY Date DESC LIMIT 1) as fx_rate
         FROM dates dt CROSS JOIN Currencies c
     ),
     daily_prices AS (
         SELECT dt.d as date, s.Securities_Id,
-            (SELECT Price_Close FROM Historical_Prices WHERE Price_Date <= dt.d AND Securities_Id = s.Securities_Id ORDER BY Price_Date DESC LIMIT 1) as price_close
+            (SELECT Close FROM Historical_Prices WHERE Date <= dt.d AND Securities_Id = s.Securities_Id ORDER BY Date DESC LIMIT 1) as close
         FROM dates dt CROSS JOIN Securities s
     )
     SELECT 
         hq.date,
         COALESCE(a.Accounts_Name, 'Total') as Accounts_Name,
-        SUM(hq.qty_at_date * COALESCE(dp.price_close, 0) * 
+        SUM(hq.qty_at_date * COALESCE(dp.close, 0) * 
             CASE WHEN cur_s.Currencies_ShortName = 'EUR' THEN 1 ELSE COALESCE(dfx.fx_rate, 1) END
         ) as account_value
     FROM historical_qty hq
@@ -222,6 +260,256 @@ def get_hist_inv_positions_data(start_date):
     df = pd.read_sql(query, conn)
     conn.close()
     return df
+
+
+@st.cache_data(ttl=3600)
+def get_portfolio_signals_old(selected_acc_id=None): # Προσθήκη '=' εδώ
+    """Get signals for my investment portfolio."""
+    conn = get_connection()
+    
+    # Χρησιμοποιούμε απλό τριπλό string (όχι f-string) για ασφάλεια με το pd.read_sql
+    query = """
+        WITH investment_signals AS (
+            WITH performance_data AS (
+                WITH base_data AS (
+                    SELECT 
+                        Securities_Id, 
+                        Date, 
+                        Close,
+                        (Close / LAG(Close) OVER (PARTITION BY Securities_Id ORDER BY Date) - 1) as daily_ret
+                    FROM Historical_Prices
+                    WHERE Date >= (CURRENT_DATE - INTERVAL '62 months')
+                ),
+                ranked_prices AS (
+                    SELECT 
+                        Securities_Id, 
+                        Date, 
+                        Close as price_today,
+                        LAG(Close, 1) OVER (PARTITION BY Securities_Id ORDER BY Date) as price_1d,
+                        LAG(Close, 5) OVER (PARTITION BY Securities_Id ORDER BY Date) as price_1w,
+                        LAG(Close, 21) OVER (PARTITION BY Securities_Id ORDER BY Date) as price_1m,
+                        LAG(Close, 63) OVER (PARTITION BY Securities_Id ORDER BY Date) as price_3m,
+                        LAG(Close, 126) OVER (PARTITION BY Securities_Id ORDER BY Date) as price_6m,
+                        LAG(Close, 252) OVER (PARTITION BY Securities_Id ORDER BY Date) as price_1y,
+                        LAG(Close, 756) OVER (PARTITION BY Securities_Id ORDER BY Date) as price_3y,
+                        ROW_NUMBER() OVER (PARTITION BY Securities_Id ORDER BY Date DESC) as rev_rank
+                    FROM base_data
+                ),
+                ytd_prices AS (
+                    SELECT DISTINCT ON (Securities_Id) Securities_Id, Close as price_ytd_start
+                    FROM Historical_Prices
+                    WHERE Date < date_trunc('year', CURRENT_DATE)
+                    ORDER BY Securities_Id, Date DESC
+                ),
+                latest_only AS (
+                    SELECT rp.*, yp.price_ytd_start 
+                    FROM ranked_prices rp
+                    LEFT JOIN ytd_prices yp ON rp.Securities_Id = yp.Securities_Id
+                    WHERE rp.rev_rank = 1
+                )
+                SELECT 
+                    lo.Securities_Id,
+                    Sec.Securities_Name,
+                    lo.price_today,
+                    ROUND(((lo.price_today / NULLIF(lo.price_1d, 0)) - 1) * 100, 2) as daily_chg_pct,
+                    ROUND(((lo.price_today / NULLIF(lo.price_1w, 0)) - 1) * 100, 2) as weekly_chg_pct,
+                    ROUND(((lo.price_today / NULLIF(lo.price_1m, 0)) - 1) * 100, 2) as monthly_chg_pct,
+                    ROUND(((lo.price_today / NULLIF(lo.price_3m, 0)) - 1) * 100, 2) as quarterly_chg_pct,
+                    ROUND(((lo.price_today / NULLIF(lo.price_6m, 0)) - 1) * 100, 2) as semiannual_chg_pct,
+                    ROUND(((lo.price_today / NULLIF(lo.price_1y, 0)) - 1) * 100, 2) as annual_chg_pct,
+                    ROUND(((lo.price_today / NULLIF(lo.price_3y, 0)) - 1) * 100, 2) as triannual_chg_pct,
+                    ROUND(((lo.price_today / NULLIF(lo.price_ytd_start, 0)) - 1) * 100, 2) as ytd_chg_pct,
+                    (SELECT ROUND((STDDEV(daily_ret) * SQRT(252) * 100)::numeric, 2) FROM base_data bd WHERE bd.Securities_Id = lo.Securities_Id AND bd.Date > (lo.Date - INTERVAL '1 month')) as vol_1m_ann,
+                    (SELECT ROUND((STDDEV(daily_ret) * SQRT(252) * 100)::numeric, 2) FROM base_data bd WHERE bd.Securities_Id = lo.Securities_Id AND bd.Date > (lo.Date - INTERVAL '3 months')) as vol_3m_ann,
+                    (SELECT ROUND((STDDEV(daily_ret) * SQRT(252) * 100)::numeric, 2) FROM base_data bd WHERE bd.Securities_Id = lo.Securities_Id AND bd.Date > (lo.Date - INTERVAL '12 months')) as vol_1y_ann,
+                    (SELECT ROUND((STDDEV(daily_ret) * SQRT(252) * 100)::numeric, 2) FROM base_data bd WHERE bd.Securities_Id = lo.Securities_Id AND bd.Date >= date_trunc('year', CURRENT_DATE)) as vol_ytd_ann
+                FROM latest_only lo
+                JOIN Securities Sec ON lo.Securities_Id = Sec.Securities_Id
+                AND Sec.Is_Active
+                AND lo.Date > (CURRENT_DATE - INTERVAL '15 days')
+            ),
+            rfr AS (
+                SELECT COALESCE(annual_chg_pct, 2.36) as value 
+                FROM performance_data 
+                WHERE Securities_Name LIKE 'Hellenic T-Bill 52W%%' -- Χρήση διπλού %% για αποφυγή σφάλματος Python formatting
+                LIMIT 1
+            )        
+            SELECT 
+                Securities_Id,
+                Securities_Name,
+                price_today,
+                monthly_chg_pct,
+                annual_chg_pct,
+                vol_1y_ann,
+                ROUND(((monthly_chg_pct * 0.5) + (quarterly_chg_pct * 0.3) + (annual_chg_pct * 0.2))::numeric, 2) as quality_score,
+                ROUND(((annual_chg_pct - (SELECT value FROM rfr)) / NULLIF(vol_1y_ann, 0))::numeric, 2) as sharpe_ratio
+            FROM performance_data
+            WHERE vol_1y_ann > 0 
+        ),
+        portfolio_status AS (
+            SELECT 
+                s.Securities_Id,
+                s.Securities_Name,
+                sig.price_today,
+                sig.annual_chg_pct,
+                sig.vol_1y_ann,
+                sig.sharpe_ratio,
+                sig.quality_score,
+                SUM(COALESCE(h.Quantity, 0)) as current_qty,
+                (SUM(COALESCE(h.Quantity, 0)) * sig.price_today) as market_value_base_curr
+            FROM investment_signals sig
+            JOIN Securities s ON sig.Securities_Id = s.Securities_Id
+            LEFT JOIN Holdings h ON s.Securities_Id = h.Securities_Id
+                AND (%s IS NULL OR h.Accounts_Id = %s) 
+			GROUP BY s.Securities_Id, s.Securities_Name, sig.price_today, sig.annual_chg_pct, sig.vol_1y_ann, sig.sharpe_ratio, sig.quality_score
+        )
+        SELECT 
+            *,
+            CASE 
+                WHEN current_qty > 0 AND (sharpe_ratio < 0 OR quality_score < -5) THEN '🔴 SELL / REDUCE'
+                WHEN sharpe_ratio > 1.2 AND quality_score > 10 THEN '🟢 STRONG BUY'
+                WHEN sharpe_ratio BETWEEN 0.5 AND 1.2 AND quality_score > 0 THEN '🟡 BUY / HOLD'
+                WHEN current_qty = 0 AND sharpe_ratio > 1.0 THEN '👀 WATCHLIST'
+                ELSE '⚪ NEUTRAL'
+            END as recommendation_signal
+        FROM portfolio_status
+        ORDER BY sharpe_ratio DESC;
+    """
+    
+    # Το pandas.read_sql χειρίζεται σωστά τις παραμέτρους για την αποφυγή SQL Injection
+    df = pd.read_sql(query, conn, params=(selected_acc_id, selected_acc_id))
+    cur = conn.cursor()
+    cur.close()
+    conn.close()
+    return df
+
+
+@st.cache_data(ttl=3600)
+def get_portfolio_signals(selected_acc_id=None): # Προσθήκη '=' εδώ
+    """Get signals for my investment portfolio."""
+    conn = get_connection()
+    
+    # Χρησιμοποιούμε απλό τριπλό string (όχι f-string) για ασφάλεια με το pd.read_sql
+    query = """
+        WITH base_data AS (
+            SELECT Securities_Id, Date, Close,
+                   (Close / LAG(Close) OVER (PARTITION BY Securities_Id ORDER BY Date) - 1) as daily_ret
+            FROM Historical_Prices
+            WHERE Date >= (CURRENT_DATE - INTERVAL '62 months')
+        ),
+        ranked_prices AS (
+            SELECT Securities_Id, Date, Close as price_today,
+                   LAG(Close, 1) OVER (PARTITION BY Securities_Id ORDER BY Date) as price_1d,
+                   LAG(Close, 5) OVER (PARTITION BY Securities_Id ORDER BY Date) as price_1w,
+                   LAG(Close, 21) OVER (PARTITION BY Securities_Id ORDER BY Date) as price_1m,
+                   LAG(Close, 63) OVER (PARTITION BY Securities_Id ORDER BY Date) as price_3m,
+                   LAG(Close, 126) OVER (PARTITION BY Securities_Id ORDER BY Date) as price_6m,
+                   LAG(Close, 252) OVER (PARTITION BY Securities_Id ORDER BY Date) as price_1y,
+                   LAG(Close, 756) OVER (PARTITION BY Securities_Id ORDER BY Date) as price_3y,
+                   ROW_NUMBER() OVER (PARTITION BY Securities_Id ORDER BY Date DESC) as rev_rank
+            FROM base_data
+        ),
+        ytd_prices AS (
+            SELECT DISTINCT ON (Securities_Id) Securities_Id, Close as price_ytd_start
+            FROM Historical_Prices
+            WHERE Date < date_trunc('year', CURRENT_DATE)
+            ORDER BY Securities_Id, Date DESC
+        ),
+        latest_only AS (
+            SELECT rp.*, yp.price_ytd_start 
+            FROM ranked_prices rp
+            LEFT JOIN ytd_prices yp ON rp.Securities_Id = yp.Securities_Id
+            WHERE rp.rev_rank = 1
+        ),
+        performance_data AS (
+            SELECT 
+                lo.Securities_Id, Sec.Securities_Name, lo.price_today,
+                ROUND(((lo.price_today / NULLIF(lo.price_1d, 0)) - 1) * 100, 2) as daily_chg_pct,
+                ROUND(((lo.price_today / NULLIF(lo.price_1w, 0)) - 1) * 100, 2) as weekly_chg_pct,
+                ROUND(((lo.price_today / NULLIF(lo.price_1m, 0)) - 1) * 100, 2) as monthly_chg_pct,
+                ROUND(((lo.price_today / NULLIF(lo.price_3m, 0)) - 1) * 100, 2) as quarterly_chg_pct,
+                ROUND(((lo.price_today / NULLIF(lo.price_6m, 0)) - 1) * 100, 2) as semiannual_chg_pct,
+                ROUND(((lo.price_today / NULLIF(lo.price_1y, 0)) - 1) * 100, 2) as annual_chg_pct,
+                ROUND(((lo.price_today / NULLIF(lo.price_3y, 0)) - 1) * 100, 2) as triannual_chg_pct,
+                ROUND(((lo.price_today / NULLIF(lo.price_ytd_start, 0)) - 1) * 100, 2) as ytd_chg_pct,
+                (SELECT ROUND((STDDEV(daily_ret) * SQRT(252) * 100)::numeric, 2) FROM base_data bd WHERE bd.Securities_Id = lo.Securities_Id AND bd.Date > (lo.Date - INTERVAL '1 month')) as vol_1m_ann,
+                (SELECT ROUND((STDDEV(daily_ret) * SQRT(252) * 100)::numeric, 2) FROM base_data bd WHERE bd.Securities_Id = lo.Securities_Id AND bd.Date > (lo.Date - INTERVAL '3 months')) as vol_3m_ann,
+                (SELECT ROUND((STDDEV(daily_ret) * SQRT(252) * 100)::numeric, 2) FROM base_data bd WHERE bd.Securities_Id = lo.Securities_Id AND bd.Date > (lo.Date - INTERVAL '12 months')) as vol_1y_ann,
+                (SELECT ROUND((STDDEV(daily_ret) * SQRT(252) * 100)::numeric, 2) FROM base_data bd WHERE bd.Securities_Id = lo.Securities_Id AND bd.Date >= date_trunc('year', CURRENT_DATE)) as vol_ytd_ann
+            FROM latest_only lo
+            JOIN Securities Sec ON lo.Securities_Id = Sec.Securities_Id
+            AND Sec.Is_Active
+            AND lo.Date > (CURRENT_DATE - INTERVAL '15 days')
+        ),
+        rfr AS (
+            SELECT COALESCE(annual_chg_pct, 2.36) as value 
+            FROM performance_data 
+            WHERE Securities_Name LIKE 'Hellenic T-Bill 52W%%'
+            LIMIT 1
+        ),
+        investment_signals AS (
+            SELECT *,
+                ROUND(((monthly_chg_pct * 0.5) + (quarterly_chg_pct * 0.3) + (annual_chg_pct * 0.2))::numeric, 2) as quality_score,
+                ROUND(((annual_chg_pct - (SELECT value FROM rfr)) / NULLIF(vol_1y_ann, 0))::numeric, 2) as sharpe_ratio
+            FROM performance_data
+            WHERE vol_1y_ann > 0 
+        ),
+        portfolio_status AS (
+            SELECT sig.*,
+                SUM(COALESCE(h.Quantity, 0)) as current_qty,
+                (SUM(COALESCE(h.Quantity, 0)) * sig.price_today) as market_value_base_curr
+            FROM investment_signals sig
+            LEFT JOIN Holdings h ON sig.Securities_Id = h.Securities_Id
+                AND (%s IS NULL OR h.Accounts_Id = %s) 
+			GROUP BY sig.Securities_Id, sig.Securities_Name, sig.price_today, sig.daily_chg_pct, sig.weekly_chg_pct, 
+                     sig.monthly_chg_pct, sig.quarterly_chg_pct, sig.semiannual_chg_pct, sig.annual_chg_pct, 
+                     sig.triannual_chg_pct, sig.ytd_chg_pct, sig.vol_1m_ann, sig.vol_3m_ann, sig.vol_1y_ann, 
+                     sig.vol_ytd_ann, sig.quality_score, sig.sharpe_ratio
+        ),
+        recommendations AS (
+            SELECT 
+                sig.*, 
+                sig.market_value_base_curr * COALESCE((SELECT FX_Rate FROM Historical_FX WHERE Currencies_Id_1 = sec.Currencies_Id AND Date <= CURRENT_DATE ORDER BY Date DESC LIMIT 1), 1) as current_value_eur,
+                sec.Analyst_Rating as wall_street_view,
+                sec.Analyst_Target_Price as target_price,
+                ROUND((((sec.Analyst_Target_Price / NULLIF(sig.price_today, 0)) - 1) * 100)::numeric, 2) as upside_pct,
+                CASE 
+                    WHEN current_qty > 0 AND (sharpe_ratio < 0 OR quality_score < -5) THEN '🔴 SELL / REDUCE'
+                    WHEN sharpe_ratio > 1.2 AND quality_score > 10 THEN '🟢 STRONG BUY'
+                    WHEN sharpe_ratio > 0.7 OR quality_score > 8 THEN '🟢 BUY'
+                    WHEN sharpe_ratio > 0.3 OR quality_score > 0 THEN '🟡 HOLD'
+                    WHEN current_qty = 0 AND sharpe_ratio > 0.5 THEN '👀 WATCHLIST'
+                    ELSE '⚪ NEUTRAL'
+                END as recommendation_signal
+            FROM portfolio_status sig
+            JOIN Securities sec ON sig.Securities_Id = sec.Securities_Id
+        )
+        SELECT *,
+            CASE 
+                WHEN recommendation_signal LIKE '🟢%%' AND wall_street_view IN ('buy', 'strong_buy') AND upside_pct > 20 THEN '🔥 HIGH CONVICTION BUY'
+                WHEN recommendation_signal LIKE '🟢%%' AND wall_street_view = 'strong_buy' THEN '💎 STRONG CONVICTION'
+                WHEN recommendation_signal LIKE '🟢%%' AND wall_street_view = 'buy' THEN '💎 CONVICTION BUY'
+                WHEN recommendation_signal LIKE '🟢%%' AND wall_street_view IN ('sell', 'underperform') THEN '🔍 CONTRARIAN BUY'
+                WHEN recommendation_signal LIKE '🔴%%' AND wall_street_view IN ('buy', 'strong_buy') THEN '🔍 CONTRARIAN SELL'
+                WHEN recommendation_signal LIKE '🟢%%' AND wall_street_view = 'hold' THEN '🚀 MOMENTUM BUY'
+                WHEN recommendation_signal LIKE '🔴%%' AND wall_street_view = 'hold' THEN '📉 MOMENTUM SELL'
+                WHEN recommendation_signal LIKE '🟢%%' AND (wall_street_view IS NULL OR wall_street_view = 'none') THEN '⚙️ ALGO BUY'
+                WHEN recommendation_signal LIKE '🔴%%' AND (wall_street_view IS NULL OR wall_street_view = 'none') THEN '⚙️ ALGO SELL'
+                WHEN recommendation_signal LIKE '🔴%%' AND wall_street_view IN ('sell', 'underperform') THEN '⚠️ CONVICTION SELL'
+                ELSE recommendation_signal 
+            END as final_signal            
+        FROM recommendations
+        ORDER BY sharpe_ratio DESC;
+    """
+    
+    # Το pandas.read_sql χειρίζεται σωστά τις παραμέτρους για την αποφυγή SQL Injection
+    df = pd.read_sql(query, conn, params=(selected_acc_id, selected_acc_id))
+    cur = conn.cursor()
+    cur.close()
+    conn.close()
+    return df
+
+
 
 @st.cache_data(ttl=3600)
 def get_pnl_report_data():
@@ -244,27 +532,27 @@ def get_pnl_report_data():
             p.today, p.dtd_start, p.wtd_start, p.mtd_start, p.ytd_start, p.all_time_start,
             h.Accounts_Id, h.Securities_Id,
             h.Quantity as qty_today,
-            h.Quantity - COALESCE((SELECT SUM(CASE WHEN Action = 'Buy' THEN Quantity WHEN Action = 'Sell' THEN -Quantity ELSE 0 END) FROM Investment_Transactions WHERE Securities_Id = h.Securities_Id AND Accounts_Id = h.Accounts_Id AND Date > p.dtd_start), 0) as qty_dtd,
-            h.Quantity - COALESCE((SELECT SUM(CASE WHEN Action = 'Buy' THEN Quantity WHEN Action = 'Sell' THEN -Quantity ELSE 0 END) FROM Investment_Transactions WHERE Securities_Id = h.Securities_Id AND Accounts_Id = h.Accounts_Id AND Date > p.wtd_start), 0) as qty_wtd,
-            h.Quantity - COALESCE((SELECT SUM(CASE WHEN Action = 'Buy' THEN Quantity WHEN Action = 'Sell' THEN -Quantity ELSE 0 END) FROM Investment_Transactions WHERE Securities_Id = h.Securities_Id AND Accounts_Id = h.Accounts_Id AND Date > p.mtd_start), 0) as qty_mtd,
-            h.Quantity - COALESCE((SELECT SUM(CASE WHEN Action = 'Buy' THEN Quantity WHEN Action = 'Sell' THEN -Quantity ELSE 0 END) FROM Investment_Transactions WHERE Securities_Id = h.Securities_Id AND Accounts_Id = h.Accounts_Id AND Date > p.ytd_start), 0) as qty_ytd
+            h.Quantity - COALESCE((SELECT SUM(CASE WHEN Action IN ('Buy', 'Reinvest') THEN Quantity WHEN Action = 'Sell' THEN -Quantity ELSE 0 END) FROM Investments WHERE Securities_Id = h.Securities_Id AND Accounts_Id = h.Accounts_Id AND Date > p.dtd_start), 0) as qty_dtd,
+            h.Quantity - COALESCE((SELECT SUM(CASE WHEN Action IN ('Buy', 'Reinvest') THEN Quantity WHEN Action = 'Sell' THEN -Quantity ELSE 0 END) FROM Investments WHERE Securities_Id = h.Securities_Id AND Accounts_Id = h.Accounts_Id AND Date > p.wtd_start), 0) as qty_wtd,
+            h.Quantity - COALESCE((SELECT SUM(CASE WHEN Action IN ('Buy', 'Reinvest') THEN Quantity WHEN Action = 'Sell' THEN -Quantity ELSE 0 END) FROM Investments WHERE Securities_Id = h.Securities_Id AND Accounts_Id = h.Accounts_Id AND Date > p.mtd_start), 0) as qty_mtd,
+            h.Quantity - COALESCE((SELECT SUM(CASE WHEN Action IN ('Buy', 'Reinvest') THEN Quantity WHEN Action = 'Sell' THEN -Quantity ELSE 0 END) FROM Investments WHERE Securities_Id = h.Securities_Id AND Accounts_Id = h.Accounts_Id AND Date > p.ytd_start), 0) as qty_ytd
         FROM periods p
         CROSS JOIN Holdings h
     ),
     prices_fx AS (
         SELECT 
             hh.*,
-            (SELECT Price_Close FROM Historical_Prices WHERE Securities_Id = hh.Securities_Id AND Price_Date <= hh.today ORDER BY Price_Date DESC LIMIT 1) as price_today,
-            (SELECT Price_Close FROM Historical_Prices WHERE Securities_Id = hh.Securities_Id AND Price_Date <= hh.dtd_start ORDER BY Price_Date DESC LIMIT 1) as price_dtd,
-            (SELECT Price_Close FROM Historical_Prices WHERE Securities_Id = hh.Securities_Id AND Price_Date <= hh.wtd_start ORDER BY Price_Date DESC LIMIT 1) as price_wtd,
-            (SELECT Price_Close FROM Historical_Prices WHERE Securities_Id = hh.Securities_Id AND Price_Date <= hh.mtd_start ORDER BY Price_Date DESC LIMIT 1) as price_mtd,
-            (SELECT Price_Close FROM Historical_Prices WHERE Securities_Id = hh.Securities_Id AND Price_Date <= hh.ytd_start ORDER BY Price_Date DESC LIMIT 1) as price_ytd,
-            (SELECT FX_Rate FROM Historical_FX WHERE Base_Currency_Id = s.Currencies_Id AND FX_Date <= hh.today ORDER BY FX_Date DESC LIMIT 1) as fx_today,
-            (SELECT FX_Rate FROM Historical_FX WHERE Base_Currency_Id = s.Currencies_Id AND FX_Date <= hh.dtd_start ORDER BY FX_Date DESC LIMIT 1) as fx_dtd,
-            (SELECT FX_Rate FROM Historical_FX WHERE Base_Currency_Id = s.Currencies_Id AND FX_Date <= hh.wtd_start ORDER BY FX_Date DESC LIMIT 1) as fx_wtd,
-            (SELECT FX_Rate FROM Historical_FX WHERE Base_Currency_Id = s.Currencies_Id AND FX_Date <= hh.mtd_start ORDER BY FX_Date DESC LIMIT 1) as fx_mtd,
-            (SELECT FX_Rate FROM Historical_FX WHERE Base_Currency_Id = s.Currencies_Id AND FX_Date <= hh.ytd_start ORDER BY FX_Date DESC LIMIT 1) as fx_ytd,
-            s.Security_Name, a.Accounts_Name
+            (SELECT Close FROM Historical_Prices WHERE Securities_Id = hh.Securities_Id AND Date <= hh.today ORDER BY Date DESC LIMIT 1) as price_today,
+            (SELECT Close FROM Historical_Prices WHERE Securities_Id = hh.Securities_Id AND Date <= hh.dtd_start ORDER BY Date DESC LIMIT 1) as price_dtd,
+            (SELECT Close FROM Historical_Prices WHERE Securities_Id = hh.Securities_Id AND Date <= hh.wtd_start ORDER BY Date DESC LIMIT 1) as price_wtd,
+            (SELECT Close FROM Historical_Prices WHERE Securities_Id = hh.Securities_Id AND Date <= hh.mtd_start ORDER BY Date DESC LIMIT 1) as price_mtd,
+            (SELECT Close FROM Historical_Prices WHERE Securities_Id = hh.Securities_Id AND Date <= hh.ytd_start ORDER BY Date DESC LIMIT 1) as price_ytd,
+            (SELECT FX_Rate FROM Historical_FX WHERE Currencies_Id_1 = s.Currencies_Id AND Date <= hh.today ORDER BY Date DESC LIMIT 1) as fx_today,
+            (SELECT FX_Rate FROM Historical_FX WHERE Currencies_Id_1 = s.Currencies_Id AND Date <= hh.dtd_start ORDER BY Date DESC LIMIT 1) as fx_dtd,
+            (SELECT FX_Rate FROM Historical_FX WHERE Currencies_Id_1 = s.Currencies_Id AND Date <= hh.wtd_start ORDER BY Date DESC LIMIT 1) as fx_wtd,
+            (SELECT FX_Rate FROM Historical_FX WHERE Currencies_Id_1 = s.Currencies_Id AND Date <= hh.mtd_start ORDER BY Date DESC LIMIT 1) as fx_mtd,
+            (SELECT FX_Rate FROM Historical_FX WHERE Currencies_Id_1 = s.Currencies_Id AND Date <= hh.ytd_start ORDER BY Date DESC LIMIT 1) as fx_ytd,
+            s.Securities_Name, a.Accounts_Name
         FROM historical_holdings hh
         JOIN Securities s ON hh.Securities_Id = s.Securities_Id
         JOIN Accounts a ON hh.Accounts_Id = a.Accounts_Id
@@ -296,32 +584,526 @@ def get_pnl_report_data():
                     WHEN Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -Total_Amount 
                     ELSE 0 END) 
                 ELSE 0 END) as cf_ytd,
-            SUM(CASE 
+/*
+                SUM(CASE 
                 WHEN Action IN ('Buy', 'MiscExp') THEN Total_Amount 
                 WHEN Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -Total_Amount 
                 ELSE 0 END) as cf_all_time,
+*/
+            -- Net cash you actually paid out of pocket (true economic cost)
+            SUM(CASE
+                WHEN Action = 'Buy'      THEN Total_Amount          -- cash spent on purchases
+                WHEN Action = 'Sell'     THEN -Total_Amount         -- cash received from sales
+                WHEN Action = 'Exercise' THEN Total_Amount          -- cash paid to exercise options
+                WHEN Action = 'MiscExp'  THEN Total_Amount          -- fees paid
+                WHEN Action = 'Reinvest' THEN Total_Amount          -- treated as a buy
+                -- Vest/Grant/ShrIn: zero cash cost, but add fair value at vest as synthetic cost:
+                WHEN Action IN ('Vest', 'Grant') THEN 0             -- or Price_Per_Share * Quantity if you record grant price
+                WHEN Action = 'ShrIn'    THEN Total_Amount          -- cost basis of transferred shares
+                WHEN Action = 'ShrOut'   THEN -Total_Amount         -- remove cost basis
+                -- These are inter-account cash movements, NOT investment P&L:
+                -- EXCLUDE CashIn / CashOut entirely
+                WHEN Action IN ('Dividend', 'IntInc', 'RtrnCap') THEN -Total_Amount
+                ELSE 0
+            END) as cf_all_time,
+
             SUM(CASE 
                 WHEN Action IN ('Buy', 'CashOut', 'MiscExp') THEN Total_Amount 
                 WHEN Action IN ('Sell', 'Dividend', 'IntInc', 'CashIn', 'RtrnCap') THEN -Total_Amount 
                 ELSE 0 END) as net_invested_all_time                
-        FROM Investment_Transactions
+        FROM Investments
         GROUP BY Accounts_Id, Securities_Id
     )
     SELECT 
-        pf.Accounts_Name, pf.Security_Name,
+        pf.Accounts_Name, pf.Securities_Name,
+        -- Συνολική Αξία σήμερα σε EUR
         (pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)) as current_value_eur,
+        
+        -- --- DTD ANALYSIS ---
+        -- 1. P&L λόγω μεταβολής Τιμής (Market Effect YTD)
+        ((pf.qty_today * pf.price_today) - (pf.qty_dtd * pf.price_dtd) - COALESCE(cf.cf_dtd, 0)) * COALESCE(pf.fx_today, 1) as pnl_dtd_market_eur,
+        -- 2. P&L λόγω μεταβολής Ισοτιμίας (FX Effect YTD)
+        (pf.qty_dtd * pf.price_dtd) * (COALESCE(pf.fx_today, 1) - COALESCE(pf.fx_dtd, 1)) as pnl_dtd_fx_eur,
+        -- Συνολικό YTD P&L
         (pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)) - (pf.qty_dtd * pf.price_dtd * COALESCE(pf.fx_dtd, 1)) - COALESCE(cf.cf_dtd, 0) as pnl_dtd_eur,
+
+        -- Υπόλοιπα διαστήματα
         (pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)) - (pf.qty_wtd * pf.price_wtd * COALESCE(pf.fx_wtd, 1)) - COALESCE(cf.cf_wtd, 0) as pnl_wtd_eur,
         (pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)) - (pf.qty_mtd * pf.price_mtd * COALESCE(pf.fx_mtd, 1)) - COALESCE(cf.cf_mtd, 0) as pnl_mtd_eur,
+
+                -- --- YTD ANALYSIS ---
+        -- 1. P&L λόγω μεταβολής Τιμής (Market Effect YTD)
+    --    ((pf.qty_today * pf.price_today) - (pf.qty_ytd * pf.price_ytd) - COALESCE(cf.cf_ytd, 0)) * COALESCE(pf.fx_today, 1) as pnl_ytd_market_eur,
+        ((pf.qty_today * pf.price_today) - (pf.qty_ytd * pf.price_ytd) - (COALESCE(cf.cf_ytd, 0) / NULLIF(COALESCE(pf.fx_today, 1), 0))) * COALESCE(pf.fx_today, 1) as pnl_ytd_market_eur,
+
+        -- 2. P&L λόγω μεταβολής Ισοτιμίας (FX Effect YTD)
+        (pf.qty_ytd * pf.price_ytd) * (COALESCE(pf.fx_today, 1) - COALESCE(pf.fx_ytd, 1)) as pnl_ytd_fx_eur,
+        
+        -- Συνολικό YTD P&L
         (pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)) - (pf.qty_ytd * pf.price_ytd * COALESCE(pf.fx_ytd, 1)) - COALESCE(cf.cf_ytd, 0) as pnl_ytd_eur,
+        
         (pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)) - COALESCE(cf.cf_all_time, 0) as pnl_all_time_eur,
         (pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)) - COALESCE(cf.net_invested_all_time, 0) as pnl_net_all_time_eur,
+        
         (SELECT Quantity * (pf.price_today - Fifo_Avg_Price) * COALESCE(pf.fx_today, 1) FROM Holdings WHERE Accounts_Id = pf.Accounts_Id AND Securities_Id = pf.Securities_Id) as unrealized_pnl_eur      
     FROM prices_fx pf
     LEFT JOIN cash_flows cf ON pf.Accounts_Id = cf.Accounts_Id AND pf.Securities_Id = cf.Securities_Id
-    ORDER BY pf.Accounts_Name, pf.Security_Name;
+    ORDER BY pf.Accounts_Name, pf.Securities_Name;
     """
     
     df = pd.read_sql(query, conn)
     conn.close()
     return df
+
+
+@st.cache_data(ttl=3600)
+def get_income_expense_data(start_date, end_date, category_id=None, cash_account_types=None, inv_account_types=None):
+    """Get income and expense data for a period, optionally filtered by category.
+    Includes both bank transactions, investment transactions (dividends, interest, etc.),
+    and realized P&L from securities sales calculated using FIFO method with FX conversion.
+    All amounts are converted to EUR using historical FX rates.
+    """
+    conn = get_connection()
+
+    # Μετατρέπουμε τη λίστα σε tuple για την SQL (π.χ. ('Brokerage', 'Pension'))
+    if not cash_account_types:
+        cash_account_types = ['Cash', 'Checking', 'Savings', 'Credit Card', 'Loan', 'Real Estate', 'Vehicle', 'Asset', 'Liability', 'Other']
+    
+    cash_account_types_tuple = tuple(cash_account_types)
+
+    if not inv_account_types:
+        inv_account_types = ['Brokerage', 'Other Investment', 'Margin']
+    
+    inv_account_types_tuple = tuple(inv_account_types)
+
+
+    # First, create the CategoryHierarchy CTE
+    category_hierarchy_cte = """
+    WITH RECURSIVE CategoryHierarchy AS (
+        SELECT 
+            Categories_Id, 
+            Categories_Name::TEXT as Full_Path,
+            Categories_Name::TEXT as Name,
+            Categories_Type::TEXT as Categories_Type,
+            Categories_Id_Parent,
+            0 as Level
+        FROM Categories 
+        WHERE Categories_Id_Parent IS NULL
+        
+        UNION ALL
+        
+        SELECT 
+            c.Categories_Id, 
+            ch.Full_Path || ' : ' || c.Categories_Name as Full_Path,
+            c.Categories_Name as Name,
+            c.Categories_Type::TEXT as Categories_Type,
+            c.Categories_Id_Parent,
+            ch.Level + 1 as Level
+        FROM Categories c
+        JOIN CategoryHierarchy ch ON c.Categories_Id_Parent = ch.Categories_Id
+    )
+    """
+    
+    # Build the complete query with UNION of Bank Transactions, Investment Transactions, and Realized P&L
+    base_query = f"""
+    {category_hierarchy_cte},
+    DateRange AS (
+        SELECT %s::date as start_date, %s::date as end_date
+    ),
+    -- Get FX rates for currency conversion
+    FX_Rates AS (
+        SELECT DISTINCT ON (currencies_id_1)
+            hf.currencies_id_1,
+            hf.currencies_id_2,
+            hf.fx_rate,
+            hf.date,
+            c.currencies_shortname as base_currency
+        FROM Historical_FX hf
+        JOIN Currencies c ON hf.currencies_id_1 = c.currencies_id
+        WHERE hf.currencies_id_2 = (SELECT currencies_id FROM Currencies WHERE currencies_shortname = 'EUR')
+          AND hf.date <= (SELECT end_date FROM DateRange)
+        ORDER BY currencies_id_1, hf.date DESC
+    ),
+    -- Default FX rates for each currency
+    DefaultFX_Rates AS (
+        SELECT DISTINCT ON (c.currencies_id)
+            c.currencies_id as currencies_id_1,
+            c.currencies_shortname as base_currency,
+            COALESCE(hf.fx_rate, 1) as fx_rate
+        FROM Currencies c
+        LEFT JOIN Historical_FX hf ON c.currencies_id = hf.currencies_id_1 
+            AND hf.currencies_id_2 = (SELECT currencies_id FROM Currencies WHERE currencies_shortname = 'EUR')
+            AND hf.date <= (SELECT end_date FROM DateRange)
+        WHERE c.currencies_shortname != 'EUR'
+        ORDER BY c.currencies_id, hf.date DESC
+    ),
+    -- Calculate Realized P&L using FIFO method
+    FIFO_Inventory AS (
+        SELECT 
+            t.Accounts_Id,
+            t.Securities_Id,
+            t.Date,
+            t.Investments_Id,
+            t.Action,
+            t.Quantity,
+            t.Price_Per_Share,
+            t.Total_Amount,
+            t.Commission,
+            -- Running total of shares bought
+            SUM(CASE WHEN t.Action IN ('Buy', 'Reinvest', 'ShrIn') THEN t.Quantity ELSE 0 END) 
+                OVER (PARTITION BY t.Accounts_Id, t.Securities_Id ORDER BY t.Date, t.Investments_Id) as running_bought,
+            -- Running total of shares sold
+            SUM(CASE WHEN t.Action IN ('Sell', 'ShrOut') THEN t.Quantity ELSE 0 END) 
+                OVER (PARTITION BY t.Accounts_Id, t.Securities_Id ORDER BY t.Date, t.Investments_Id) as running_sold,
+            -- Total bought for FIFO calculation
+            SUM(CASE WHEN t.Action IN ('Buy', 'Reinvest', 'ShrIn') THEN t.Quantity ELSE 0 END) 
+                OVER (PARTITION BY t.Accounts_Id, t.Securities_Id) as total_bought,
+            -- Get the security currency
+            s.Currencies_Id as security_currency_id,
+            cur_s.Currencies_ShortName as security_currency
+        FROM Investments t
+        JOIN Securities s ON t.Securities_Id = s.Securities_Id
+        JOIN Currencies cur_s ON s.Currencies_Id = cur_s.Currencies_Id
+        WHERE t.Action IN ('Buy', 'Reinvest', 'ShrIn', 'Sell', 'ShrOut')
+          AND t.Date <= (SELECT end_date FROM DateRange)
+    ),
+    -- Step 1: Materialise cumulative_bought_before for each sale row.
+    -- This intermediate CTE is necessary because PostgreSQL does not allow a
+    -- SELECT-list alias (cumulative_bought_before) to be referenced by another
+    -- expression in the same SELECT list (the purchase_lots subquery).
+    FIFO_Sales AS (
+        SELECT 
+            f.Accounts_Id,
+            f.Securities_Id,
+            f.Date as sale_date,
+            f.Investments_Id as sale_id,
+            f.Quantity as sold_quantity,
+            f.Price_Per_Share as sale_price,
+            f.Total_Amount as sale_amount,
+            f.Commission as sale_commission,
+            f.security_currency_id,
+            f.security_currency,
+            -- How many shares have already been consumed by prior sales (FIFO offset).
+            -- We sum prior SELL quantities, NOT prior buy quantities.
+            -- Using prior buys was the bug: it pushed the sale window past the buy lots entirely.
+            (SELECT COALESCE(SUM(f2.Quantity), 0) 
+             FROM FIFO_Inventory f2 
+             WHERE f2.Accounts_Id = f.Accounts_Id 
+               AND f2.Securities_Id = f.Securities_Id 
+               AND f2.Action IN ('Sell', 'ShrOut')
+               AND (f2.Date < f.Date OR (f2.Date = f.Date AND f2.Investments_Id < f.Investments_Id))
+            ) as cumulative_bought_before
+        FROM FIFO_Inventory f
+        WHERE f.Action IN ('Sell', 'ShrOut')
+          AND f.Date BETWEEN (SELECT start_date FROM DateRange) AND (SELECT end_date FROM DateRange)
+    ),
+    -- Step 2: Now that cumulative_bought_before is a real column we can reference
+    -- it freely inside the purchase_lots correlated subquery.
+    FIFO_CostBasis AS (
+        SELECT 
+            fs.Accounts_Id,
+            fs.Securities_Id,
+            fs.sale_date,
+            fs.sale_id,
+            fs.sold_quantity,
+            fs.sale_price,
+            fs.sale_amount,
+            fs.sale_commission,
+            fs.security_currency_id,
+            fs.security_currency,
+            (
+                SELECT json_agg(json_build_object(
+                    'purchase_date', purchase_date,
+                    'quantity', quantity,
+                    'price', price,
+                    'cost', cost
+                ))
+                FROM (
+                    SELECT 
+                        p.Date as purchase_date,
+                        -- Correct FIFO overlap formula:
+                        --   lot covers  [lot_start, lot_end)  where lot_start = running_bought - Quantity
+                        --   sale covers [sale_start, sale_end) where sale_start = cumulative_bought_before
+                        --   allocated qty = LEAST(lot_end, sale_end) - GREATEST(lot_start, sale_start)
+                        GREATEST(0,
+                            LEAST(p.running_bought,
+                                  fs.cumulative_bought_before + fs.sold_quantity)
+                            - GREATEST(p.running_bought - p.Quantity,
+                                       fs.cumulative_bought_before)
+                        ) as quantity,
+                        p.Price_Per_Share as price,
+                        p.Price_Per_Share * GREATEST(0,
+                            LEAST(p.running_bought,
+                                  fs.cumulative_bought_before + fs.sold_quantity)
+                            - GREATEST(p.running_bought - p.Quantity,
+                                       fs.cumulative_bought_before)
+                        ) as cost
+                    FROM FIFO_Inventory p
+                    WHERE p.Accounts_Id = fs.Accounts_Id 
+                      AND p.Securities_Id = fs.Securities_Id
+                      AND p.Action IN ('Buy', 'Reinvest', 'ShrIn')
+                      AND p.Date <= fs.sale_date
+                      -- Only lots that overlap with the sale range
+                      AND p.running_bought > fs.cumulative_bought_before
+                      AND p.running_bought - p.Quantity < fs.cumulative_bought_before + fs.sold_quantity
+                    ORDER BY p.Date, p.Investments_Id
+                ) lots
+                WHERE quantity > 0
+            ) as purchase_lots
+        FROM FIFO_Sales fs
+    ),
+    -- Calculate the realized P&L for each sale
+    RealizedPNL AS (
+        SELECT 
+            fc.sale_date as date,
+            DATE_TRUNC('month', fc.sale_date)::timestamp without time zone as month_date,
+            EXTRACT(YEAR FROM fc.sale_date) as year,
+            EXTRACT(MONTH FROM fc.sale_date) as month,
+            fc.Accounts_Id,
+            fc.Securities_Id,
+            -- Calculate cost basis in original currency
+            (SELECT COALESCE(SUM((lot->>'cost')::numeric), 0) FROM json_array_elements(fc.purchase_lots) as lot) as cost_basis_original,
+            fc.sale_amount as sale_proceeds_original,
+            fc.sale_commission as commission_original,
+            -- Calculate realized P&L in original currency
+            (fc.sale_amount - COALESCE((SELECT COALESCE(SUM((lot->>'cost')::numeric), 0) FROM json_array_elements(fc.purchase_lots) as lot), 0) - fc.sale_commission) as realized_pnl_original,
+            -- Get account currency for FX conversion
+            a.Currencies_Id as account_currency_id,
+            curr_acc.Currencies_ShortName as account_currency,
+            fc.security_currency,
+            -- Description for the transaction
+            (SELECT Securities_Name FROM Securities WHERE Securities_Id = fc.Securities_Id) as description,
+            -- Map to category
+            (SELECT Categories_Id FROM Categories WHERE Categories_Name = '_RealizedGain' LIMIT 1) as gain_category_id,
+            (SELECT Categories_Id FROM Categories WHERE Categories_Name = '_RealizedLoss' LIMIT 1) as loss_category_id
+        FROM FIFO_CostBasis fc
+        JOIN Accounts a ON fc.Accounts_Id = a.Accounts_Id
+        JOIN Currencies curr_acc ON a.Currencies_Id = curr_acc.Currencies_Id
+        WHERE fc.sold_quantity > 0
+    ),
+    -- Convert realized P&L to EUR
+    RealizedPNL_EUR AS (
+        SELECT 
+            rp.date,
+            rp.month_date,
+            rp.year,
+            rp.month,
+            -- Convert realized P&L to EUR using FX rate on sale date
+            CASE 
+                WHEN rp.account_currency = 'EUR' THEN rp.realized_pnl_original
+                ELSE rp.realized_pnl_original * COALESCE(
+                    (SELECT fx_rate FROM FX_Rates 
+                     WHERE currencies_id_1 = rp.account_currency_id 
+                       AND date <= rp.date 
+                     ORDER BY date DESC LIMIT 1),
+                    (SELECT fx_rate FROM DefaultFX_Rates WHERE currencies_id_1 = rp.account_currency_id),
+                    1
+                )
+            END as split_amount_eur,
+            rp.realized_pnl_original as split_amount_original,
+            rp.account_currency as original_currency,
+            -- Use gain or loss category based on P&L sign
+            CASE 
+                WHEN rp.realized_pnl_original > 0 THEN rp.gain_category_id
+                ELSE rp.loss_category_id
+            END as categories_id,
+            rp.description,
+            rp.Accounts_id,
+            a.accounts_name,
+            a.accounts_type,
+            NULL as payees_name,
+            'Realized P&L' as source_type
+        FROM RealizedPNL rp
+        JOIN Accounts a ON rp.Accounts_Id = a.Accounts_Id
+    ),
+    BankTransactionData AS (
+        SELECT 
+            t.date::timestamp without time zone as date,
+            DATE_TRUNC('month', t.date)::timestamp without time zone as month_date,
+            EXTRACT(YEAR FROM t.date) as year,
+            EXTRACT(MONTH FROM t.date) as month,
+            -- Convert amount to EUR using the FX rate as of the transaction date
+            CASE 
+                WHEN curr.currencies_shortname = 'EUR' THEN s.amount
+                ELSE s.amount * COALESCE(
+                    (SELECT fx_rate FROM FX_Rates 
+                     WHERE currencies_id_1 = curr.currencies_id 
+                       AND date <= t.date 
+                     ORDER BY date DESC LIMIT 1),
+                    (SELECT fx_rate FROM DefaultFX_Rates WHERE currencies_id_1 = curr.currencies_id),
+                    1
+                )
+            END as split_amount_eur,
+            s.amount as split_amount_original,
+            curr.currencies_shortname as original_currency,
+            s.categories_id,
+            t.description,
+            t.accounts_id,
+            a.accounts_name,
+            a.accounts_type,
+            p.payees_name,
+            'Bank' as source_type
+        FROM Transactions t
+        JOIN Splits s ON t.transactions_id = s.transactions_id
+        JOIN CategoryHierarchy ch ON s.categories_id = ch.Categories_Id
+        JOIN Accounts a ON t.accounts_id = a.accounts_id
+        JOIN Currencies curr ON a.currencies_id = curr.currencies_id
+        LEFT JOIN Payees p ON t.payees_id = p.payees_id
+        WHERE t.date BETWEEN (SELECT start_date FROM DateRange) AND (SELECT end_date FROM DateRange)
+    --      AND a.accounts_type NOT IN ('Brokerage', 'Pension', 'Other Investment', 'Margin')
+          AND a.accounts_type IN %s
+          AND s.amount != 0
+    ),
+    InvestmentTransactionData AS (
+        SELECT 
+            t.date::timestamp without time zone as date,
+            DATE_TRUNC('month', t.date)::timestamp without time zone as month_date,
+            EXTRACT(YEAR FROM t.date) as year,
+            EXTRACT(MONTH FROM t.date) as month,
+            -- Convert amount to EUR using the FX rate as of the transaction date
+            CASE 
+                WHEN curr.currencies_shortname = 'EUR' THEN 
+                    CASE 
+                        WHEN t.action IN ('Dividend', 'IntInc') THEN t.total_amount
+                        WHEN t.action IN ('MiscExp') THEN -ABS(t.total_amount)
+                        ELSE 0
+                    END
+                ELSE 
+                    CASE 
+                        WHEN t.action IN ('Dividend', 'IntInc') THEN t.total_amount * COALESCE(
+                            (SELECT fx_rate FROM FX_Rates 
+                             WHERE currencies_id_1 = curr.currencies_id 
+                               AND date <= t.date 
+                             ORDER BY date DESC LIMIT 1),
+                            (SELECT fx_rate FROM DefaultFX_Rates WHERE currencies_id_1 = curr.currencies_id),
+                            1
+                        )
+                        WHEN t.action IN ('MiscExp') THEN -ABS(t.total_amount) * COALESCE(
+                            (SELECT fx_rate FROM FX_Rates 
+                             WHERE currencies_id_1 = curr.currencies_id 
+                               AND date <= t.date 
+                             ORDER BY date DESC LIMIT 1),
+                            (SELECT fx_rate FROM DefaultFX_Rates WHERE currencies_id_1 = curr.currencies_id),
+                            1
+                        )
+                        ELSE 0
+                    END
+            END as split_amount_eur,
+            CASE 
+                WHEN t.action IN ('Dividend', 'IntInc') THEN t.total_amount
+                WHEN t.action IN ('MiscExp') THEN -ABS(t.total_amount)
+                ELSE 0
+            END as split_amount_original,
+            curr.currencies_shortname as original_currency,
+            -- Map investment actions to appropriate categories
+            CASE
+                WHEN t.action = 'Dividend' THEN (SELECT Categories_Id FROM Categories WHERE Categories_Name = '_DivInc' LIMIT 1)
+                WHEN t.action = 'IntInc' THEN (SELECT Categories_Id FROM Categories WHERE Categories_Name = '_IntInc' LIMIT 1)
+                WHEN t.action = 'MiscExp' THEN (SELECT Categories_Id FROM Categories WHERE Categories_Name = '_MiscExp' LIMIT 1)
+                ELSE NULL
+            END as categories_id,
+            COALESCE((SELECT s.Securities_Name FROM Securities s WHERE s.Securities_Id = t.Securities_id), t.description) as description,
+            t.accounts_id,
+            a.accounts_name,
+            a.accounts_type,
+            NULL as payees_name,
+            'Investment' as source_type
+        FROM Investments t
+        JOIN Accounts a ON t.accounts_id = a.accounts_id
+        JOIN Currencies curr ON a.currencies_id = curr.currencies_id
+        WHERE t.date BETWEEN (SELECT start_date FROM DateRange) AND (SELECT end_date FROM DateRange)
+    --      AND a.accounts_type IN ('Brokerage', 'Pension', 'Other Investment', 'Margin')
+          AND a.accounts_type IN %s
+          AND t.action IN ('Dividend', 'IntInc', 'MiscExp')
+          AND t.total_amount != 0
+    ),
+    TransactionData AS (
+        SELECT * FROM BankTransactionData
+        UNION ALL
+        SELECT * FROM InvestmentTransactionData
+        UNION ALL
+        SELECT * FROM RealizedPNL_EUR
+    )
+    SELECT 
+        td.date,
+        td.month_date,
+        td.year,
+        td.month,
+        td.split_amount_eur as split_amount,
+        td.split_amount_original,
+        td.original_currency,
+        td.categories_id,
+        td.description,
+        td.accounts_id,
+        td.accounts_name,
+        td.accounts_type,
+        td.payees_name,
+        CASE WHEN td.source_type = 'Realized P&L' THEN 'Investment' ELSE td.source_type END as source_type,
+        COALESCE(c.Full_Path, 
+            CASE 
+                WHEN td.source_type = 'Realized P&L' AND td.split_amount_eur > 0 THEN '_RlzdGain' --'Investment: Realized Gains'
+                WHEN td.source_type = 'Realized P&L' AND td.split_amount_eur < 0 THEN '_RlzdGain' --'Investment: Realized Losses'
+                ELSE 'Uncategorized'
+            END
+        ) as category_full_path,
+        COALESCE(c.Name,
+            CASE 
+                WHEN td.source_type = 'Realized P&L' AND td.split_amount_eur > 0 THEN '_RlzdGain' --'Realized Gains'
+                WHEN td.source_type = 'Realized P&L' AND td.split_amount_eur < 0 THEN '_RlzdGain' --'Realized Losses'
+                ELSE 'Uncategorized'
+            END
+        ) as category_name,
+        COALESCE(c.Categories_Type, 
+            CASE 
+            --    WHEN td.split_amount_eur > 0 THEN 'Income'::text 
+                WHEN td.split_amount_eur != 0 THEN 'Income'::text 
+                ELSE 'Expense'::text 
+            END
+        ) as Categories_Type,
+        COALESCE(c.Level, 0) as category_level
+    FROM TransactionData td
+    LEFT JOIN CategoryHierarchy c ON td.categories_id = c.Categories_Id
+    """
+    
+    params = [start_date, end_date, cash_account_types_tuple, inv_account_types_tuple]
+    
+    # Add category filter if specified
+    if category_id:
+        cursor = conn.cursor()
+        cursor.execute("""
+            WITH RECURSIVE CategoryHierarchy AS (
+                SELECT Categories_Id, Categories_Name::TEXT as Full_Path
+                FROM Categories WHERE Categories_Id = %s
+                UNION ALL
+                SELECT c.Categories_Id, ch.Full_Path || ' : ' || c.Categories_Name
+                FROM Categories c
+                JOIN CategoryHierarchy ch ON c.Categories_Id_Parent = ch.Categories_Id
+            )
+            SELECT Full_Path FROM CategoryHierarchy WHERE Categories_Id = %s
+        """, (category_id, category_id))
+        result = cursor.fetchone()
+        cursor.close()
+        
+        if result:
+            category_path = result[0]
+            base_query += " AND c.Full_Path LIKE %s || '%%'"
+            params.append(category_path)
+    
+    base_query += " ORDER BY td.date DESC, c.Full_Path"
+    
+    df = pd.read_sql(base_query, conn, params=params)
+    conn.close()
+    
+    # Convert datetime columns to naive datetime
+    if 'date' in df.columns:
+        df['date'] = pd.to_datetime(df['date'], errors='coerce')
+        if hasattr(df['date'].dt, 'tz') and df['date'].dt.tz is not None:
+            df['date'] = df['date'].dt.tz_localize(None)
+    
+    if 'month_date' in df.columns:
+        df['month_date'] = pd.to_datetime(df['month_date'], errors='coerce')
+        if hasattr(df['month_date'].dt, 'tz') and df['month_date'].dt.tz is not None:
+            df['month_date'] = df['month_date'].dt.tz_localize(None)
+    
+    return df
+ 
