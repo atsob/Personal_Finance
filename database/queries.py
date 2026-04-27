@@ -199,9 +199,7 @@ def get_hist_net_worth_data(start_date):
 
 @st.cache_data(ttl=3600)
 def get_hist_inv_positions_data(start_date):
-    """Get historical investment positions data."""
     conn = get_connection()
-    
     query = f"""
     WITH RECURSIVE 
     months AS (
@@ -222,7 +220,10 @@ def get_hist_inv_positions_data(start_date):
             h.Securities_Id,
             h.Accounts_Id,
             h.Quantity - COALESCE((
-                SELECT SUM(CASE WHEN Action = 'Buy' THEN Quantity WHEN Action = 'Sell' THEN -Quantity ELSE 0 END)
+                SELECT SUM(CASE 
+                    WHEN Action IN ('Buy', 'Reinvest', 'ShrIn') THEN Quantity 
+                    WHEN Action IN ('Sell', 'ShrOut') THEN -Quantity 
+                    ELSE 0 END)
                 FROM Investments 
                 WHERE Securities_Id = h.Securities_Id AND Accounts_Id = h.Accounts_Id
                 AND Date > dt.d
@@ -242,24 +243,26 @@ def get_hist_inv_positions_data(start_date):
     )
     SELECT 
         hq.date,
-        COALESCE(a.Accounts_Name, 'Total') as Accounts_Name,
-        SUM(hq.qty_at_date * COALESCE(dp.close, 0) * 
+        a.Accounts_Name,
+        s.Securities_Name,
+        hq.qty_at_date,
+        COALESCE(dp.close, 0) as price_at_date,
+        (hq.qty_at_date * COALESCE(dp.close, 0) * 
             CASE WHEN cur_s.Currencies_ShortName = 'EUR' THEN 1 ELSE COALESCE(dfx.fx_rate, 1) END
-        ) as account_value
+        ) as value_in_eur
     FROM historical_qty hq
     JOIN Accounts a ON hq.Accounts_Id = a.Accounts_Id
     JOIN Securities s ON hq.Securities_Id = s.Securities_Id
     JOIN Currencies cur_s ON s.Currencies_Id = cur_s.Currencies_Id
     LEFT JOIN daily_prices dp ON hq.date = dp.date AND hq.Securities_Id = dp.Securities_Id
     LEFT JOIN daily_fx dfx ON hq.date = dfx.date AND s.Currencies_Id = dfx.Currencies_Id
-    GROUP BY hq.date, ROLLUP(a.Accounts_Name)
-    HAVING SUM(hq.qty_at_date) > 0 
-    ORDER BY hq.date ASC, (a.Accounts_Name IS NULL) ASC, a.Accounts_Name ASC
+    WHERE hq.qty_at_date != 0
+    ORDER BY hq.date ASC, a.Accounts_Name ASC, value_in_eur DESC
     """
-    
     df = pd.read_sql(query, conn)
     conn.close()
     return df
+
 
 
 @st.cache_data(ttl=3600)

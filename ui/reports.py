@@ -14,7 +14,7 @@ def render_reports(conn):
     
     hist_sub_menu = st.sidebar.radio(
         "Select Report:",
-        ["Historical Net Worth", "Historical Investment Positions", "P&L Reports", "Securities Analysis", "Income & Expense"],
+        ["Historical Net Worth", "Historical Investment Positions", "P&L Reports", "Securities & Portfolio Analysis", "Income & Expense"],
         key="hist_sub_nav"
     )
     
@@ -128,6 +128,7 @@ def render_reports(conn):
     elif hist_sub_menu == "Historical Investment Positions":
         st.subheader("📈 Investments Position Progress (Monthly)")
         
+        # ... (Start Date logic remains same) ...
         last_day_prev_month = pd.Timestamp.now().replace(day=1) - pd.Timedelta(days=1)
         
         min_inv_date = st.sidebar.date_input(
@@ -137,57 +138,86 @@ def render_reports(conn):
             key="inv_date"
         )
         st.session_state.inv_date_val = min_inv_date
+
+
+        df_raw = get_hist_inv_positions_data(min_inv_date)
         
-        df_inv = get_hist_inv_positions_data(min_inv_date)
+        if df_raw.empty:
+            st.warning("No data found for the selected period.")
+            return
+
+        # 1. Προετοιμασία δεδομένων για το Γράφημα (Pivot by Account)
+        df_acc_daily = df_raw.groupby(['date', 'accounts_name'])['value_in_eur'].sum().reset_index()
         
-        if st.sidebar.button("🔄 Refresh Positions"):
-            get_hist_inv_positions_data.clear()
-            st.cache_data.clear()
-            st.rerun()
+        # Υπολογισμός Total για κάθε ημερομηνία
+        df_total = df_raw.groupby('date')['value_in_eur'].sum().reset_index()
+        df_total['accounts_name'] = 'TOTAL'
         
-        try:
-            df_inv.columns = [c.lower() for c in df_inv.columns]
-            df_inv['date'] = pd.to_datetime(df_inv['date'])
+        # Ένωση για το γράφημα
+        df_plot = pd.concat([df_acc_daily, df_total])
+        df_pivot = df_plot.pivot(index='date', columns='accounts_name', values='value_in_eur').fillna(0).reset_index()
+
+        tab_graph, tab_data, tab_details = st.tabs(["📊 Graph", "📋 Summary per Account", "🔍 Detail Analysis"])
+        
+        with tab_graph:
+            fig = px.line(df_pivot, x="date", y=[c for c in df_pivot.columns if c != 'date'],
+                         title="<b>Investment Value per Account</b>", template="plotly_dark")
+            # Highlight Total line
+            fig.for_each_trace(lambda t: t.update(line=dict(color="white", width=4) if t.name == "TOTAL" else dict(width=2)))
+            st.plotly_chart(fig, use_container_width=True)
             
-            df_pivot = df_inv.pivot(
-                index='date', 
-                columns='accounts_name', 
-                values='account_value'
-            ).fillna(0).reset_index()
+
+        with tab_data:
+            # 1. Προετοιμασία δεδομένων
+            df_summary = df_pivot.sort_values('date', ascending=False).copy()
+            df_summary['date'] = pd.to_datetime(df_summary['date']).dt.strftime('%Y-%m-%d')
             
-            tab_graph, tab_data = st.tabs(["📊 Graph", "📋 Data Table"])
-            
-            with tab_graph:
-                fig = px.line(
-                    df_pivot, 
-                    x="date", 
-                    y=[c for c in df_pivot.columns if c != 'date'],
-                    title="<b>Investment Value per Account</b>",
-                    labels={"value": "Value (€)", "date": "Date", "variable": "Account"},
-                    template="plotly_dark"
+            # 2. Δυναμικός εντοπισμός των αριθμητικών στηλών (όλες εκτός από την 'date')
+            numeric_cols = [col for col in df_summary.columns if col != 'date']
+
+            # 3. Δημιουργία του configuration
+            col_config = {
+                # Προσθήκη του "Date" header
+                "date": st.column_config.TextColumn("Date"),
+            }
+
+            # Προσθήκη των αριθμητικών στηλών στο υπάρχον dictionary
+            for col in numeric_cols:
+                col_config[col] = st.column_config.NumberColumn(
+                    label=col,
+                    format="%,.2f €"
                 )
-                fig.for_each_trace(lambda t: t.update(
-                    line=dict(color="white", width=4) if t.name.upper() == "TOTAL" else dict(width=2)
-                ))
-                fig.update_layout(
-                    hovermode="x unified",
-                    yaxis_tickformat=',.0f',
-                    xaxis=dict(range=[df_pivot['date'].min(), df_pivot['date'].max()], type='date')
-                )
-                st.plotly_chart(fig, width="stretch")
+           
+            # 4. Εμφάνιση του πίνακα με το config
+            st.dataframe(
+                df_summary, 
+                hide_index=True, 
+                use_container_width=True,
+                column_config=col_config
+            )
+
+
+        with tab_details:
+            st.markdown("### 🔍 Drill-down per Security")
             
-            with tab_data:
-                df_display = df_pivot.copy().sort_values('date', ascending=False)
-                numeric_cols = [c for c in df_display.columns if c != 'date']
-                df_display['date'] = df_display['date'].dt.strftime('%Y-%m-%d')
-                
-                col_config = {
-                    col: st.column_config.NumberColumn(col, format="%,.2f €", width="medium")
-                    for col in numeric_cols
-                }
-                st.dataframe(df_display, width="stretch", hide_index=True, column_config=col_config)
-        except Exception as e:
-            st.error(f"Error: {e}")
+            # Φίλτρο ημερομηνίας για τις λεπτομέρειες
+            available_dates = sorted(df_raw['date'].unique(), reverse=True)
+            selected_date = st.selectbox("Select Snapshot Date:", available_dates)
+            
+            df_snapshot = df_raw[df_raw['date'] == selected_date].copy()
+            
+            st.dataframe(
+                df_snapshot[['accounts_name', 'securities_name', 'qty_at_date', 'price_at_date', 'value_in_eur']],
+                column_config={
+                    "accounts_name": "Account",
+                    "securities_name": "Security",
+                    "qty_at_date": st.column_config.NumberColumn("Quantity", format="%,.8f"),
+                    "price_at_date": st.column_config.NumberColumn("Price", format="%,.2f"),
+                    "value_in_eur": st.column_config.NumberColumn("Value (€)", format="%,.2f €")
+                },
+                hide_index=True,
+                use_container_width=True
+            )
     
     elif hist_sub_menu == "P&L Reports":
         tab_report, tab_movers = st.tabs(["📊 P&L Report", "🚀 Top Movers"])
@@ -479,7 +509,7 @@ def render_reports(conn):
                 }                
                 )
 
-    elif hist_sub_menu == "Securities Analysis":
+    elif hist_sub_menu == "Securities & Portfolio Analysis":
         # 1. Tabs
         tab_change, tab_volat, tab_inv_signals, tab_port_signals = st.tabs(["📈 Price Change %", "🌊 Volatility", "🎯 Investment Signals", "📢 Portfolio Action Signals"])
 
@@ -716,7 +746,7 @@ def render_reports(conn):
                 return ''
 
             st.dataframe(
-                df_rec[['final_signal', 'recommendation_signal', 'wall_street_view', 'securities_name', 'current_value_eur', 'sharpe_ratio', 'quality_score', 'price_today', 'upside_pct', 'target_price']].style.applymap(color_rec, subset=['recommendation_signal', 'final_signal']),
+                df_rec[['final_signal', 'recommendation_signal', 'wall_street_view', 'securities_name', 'current_value_eur', 'sharpe_ratio', 'quality_score', 'price_today', 'upside_pct', 'target_price']].style.map(color_rec, subset=['recommendation_signal', 'final_signal']),
                 column_config={
                     "final_signal": st.column_config.TextColumn("Final Signal", help="Conviction signals appear when our math matches Analyst views"),
                     "recommendation_signal": "Math Signal",
