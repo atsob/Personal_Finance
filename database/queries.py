@@ -265,127 +265,6 @@ def get_hist_inv_positions_data(start_date):
 
 
 
-@st.cache_data(ttl=3600)
-def get_portfolio_signals_old(selected_acc_id=None): # Προσθήκη '=' εδώ
-    """Get signals for my investment portfolio."""
-    conn = get_connection()
-    
-    # Χρησιμοποιούμε απλό τριπλό string (όχι f-string) για ασφάλεια με το pd.read_sql
-    query = """
-        WITH investment_signals AS (
-            WITH performance_data AS (
-                WITH base_data AS (
-                    SELECT 
-                        Securities_Id, 
-                        Date, 
-                        Close,
-                        (Close / LAG(Close) OVER (PARTITION BY Securities_Id ORDER BY Date) - 1) as daily_ret
-                    FROM Historical_Prices
-                    WHERE Date >= (CURRENT_DATE - INTERVAL '62 months')
-                ),
-                ranked_prices AS (
-                    SELECT 
-                        Securities_Id, 
-                        Date, 
-                        Close as price_today,
-                        LAG(Close, 1) OVER (PARTITION BY Securities_Id ORDER BY Date) as price_1d,
-                        LAG(Close, 5) OVER (PARTITION BY Securities_Id ORDER BY Date) as price_1w,
-                        LAG(Close, 21) OVER (PARTITION BY Securities_Id ORDER BY Date) as price_1m,
-                        LAG(Close, 63) OVER (PARTITION BY Securities_Id ORDER BY Date) as price_3m,
-                        LAG(Close, 126) OVER (PARTITION BY Securities_Id ORDER BY Date) as price_6m,
-                        LAG(Close, 252) OVER (PARTITION BY Securities_Id ORDER BY Date) as price_1y,
-                        LAG(Close, 756) OVER (PARTITION BY Securities_Id ORDER BY Date) as price_3y,
-                        ROW_NUMBER() OVER (PARTITION BY Securities_Id ORDER BY Date DESC) as rev_rank
-                    FROM base_data
-                ),
-                ytd_prices AS (
-                    SELECT DISTINCT ON (Securities_Id) Securities_Id, Close as price_ytd_start
-                    FROM Historical_Prices
-                    WHERE Date < date_trunc('year', CURRENT_DATE)
-                    ORDER BY Securities_Id, Date DESC
-                ),
-                latest_only AS (
-                    SELECT rp.*, yp.price_ytd_start 
-                    FROM ranked_prices rp
-                    LEFT JOIN ytd_prices yp ON rp.Securities_Id = yp.Securities_Id
-                    WHERE rp.rev_rank = 1
-                )
-                SELECT 
-                    lo.Securities_Id,
-                    Sec.Securities_Name,
-                    lo.price_today,
-                    ROUND(((lo.price_today / NULLIF(lo.price_1d, 0)) - 1) * 100, 2) as daily_chg_pct,
-                    ROUND(((lo.price_today / NULLIF(lo.price_1w, 0)) - 1) * 100, 2) as weekly_chg_pct,
-                    ROUND(((lo.price_today / NULLIF(lo.price_1m, 0)) - 1) * 100, 2) as monthly_chg_pct,
-                    ROUND(((lo.price_today / NULLIF(lo.price_3m, 0)) - 1) * 100, 2) as quarterly_chg_pct,
-                    ROUND(((lo.price_today / NULLIF(lo.price_6m, 0)) - 1) * 100, 2) as semiannual_chg_pct,
-                    ROUND(((lo.price_today / NULLIF(lo.price_1y, 0)) - 1) * 100, 2) as annual_chg_pct,
-                    ROUND(((lo.price_today / NULLIF(lo.price_3y, 0)) - 1) * 100, 2) as triannual_chg_pct,
-                    ROUND(((lo.price_today / NULLIF(lo.price_ytd_start, 0)) - 1) * 100, 2) as ytd_chg_pct,
-                    (SELECT ROUND((STDDEV(daily_ret) * SQRT(252) * 100)::numeric, 2) FROM base_data bd WHERE bd.Securities_Id = lo.Securities_Id AND bd.Date > (lo.Date - INTERVAL '1 month')) as vol_1m_ann,
-                    (SELECT ROUND((STDDEV(daily_ret) * SQRT(252) * 100)::numeric, 2) FROM base_data bd WHERE bd.Securities_Id = lo.Securities_Id AND bd.Date > (lo.Date - INTERVAL '3 months')) as vol_3m_ann,
-                    (SELECT ROUND((STDDEV(daily_ret) * SQRT(252) * 100)::numeric, 2) FROM base_data bd WHERE bd.Securities_Id = lo.Securities_Id AND bd.Date > (lo.Date - INTERVAL '12 months')) as vol_1y_ann,
-                    (SELECT ROUND((STDDEV(daily_ret) * SQRT(252) * 100)::numeric, 2) FROM base_data bd WHERE bd.Securities_Id = lo.Securities_Id AND bd.Date >= date_trunc('year', CURRENT_DATE)) as vol_ytd_ann
-                FROM latest_only lo
-                JOIN Securities Sec ON lo.Securities_Id = Sec.Securities_Id
-                AND Sec.Is_Active
-                AND lo.Date > (CURRENT_DATE - INTERVAL '15 days')
-            ),
-            rfr AS (
-                SELECT COALESCE(annual_chg_pct, 2.36) as value 
-                FROM performance_data 
-                WHERE Securities_Name LIKE 'Hellenic T-Bill 52W%%' -- Χρήση διπλού %% για αποφυγή σφάλματος Python formatting
-                LIMIT 1
-            )        
-            SELECT 
-                Securities_Id,
-                Securities_Name,
-                price_today,
-                monthly_chg_pct,
-                annual_chg_pct,
-                vol_1y_ann,
-                ROUND(((monthly_chg_pct * 0.5) + (quarterly_chg_pct * 0.3) + (annual_chg_pct * 0.2))::numeric, 2) as quality_score,
-                ROUND(((annual_chg_pct - (SELECT value FROM rfr)) / NULLIF(vol_1y_ann, 0))::numeric, 2) as sharpe_ratio
-            FROM performance_data
-            WHERE vol_1y_ann > 0 
-        ),
-        portfolio_status AS (
-            SELECT 
-                s.Securities_Id,
-                s.Securities_Name,
-                sig.price_today,
-                sig.annual_chg_pct,
-                sig.vol_1y_ann,
-                sig.sharpe_ratio,
-                sig.quality_score,
-                SUM(COALESCE(h.Quantity, 0)) as current_qty,
-                (SUM(COALESCE(h.Quantity, 0)) * sig.price_today) as market_value_base_curr
-            FROM investment_signals sig
-            JOIN Securities s ON sig.Securities_Id = s.Securities_Id
-            LEFT JOIN Holdings h ON s.Securities_Id = h.Securities_Id
-                AND (%s IS NULL OR h.Accounts_Id = %s) 
-			GROUP BY s.Securities_Id, s.Securities_Name, sig.price_today, sig.annual_chg_pct, sig.vol_1y_ann, sig.sharpe_ratio, sig.quality_score
-        )
-        SELECT 
-            *,
-            CASE 
-                WHEN current_qty > 0 AND (sharpe_ratio < 0 OR quality_score < -5) THEN '🔴 SELL / REDUCE'
-                WHEN sharpe_ratio > 1.2 AND quality_score > 10 THEN '🟢 STRONG BUY'
-                WHEN sharpe_ratio BETWEEN 0.5 AND 1.2 AND quality_score > 0 THEN '🟡 BUY / HOLD'
-                WHEN current_qty = 0 AND sharpe_ratio > 1.0 THEN '👀 WATCHLIST'
-                ELSE '⚪ NEUTRAL'
-            END as recommendation_signal
-        FROM portfolio_status
-        ORDER BY sharpe_ratio DESC;
-    """
-    
-    # Το pandas.read_sql χειρίζεται σωστά τις παραμέτρους για την αποφυγή SQL Injection
-    df = pd.read_sql(query, conn, params=(selected_acc_id, selected_acc_id))
-    cur = conn.cursor()
-    cur.close()
-    conn.close()
-    return df
-
 
 @st.cache_data(ttl=3600)
 def get_portfolio_signals(selected_acc_id=None): # Προσθήκη '=' εδώ
@@ -521,137 +400,149 @@ def get_pnl_report_data():
     
     query = """
     WITH RECURSIVE 
-    periods AS (
-        SELECT 
-            (date_trunc('day', CURRENT_DATE) - INTERVAL '1 day')::date as dtd_start,
-            (date_trunc('week', CURRENT_DATE) - INTERVAL '1 day')::date as wtd_start,
-            (date_trunc('month', CURRENT_DATE) - INTERVAL '1 day')::date as mtd_start,
-            (date_trunc('year', CURRENT_DATE) - INTERVAL '1 day')::date as ytd_start,
-            '1900-01-01'::date as all_time_start,
-            CURRENT_DATE::date as today
-    ),
-    historical_holdings AS (
-        SELECT 
-            p.today, p.dtd_start, p.wtd_start, p.mtd_start, p.ytd_start, p.all_time_start,
-            h.Accounts_Id, h.Securities_Id,
-            h.Quantity as qty_today,
-            h.Quantity - COALESCE((SELECT SUM(CASE WHEN Action IN ('Buy', 'Reinvest') THEN Quantity WHEN Action = 'Sell' THEN -Quantity ELSE 0 END) FROM Investments WHERE Securities_Id = h.Securities_Id AND Accounts_Id = h.Accounts_Id AND Date > p.dtd_start), 0) as qty_dtd,
-            h.Quantity - COALESCE((SELECT SUM(CASE WHEN Action IN ('Buy', 'Reinvest') THEN Quantity WHEN Action = 'Sell' THEN -Quantity ELSE 0 END) FROM Investments WHERE Securities_Id = h.Securities_Id AND Accounts_Id = h.Accounts_Id AND Date > p.wtd_start), 0) as qty_wtd,
-            h.Quantity - COALESCE((SELECT SUM(CASE WHEN Action IN ('Buy', 'Reinvest') THEN Quantity WHEN Action = 'Sell' THEN -Quantity ELSE 0 END) FROM Investments WHERE Securities_Id = h.Securities_Id AND Accounts_Id = h.Accounts_Id AND Date > p.mtd_start), 0) as qty_mtd,
-            h.Quantity - COALESCE((SELECT SUM(CASE WHEN Action IN ('Buy', 'Reinvest') THEN Quantity WHEN Action = 'Sell' THEN -Quantity ELSE 0 END) FROM Investments WHERE Securities_Id = h.Securities_Id AND Accounts_Id = h.Accounts_Id AND Date > p.ytd_start), 0) as qty_ytd
-        FROM periods p
-        CROSS JOIN Holdings h
-    ),
-    prices_fx AS (
-        SELECT 
-            hh.*,
-            (SELECT Close FROM Historical_Prices WHERE Securities_Id = hh.Securities_Id AND Date <= hh.today ORDER BY Date DESC LIMIT 1) as price_today,
-            (SELECT Close FROM Historical_Prices WHERE Securities_Id = hh.Securities_Id AND Date <= hh.dtd_start ORDER BY Date DESC LIMIT 1) as price_dtd,
-            (SELECT Close FROM Historical_Prices WHERE Securities_Id = hh.Securities_Id AND Date <= hh.wtd_start ORDER BY Date DESC LIMIT 1) as price_wtd,
-            (SELECT Close FROM Historical_Prices WHERE Securities_Id = hh.Securities_Id AND Date <= hh.mtd_start ORDER BY Date DESC LIMIT 1) as price_mtd,
-            (SELECT Close FROM Historical_Prices WHERE Securities_Id = hh.Securities_Id AND Date <= hh.ytd_start ORDER BY Date DESC LIMIT 1) as price_ytd,
-            (SELECT FX_Rate FROM Historical_FX WHERE Currencies_Id_1 = s.Currencies_Id AND Date <= hh.today ORDER BY Date DESC LIMIT 1) as fx_today,
-            (SELECT FX_Rate FROM Historical_FX WHERE Currencies_Id_1 = s.Currencies_Id AND Date <= hh.dtd_start ORDER BY Date DESC LIMIT 1) as fx_dtd,
-            (SELECT FX_Rate FROM Historical_FX WHERE Currencies_Id_1 = s.Currencies_Id AND Date <= hh.wtd_start ORDER BY Date DESC LIMIT 1) as fx_wtd,
-            (SELECT FX_Rate FROM Historical_FX WHERE Currencies_Id_1 = s.Currencies_Id AND Date <= hh.mtd_start ORDER BY Date DESC LIMIT 1) as fx_mtd,
-            (SELECT FX_Rate FROM Historical_FX WHERE Currencies_Id_1 = s.Currencies_Id AND Date <= hh.ytd_start ORDER BY Date DESC LIMIT 1) as fx_ytd,
-            s.Securities_Name, a.Accounts_Name
-        FROM historical_holdings hh
-        JOIN Securities s ON hh.Securities_Id = s.Securities_Id
-        JOIN Accounts a ON hh.Accounts_Id = a.Accounts_Id
-    ),
-    cash_flows AS (
-        SELECT 
-            Accounts_Id, Securities_Id,
-            SUM(CASE WHEN Date > (SELECT dtd_start FROM periods) THEN 
-                (CASE 
-                    WHEN Action IN ('Buy', 'MiscExp') THEN Total_Amount 
-                    WHEN Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -Total_Amount 
-                    ELSE 0 END) 
-                ELSE 0 END) as cf_dtd,
-            SUM(CASE WHEN Date > (SELECT wtd_start FROM periods) THEN 
-                (CASE 
-                    WHEN Action IN ('Buy', 'MiscExp') THEN Total_Amount 
-                    WHEN Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -Total_Amount 
-                    ELSE 0 END) 
-                ELSE 0 END) as cf_wtd,
-            SUM(CASE WHEN Date > (SELECT mtd_start FROM periods) THEN 
-                (CASE 
-                    WHEN Action IN ('Buy', 'MiscExp') THEN Total_Amount 
-                    WHEN Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -Total_Amount 
-                    ELSE 0 END) 
-                ELSE 0 END) as cf_mtd,
-            SUM(CASE WHEN Date > (SELECT ytd_start FROM periods) THEN 
-                (CASE 
-                    WHEN Action IN ('Buy', 'MiscExp') THEN Total_Amount 
-                    WHEN Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -Total_Amount 
-                    ELSE 0 END) 
-                ELSE 0 END) as cf_ytd,
-/*
-                SUM(CASE 
-                WHEN Action IN ('Buy', 'MiscExp') THEN Total_Amount 
-                WHEN Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -Total_Amount 
-                ELSE 0 END) as cf_all_time,
-*/
-            -- Net cash you actually paid out of pocket (true economic cost)
-            SUM(CASE
-                WHEN Action = 'Buy'      THEN Total_Amount          -- cash spent on purchases
-                WHEN Action = 'Sell'     THEN -Total_Amount         -- cash received from sales
-                WHEN Action = 'Exercise' THEN Total_Amount          -- cash paid to exercise options
-                WHEN Action = 'MiscExp'  THEN Total_Amount          -- fees paid
-                WHEN Action = 'Reinvest' THEN Total_Amount          -- treated as a buy
-                -- Vest/Grant/ShrIn: zero cash cost, but add fair value at vest as synthetic cost:
-                WHEN Action IN ('Vest', 'Grant') THEN 0             -- or Price_Per_Share * Quantity if you record grant price
-                WHEN Action = 'ShrIn'    THEN Total_Amount          -- cost basis of transferred shares
-                WHEN Action = 'ShrOut'   THEN -Total_Amount         -- remove cost basis
-                -- These are inter-account cash movements, NOT investment P&L:
-                -- EXCLUDE CashIn / CashOut entirely
-                WHEN Action IN ('Dividend', 'IntInc', 'RtrnCap') THEN -Total_Amount
-                ELSE 0
-            END) as cf_all_time,
+        periods AS (
+            SELECT 
+                (date_trunc('day', CURRENT_DATE) - INTERVAL '1 day')::date as dtd_start,
+                (date_trunc('week', CURRENT_DATE) - INTERVAL '1 day')::date as wtd_start,
+                (date_trunc('month', CURRENT_DATE) - INTERVAL '1 day')::date as mtd_start,
+                (date_trunc('year', CURRENT_DATE) - INTERVAL '1 day')::date as ytd_start,
+                '1900-01-01'::date as all_time_start,
+                CURRENT_DATE::date as today
+        ),
+        -- Βρίσκουμε κάθε συνδυασμό Λογαριασμού/Τίτλου που υπήρξε ποτέ
+        historical_entities AS (
+            SELECT Accounts_Id, Securities_Id FROM Holdings
+            UNION
+            SELECT Accounts_Id, Securities_Id FROM Investments
+        ),
+        historical_holdings AS (
+            SELECT 
+                p.*,
+                he.Accounts_Id, he.Securities_Id,
+                -- Υπολογισμός ποσότητας σήμερα (qty_today)
+                COALESCE((SELECT SUM(CASE WHEN Action IN ('Buy', 'Reinvest', 'ShrIn') THEN Quantity WHEN Action IN ('Sell', 'ShrOut') THEN -Quantity ELSE 0 END) 
+                        FROM Investments WHERE Securities_Id = he.Securities_Id AND Accounts_Id = he.Accounts_Id AND Date <= p.today), 0) as qty_today,
+                -- Υπολογισμός ποσότητας DTD
+                COALESCE((SELECT SUM(CASE WHEN Action IN ('Buy', 'Reinvest', 'ShrIn') THEN Quantity WHEN Action IN ('Sell', 'ShrOut') THEN -Quantity ELSE 0 END) 
+                        FROM Investments WHERE Securities_Id = he.Securities_Id AND Accounts_Id = he.Accounts_Id AND Date <= p.dtd_start), 0) as qty_dtd,
+                -- Υπολογισμός ποσότητας WTD
+                COALESCE((SELECT SUM(CASE WHEN Action IN ('Buy', 'Reinvest', 'ShrIn') THEN Quantity WHEN Action IN ('Sell', 'ShrOut') THEN -Quantity ELSE 0 END) 
+                        FROM Investments WHERE Securities_Id = he.Securities_Id AND Accounts_Id = he.Accounts_Id AND Date <= p.wtd_start), 0) as qty_wtd,
+                -- Υπολογισμός ποσότητας MTD
+                COALESCE((SELECT SUM(CASE WHEN Action IN ('Buy', 'Reinvest', 'ShrIn') THEN Quantity WHEN Action IN ('Sell', 'ShrOut') THEN -Quantity ELSE 0 END) 
+                        FROM Investments WHERE Securities_Id = he.Securities_Id AND Accounts_Id = he.Accounts_Id AND Date <= p.mtd_start), 0) as qty_mtd,
+                -- Υπολογισμός ποσότητας YTD
+                COALESCE((SELECT SUM(CASE WHEN Action IN ('Buy', 'Reinvest', 'ShrIn') THEN Quantity WHEN Action IN ('Sell', 'ShrOut') THEN -Quantity ELSE 0 END) 
+                        FROM Investments WHERE Securities_Id = he.Securities_Id AND Accounts_Id = he.Accounts_Id AND Date <= p.ytd_start), 0) as qty_ytd
+            FROM periods p
+            CROSS JOIN historical_entities he
+        ),
+        prices_fx AS (
+            SELECT 
+                hh.*,
+                (SELECT Close FROM Historical_Prices WHERE Securities_Id = hh.Securities_Id AND Date <= hh.today ORDER BY Date DESC LIMIT 1) as price_today,
+                (SELECT Close FROM Historical_Prices WHERE Securities_Id = hh.Securities_Id AND Date <= hh.dtd_start ORDER BY Date DESC LIMIT 1) as price_dtd,
+                (SELECT Close FROM Historical_Prices WHERE Securities_Id = hh.Securities_Id AND Date <= hh.wtd_start ORDER BY Date DESC LIMIT 1) as price_wtd,
+                (SELECT Close FROM Historical_Prices WHERE Securities_Id = hh.Securities_Id AND Date <= hh.mtd_start ORDER BY Date DESC LIMIT 1) as price_mtd,
+                (SELECT Close FROM Historical_Prices WHERE Securities_Id = hh.Securities_Id AND Date <= hh.ytd_start ORDER BY Date DESC LIMIT 1) as price_ytd,
+                (SELECT FX_Rate FROM Historical_FX WHERE Currencies_Id_1 = s.Currencies_Id AND Date <= hh.today ORDER BY Date DESC LIMIT 1) as fx_today,
+                (SELECT FX_Rate FROM Historical_FX WHERE Currencies_Id_1 = s.Currencies_Id AND Date <= hh.dtd_start ORDER BY Date DESC LIMIT 1) as fx_dtd,
+                (SELECT FX_Rate FROM Historical_FX WHERE Currencies_Id_1 = s.Currencies_Id AND Date <= hh.wtd_start ORDER BY Date DESC LIMIT 1) as fx_wtd,
+                (SELECT FX_Rate FROM Historical_FX WHERE Currencies_Id_1 = s.Currencies_Id AND Date <= hh.mtd_start ORDER BY Date DESC LIMIT 1) as fx_mtd,
+                (SELECT FX_Rate FROM Historical_FX WHERE Currencies_Id_1 = s.Currencies_Id AND Date <= hh.ytd_start ORDER BY Date DESC LIMIT 1) as fx_ytd,
+                s.Securities_Name, a.Accounts_Name, s.Currencies_Id as sec_curr_id
+            FROM historical_holdings hh
+            JOIN Securities s ON hh.Securities_Id = s.Securities_Id
+            JOIN Accounts a ON hh.Accounts_Id = a.Accounts_Id
+        ),
+        cash_flows AS (
+            SELECT 
+                Accounts_Id, Securities_Id,
+                -- DTD CF
+                SUM(CASE WHEN Date > (SELECT dtd_start FROM periods) THEN 
+                    (CASE WHEN Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(Total_Amount, 0), Quantity * Price_Per_Share) 
+                        WHEN Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(Total_Amount, 0), Quantity * Price_Per_Share) 
+                        ELSE 0 END) ELSE 0 END) as cf_dtd,
+                -- WTD CF
+                SUM(CASE WHEN Date > (SELECT wtd_start FROM periods) THEN 
+                    (CASE WHEN Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(Total_Amount, 0), Quantity * Price_Per_Share) 
+                        WHEN Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(Total_Amount, 0), Quantity * Price_Per_Share) 
+                        ELSE 0 END) ELSE 0 END) as cf_wtd,
+                -- MTD CF
+                SUM(CASE WHEN Date > (SELECT mtd_start FROM periods) THEN 
+                    (CASE WHEN Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(Total_Amount, 0), Quantity * Price_Per_Share) 
+                        WHEN Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(Total_Amount, 0), Quantity * Price_Per_Share) 
+                        ELSE 0 END) ELSE 0 END) as cf_mtd,
+                -- YTD CF
+                SUM(CASE WHEN Date > (SELECT ytd_start FROM periods) THEN 
+                    (CASE WHEN Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(Total_Amount, 0), Quantity * Price_Per_Share) 
+                        WHEN Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(Total_Amount, 0), Quantity * Price_Per_Share) 
+                        ELSE 0 END) ELSE 0 END) as cf_ytd,
+                -- Συνολικό CF (για Realized P&L)
+                SUM(CASE WHEN Action IN ('Buy', 'MiscExp', 'Reinvest', 'Exercise', 'ShrIn') THEN COALESCE(NULLIF(Total_Amount, 0), Quantity * Price_Per_Share)
+                        WHEN Action IN ('Sell', 'Dividend', 'IntInc', 'RtrnCap', 'ShrOut') THEN -COALESCE(NULLIF(Total_Amount, 0), Quantity * Price_Per_Share)
+                        ELSE 0 END) as cf_all_time,
 
-            SUM(CASE 
-                WHEN Action IN ('Buy', 'CashOut', 'MiscExp') THEN Total_Amount 
-                WHEN Action IN ('Sell', 'Dividend', 'IntInc', 'CashIn', 'RtrnCap') THEN -Total_Amount 
-                ELSE 0 END) as net_invested_all_time                
-        FROM Investments
-        GROUP BY Accounts_Id, Securities_Id
-    )
-    SELECT 
-        pf.Accounts_Name, pf.Securities_Name,
-        -- Συνολική Αξία σήμερα σε EUR
-        (pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)) as current_value_eur,
-        
-        -- --- DTD ANALYSIS ---
-        -- 1. P&L λόγω μεταβολής Τιμής (Market Effect YTD)
-        ((pf.qty_today * pf.price_today) - (pf.qty_dtd * pf.price_dtd) - COALESCE(cf.cf_dtd, 0)) * COALESCE(pf.fx_today, 1) as pnl_dtd_market_eur,
-        -- 2. P&L λόγω μεταβολής Ισοτιμίας (FX Effect YTD)
-        (pf.qty_dtd * pf.price_dtd) * (COALESCE(pf.fx_today, 1) - COALESCE(pf.fx_dtd, 1)) as pnl_dtd_fx_eur,
-        -- Συνολικό YTD P&L
-        (pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)) - (pf.qty_dtd * pf.price_dtd * COALESCE(pf.fx_dtd, 1)) - COALESCE(cf.cf_dtd, 0) as pnl_dtd_eur,
+     --           SUM(CASE 
+     --               WHEN Action IN ('Buy', 'CashOut', 'MiscExp') THEN Total_Amount 
+     --               WHEN Action IN ('Sell', 'Dividend', 'IntInc', 'CashIn', 'RtrnCap') THEN -Total_Amount 
+     --               ELSE 0 END) as net_invested_all_time    
+				SUM(CASE 
+                    WHEN Action IN ('Buy', 'CashOut', 'MiscExp') THEN Total_Amount * COALESCE((SELECT FX_Rate FROM Historical_FX WHERE Date = Investments.Date AND Currencies_Id_1 = (SELECT Currencies_Id FROM Accounts WHERE Accounts_Id = Investments.Accounts_Id)), 1)
+                    WHEN Action IN ('Sell', 'Dividend', 'IntInc', 'CashIn', 'RtrnCap') THEN -Total_Amount * COALESCE((SELECT FX_Rate FROM Historical_FX WHERE Date = Investments.Date AND Currencies_Id_1 = (SELECT Currencies_Id FROM Accounts WHERE Accounts_Id = Investments.Accounts_Id)), 1)
+                    ELSE 0 END) as net_invested_all_time      					 
+            FROM Investments
+            GROUP BY Accounts_Id, Securities_Id
+        )
+        SELECT 
+            pf.Accounts_Name, pf.Securities_Name,
+            (pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)) as current_value_eur,
+            
+            -- DTD Analysis
+            -- 1. P&L λόγω μεταβολής Τιμής (Market Effect YTD)
+            ((pf.qty_today * pf.price_today) - (pf.qty_dtd * pf.price_dtd) - COALESCE(cf.cf_dtd, 0)) * COALESCE(pf.fx_today, 1) as pnl_dtd_market_eur,
+            -- 2. P&L λόγω μεταβολής Ισοτιμίας (FX Effect YTD)
+            (pf.qty_dtd * pf.price_dtd) * (COALESCE(pf.fx_today, 1) - COALESCE(pf.fx_dtd, 1)) as pnl_dtd_fx_eur,
+            -- 3. Total P&L DTD		
+            ((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)) - (pf.qty_dtd * pf.price_dtd * COALESCE(pf.fx_dtd, 1)) - COALESCE(cf.cf_dtd, 0)) as pnl_dtd_eur,
+            
+            -- WTD/MTD Analysis
+            ((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)) - (pf.qty_wtd * pf.price_wtd * COALESCE(pf.fx_wtd, 1)) - COALESCE(cf.cf_wtd, 0)) as pnl_wtd_eur,
+            ((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)) - (pf.qty_mtd * pf.price_mtd * COALESCE(pf.fx_mtd, 1)) - COALESCE(cf.cf_mtd, 0)) as pnl_mtd_eur,
+            
+            -- YTD Analysis
+            -- 1. P&L λόγω μεταβολής Τιμής (Market Effect YTD)
+            ((pf.qty_today * pf.price_today) - (pf.qty_ytd * pf.price_ytd) - (COALESCE(cf.cf_ytd, 0) / NULLIF(COALESCE(pf.fx_today, 1), 0))) * COALESCE(pf.fx_today, 1) as pnl_ytd_market_eur,
+            -- 2. P&L λόγω μεταβολής Ισοτιμίας (FX Effect YTD)
+            (pf.qty_ytd * pf.price_ytd) * (COALESCE(pf.fx_today, 1) - COALESCE(pf.fx_ytd, 1)) as pnl_ytd_fx_eur,
+            -- Total YTD P&L
+            ((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)) - (pf.qty_ytd * pf.price_ytd * COALESCE(pf.fx_ytd, 1)) - COALESCE(cf.cf_ytd, 0)) as pnl_ytd_eur,
+            
+            -- All Time P&L
+            ((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)) - COALESCE(cf.cf_all_time, 0)) as pnl_all_time_eur,
 
-        -- Υπόλοιπα διαστήματα
-        (pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)) - (pf.qty_wtd * pf.price_wtd * COALESCE(pf.fx_wtd, 1)) - COALESCE(cf.cf_wtd, 0) as pnl_wtd_eur,
-        (pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)) - (pf.qty_mtd * pf.price_mtd * COALESCE(pf.fx_mtd, 1)) - COALESCE(cf.cf_mtd, 0) as pnl_mtd_eur,
+            -- Συνολικό P&L από την αρχή (Total Net Economic Gain)
+            COALESCE((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)),0) - COALESCE(cf.net_invested_all_time, 0) as pnl_net_all_time_eur,
+            
+            -- Unrealized P&L (FIFO based)
+            (SELECT Quantity * (pf.price_today - Fifo_Avg_Price) * COALESCE(pf.fx_today, 1) 
+            FROM Holdings WHERE Accounts_Id = pf.Accounts_Id AND Securities_Id = pf.Securities_Id) as unrealized_pnl_eur,
+            
+            -- Realized P&L (Total - Unrealized)
+    --     ((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)) - COALESCE(cf.cf_all_time, 0)) - 
+            COALESCE((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)),0) - COALESCE(cf.net_invested_all_time, 0) - 
+            COALESCE((SELECT Quantity * (pf.price_today - Fifo_Avg_Price) * COALESCE(pf.fx_today, 1) FROM Holdings WHERE Accounts_Id = pf.Accounts_Id AND Securities_Id = pf.Securities_Id), 0) as realized_pnl_eur,
 
-                -- --- YTD ANALYSIS ---
-        -- 1. P&L λόγω μεταβολής Τιμής (Market Effect YTD)
-    --    ((pf.qty_today * pf.price_today) - (pf.qty_ytd * pf.price_ytd) - COALESCE(cf.cf_ytd, 0)) * COALESCE(pf.fx_today, 1) as pnl_ytd_market_eur,
-        ((pf.qty_today * pf.price_today) - (pf.qty_ytd * pf.price_ytd) - (COALESCE(cf.cf_ytd, 0) / NULLIF(COALESCE(pf.fx_today, 1), 0))) * COALESCE(pf.fx_today, 1) as pnl_ytd_market_eur,
+            -- Annual YOC %
+            ROUND(((SELECT ABS(SUM(CASE WHEN i.Action = 'Dividend' THEN i.Total_Amount WHEN i.Action = 'Reinvest' THEN (i.Quantity * i.Price_Per_Share) ELSE 0 END)) 
+                    FROM Investments i WHERE i.Securities_Id = pf.Securities_Id AND i.Accounts_Id = pf.Accounts_Id AND i.Action IN ('Dividend', 'Reinvest') AND i.Date >= CURRENT_DATE - INTERVAL '1 year') / 
+                    NULLIF((SELECT Quantity * Fifo_Avg_Price FROM Holdings WHERE Accounts_Id = pf.Accounts_Id AND Securities_Id = pf.Securities_Id), 0))::numeric * 100, 2) as dividend_yoc_pct
 
-        -- 2. P&L λόγω μεταβολής Ισοτιμίας (FX Effect YTD)
-        (pf.qty_ytd * pf.price_ytd) * (COALESCE(pf.fx_today, 1) - COALESCE(pf.fx_ytd, 1)) as pnl_ytd_fx_eur,
-        
-        -- Συνολικό YTD P&L
-        (pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)) - (pf.qty_ytd * pf.price_ytd * COALESCE(pf.fx_ytd, 1)) - COALESCE(cf.cf_ytd, 0) as pnl_ytd_eur,
-        
-        (pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)) - COALESCE(cf.cf_all_time, 0) as pnl_all_time_eur,
-        (pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)) - COALESCE(cf.net_invested_all_time, 0) as pnl_net_all_time_eur,
-        
-        (SELECT Quantity * (pf.price_today - Fifo_Avg_Price) * COALESCE(pf.fx_today, 1) FROM Holdings WHERE Accounts_Id = pf.Accounts_Id AND Securities_Id = pf.Securities_Id) as unrealized_pnl_eur      
-    FROM prices_fx pf
-    LEFT JOIN cash_flows cf ON pf.Accounts_Id = cf.Accounts_Id AND pf.Securities_Id = cf.Securities_Id
-    ORDER BY pf.Accounts_Name, pf.Securities_Name;
+        FROM prices_fx pf
+        LEFT JOIN cash_flows cf ON pf.Accounts_Id = cf.Accounts_Id AND pf.Securities_Id = cf.Securities_Id
+        WHERE (pf.qty_today != 0 OR cf.cf_all_time IS NOT NULL) -- Εξασφαλίζει ότι βλέπουμε και κλειστές θέσεις με ιστορικό
+	--	AND pf.Accounts_Id = 112
+        ORDER BY pf.Accounts_Name, pf.Securities_Name;
     """
     
     df = pd.read_sql(query, conn)

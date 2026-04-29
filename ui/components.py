@@ -1,5 +1,9 @@
 import streamlit as st
 
+# Βοηθητική συνάρτηση για το χρώμα (πράσινο αν > 0, κόκκινο αν < 0)
+def get_color(val):
+    return "#28a745" if val >= 0 else "#dc3545"
+
 def color_negative_red(val):
     """Return CSS color for negative values (red), positive (green), zero (blue)."""
     if val < 0:

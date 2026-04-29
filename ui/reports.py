@@ -2,10 +2,11 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import numpy as np
 from database.crud import update_holdings
 from database.queries import get_category_hierarchy, get_hist_net_worth_data, get_hist_inv_positions_data, get_pnl_report_data, get_income_expense_data, get_portfolio_signals
 from data.downloaders import download_historical_fx, download_historical_prices_from_yahoo, download_bond_prices_from_solidus, download_securities_info_from_yahoo
-from ui.components import color_negative_red, color_value, custom_metric
+from ui.components import color_negative_red, color_value, custom_metric, get_color
 from datetime import datetime, timedelta
 
 def render_reports(conn):
@@ -43,7 +44,7 @@ def render_reports(conn):
             df_hist['date'] = pd.to_datetime(df_hist['date'])
             df_hist = df_hist.sort_values('date')
             
-            tab1, tab2 = st.tabs(["📊 Graph", "📋 Data"])
+            tab1, tab2 = st.tabs(["📊 Graph", "📋 Summary per Type"])
             
             with tab1:
                 df_hist['net_change'] = df_hist['total_net_worth'].diff()
@@ -107,11 +108,24 @@ def render_reports(conn):
                 st.plotly_chart(fig, width="stretch")
             
             with tab2:
+                df_hist.rename(
+                    columns={
+                        'date': 'Date',
+                        'total_cash': 'Total Cash',
+                        'total_invested': 'Total Invested',
+                        'total_pension': 'Total Pension',
+                        'total_assets': 'Total Assets',
+                        'total_net_worth': 'Total Net Worth'
+                    }, 
+                    inplace=True
+                )
+                
                 st.dataframe(
-                    df_hist.sort_values('date', ascending=False)
+                    df_hist.sort_values('Date', ascending=False)
                     .style
                     .map(color_negative_red, subset=['net_change'])
                     .format({
+                        "Date": lambda x: pd.to_datetime(x).strftime('%Y-%m-%d'),
                         "total_assets": "€ {:,.2f}",
                         "total_cash": "€ {:,.2f}",
                         "total_pension": "€ {:,.2f}",
@@ -164,7 +178,7 @@ def render_reports(conn):
                          title="<b>Investment Value per Account</b>", template="plotly_dark")
             # Highlight Total line
             fig.for_each_trace(lambda t: t.update(line=dict(color="white", width=4) if t.name == "TOTAL" else dict(width=2)))
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
             
 
         with tab_data:
@@ -187,13 +201,15 @@ def render_reports(conn):
                     label=col,
                     format="%,.2f €"
                 )
+
+            df_summary = df_summary.set_index('date')
            
             # 4. Εμφάνιση του πίνακα με το config
             st.dataframe(
                 df_summary, 
-                hide_index=True, 
-                use_container_width=True,
-                column_config=col_config
+                hide_index=False, 
+                width='stretch',
+                column_config=col_config,
             )
 
 
@@ -216,7 +232,7 @@ def render_reports(conn):
                     "value_in_eur": st.column_config.NumberColumn("Value (€)", format="%,.2f €")
                 },
                 hide_index=True,
-                use_container_width=True
+                width="stretch"
             )
     
     elif hist_sub_menu == "P&L Reports":
@@ -228,10 +244,10 @@ def render_reports(conn):
             
             if st.sidebar.button("🔄 Refresh P&L", key="refresh_pnl_btn"):
                 get_pnl_report_data.clear()
-                with st.spinner("Running :green[download_historical_fx('1d')]"):
-                    download_historical_fx("1d")
-                with st.spinner("Running :green[download_historical_prices_from_yahoo('1d')]"):
-                    download_historical_prices_from_yahoo("1d")
+                with st.spinner("Running :green[download_historical_fx('2d')]"):
+                    download_historical_fx("2d")
+                with st.spinner("Running :green[download_historical_prices_from_yahoo('2d')]"):
+                    download_historical_prices_from_yahoo("2d")
                 with st.spinner("Running :green[download_bond_prices_from_solidus()]"):
                     download_bond_prices_from_solidus()
                 with st.spinner("Running :green[update_holdings()]"):
@@ -240,36 +256,50 @@ def render_reports(conn):
                 st.rerun()
             
             try:
+                summary = {
+                    "Total Current Value": df_pnl['current_value_eur'].sum(),
+                    "Total Realized P&L": df_pnl['realized_pnl_eur'].fillna(0).sum(),
+                    "Total Unrealized P&L": df_pnl['unrealized_pnl_eur'].fillna(0).sum(),
+                    "Total Net All Time P&L": df_pnl['pnl_net_all_time_eur'].fillna(0).sum(),
+                    "Total Daily P&L": df_pnl['pnl_dtd_eur'].sum(),
+                    "Total Weekly P&L": df_pnl['pnl_wtd_eur'].sum(),
+                    "Total Monthly P&L": df_pnl['pnl_mtd_eur'].sum(),
+                    "Total YTD P&L": df_pnl['pnl_ytd_eur'].sum(),
+                    "Total Daily Market P&L": df_pnl['pnl_dtd_market_eur'].sum(),
+                    "Total Daily FX P&L": df_pnl['pnl_dtd_fx_eur'].sum(),
+                    "Total YTD Market P&L": df_pnl['pnl_ytd_market_eur'].sum(),
+                    "Total YTD FX P&L": df_pnl['pnl_ytd_fx_eur'].sum()
+                }
+
                 row1_col1, row1_col2, row1_col3, row1_col4 = st.columns(4)
-                
+
                 with row1_col1:
                     total_dtd_pnl = df_pnl['pnl_dtd_eur'].sum()
                     total_current_value = df_pnl['current_value_eur'].sum()
                     st.metric("Total Current Value (EUR)", f"{total_current_value:,.2f} €", delta=f"{total_dtd_pnl:,.2f} €")
  
                 with row1_col2:
-                    total_all_time_pnl = df_pnl['pnl_all_time_eur'].fillna(0).sum()
+                    total_realized_pnl = df_pnl['realized_pnl_eur'].fillna(0).sum()
                     custom_metric(
-                        label="Total All Time P&L", 
-                        value=f"{total_all_time_pnl:,.2f} €", 
-                        pnl_value=total_all_time_pnl
+                        label="Total Realized P&L", 
+                        value=f"{total_realized_pnl:,.2f} €", 
+                        pnl_value=total_realized_pnl
                     )
 
                 with row1_col3:
+                    total_unrealized_pnl = df_pnl['unrealized_pnl_eur'].fillna(0).sum()
+                    custom_metric(
+                        label="Total Unrealized P&L", 
+                        value=f"{total_unrealized_pnl:,.2f} €", 
+                        pnl_value=total_unrealized_pnl
+                    )
+
+                with row1_col4:
                     total_net_all_time_pnl = df_pnl['pnl_net_all_time_eur'].fillna(0).sum()
                     custom_metric(
                         label="Total Net All Time P&L", 
                         value=f"{total_net_all_time_pnl:,.2f} €", 
                         pnl_value=total_net_all_time_pnl
-                    )
-
-                with row1_col4:
-                    total_unrealized_pnl = df_pnl['unrealized_pnl_eur'].fillna(0).sum()
-                #    st.metric("Total Unrealized P&L", f"{total_unrealized_pnl:,.2f} €", delta=f"{total_unrealized_pnl:,.2f} €")
-                    custom_metric(
-                        label="Total Unrealized P&L", 
-                        value=f"{total_unrealized_pnl:,.2f} €", 
-                        pnl_value=total_unrealized_pnl
                     )
 
                 row2_col1, row2_col2, row2_col3, row2_col4 = st.columns(4)
@@ -300,50 +330,125 @@ def render_reports(conn):
 
                 with row2_col4:
                     total_ytd_pnl = df_pnl['pnl_ytd_eur'].sum()
-                #    st.metric("Total YTD P&L", f"{total_ytd_pnl:,.2f} €", delta=f"{total_ytd_pnl:,.2f} €")
                     custom_metric(
                         label="Total YTD P&L", 
                         value=f"{total_ytd_pnl:,.2f} €", 
                         pnl_value=total_ytd_pnl
                     )
 
-                row3_col1, row3_col2, row3_col3, row3_col4 = st.columns(4)
+            #    row3_col1, row3_col2, row3_col3, row3_col4 = st.columns(4)
 
-                with row3_col1:
-                    total_dtd_market_pnl = df_pnl['pnl_dtd_market_eur'].sum()
-                    custom_metric(
-                        label="Total Daily Market P&L", 
-                        value=f"{total_dtd_market_pnl:,.2f} €", 
-                        pnl_value=total_dtd_market_pnl
-                    )
+            #    with row3_col1:
+            #        total_dtd_market_pnl = df_pnl['pnl_dtd_market_eur'].sum()
+            #        custom_metric(
+            #            label="Total Daily Market P&L", 
+            #            value=f"{total_dtd_market_pnl:,.2f} €", 
+            #            pnl_value=total_dtd_market_pnl
+            #        )
 
-                with row3_col2:
-                    total_dtd_fx_pnl = df_pnl['pnl_dtd_fx_eur'].sum()
-                    custom_metric(
-                        label="Total Daily FX P&L", 
-                        value=f"{total_dtd_fx_pnl:,.2f} €", 
-                        pnl_value=total_dtd_fx_pnl
-                    )
+            #    with row3_col2:
+            #        total_dtd_fx_pnl = df_pnl['pnl_dtd_fx_eur'].sum()
+            #        custom_metric(
+            #            label="Total Daily FX P&L", 
+            #            value=f"{total_dtd_fx_pnl:,.2f} €", 
+            #            pnl_value=total_dtd_fx_pnl
+            #        )
 
-                with row3_col3:
-                    total_ytd_market_pnl = df_pnl['pnl_ytd_market_eur'].sum()
-                    custom_metric(
-                        label="Total YTD Market P&L", 
-                        value=f"{total_ytd_market_pnl:,.2f} €", 
-                        pnl_value=total_ytd_market_pnl
-                    )
+            #    with row3_col3:
+            #        total_ytd_market_pnl = df_pnl['pnl_ytd_market_eur'].sum()
+            #        custom_metric(
+            #            label="Total YTD Market P&L", 
+            #            value=f"{total_ytd_market_pnl:,.2f} €", 
+            #            pnl_value=total_ytd_market_pnl
+            #        )
 
-                with row3_col4:
-                    total_ytd_fx_pnl = df_pnl['pnl_ytd_fx_eur'].sum()
-                    custom_metric(
-                        label="Total YTD FX P&L", 
-                        value=f"{total_ytd_fx_pnl:,.2f} €", 
-                        pnl_value=total_ytd_fx_pnl
-                    )
+            #    with row3_col4:
+            #        total_ytd_fx_pnl = df_pnl['pnl_ytd_fx_eur'].sum()
+            #        custom_metric(
+            #            label="Total YTD FX P&L", 
+            #            value=f"{total_ytd_fx_pnl:,.2f} €", 
+            #            pnl_value=total_ytd_fx_pnl
+            #        )
+
+            #    st.write("---") # Διαχωριστική γραμμή
+                m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+
+
+                with m_col1:
+                    # Χρήση f-string και πρόσβαση στο dictionary με []
+                    st.markdown(f"""
+                        <div style="line-height: 1.5;text-align: center;">
+                            <p style="color: grey; font-size: 14px; margin: 0; font-family: sans-serif;">Daily Market / FX Split</p>
+                            <p style="margin: 0; font-weight: bold;">
+                                <span style="color: {get_color(summary['Total Daily Market P&L'])};">{summary['Total Daily Market P&L']:+,.2f} €</span> / 
+                                <span style="color: {get_color(summary['Total Daily FX P&L'])};">{summary['Total Daily FX P&L']:+,.2f} €</span>
+                            </p>
+                        </div>
+                    """, unsafe_allow_html=True)
+
+                with m_col4:
+                    st.markdown(f"""
+                        <div style="line-height: 1.5;text-align: center;">
+                            <p style="color: grey; font-size: 14px; margin: 0; font-family: sans-serif;">YTD Market / FX Split</p>
+                            <p style="margin: 0; font-weight: bold;">
+                                <span style="color: {get_color(summary['Total YTD Market P&L'])};">{summary['Total YTD Market P&L']:+,.2f} €</span> / 
+                                <span style="color: {get_color(summary['Total YTD FX P&L'])};">{summary['Total YTD FX P&L']:+,.2f} €</span>
+                            </p>
+                        </div>
+                    """, unsafe_allow_html=True)
+
+
+
+
 
                 st.divider() # Optional separation line for better visual effect
 
-                df_acc = df_pnl.groupby('accounts_name')[['current_value_eur', 'pnl_dtd_market_eur', 'pnl_dtd_fx_eur', 'pnl_dtd_eur', 'pnl_wtd_eur', 'pnl_mtd_eur', 'pnl_ytd_eur',  'pnl_all_time_eur', 'pnl_net_all_time_eur', 'unrealized_pnl_eur']].sum()
+
+                # 1. Καθαρισμός από τυχόν προϋπάρχοντα σύνολα της SQL για αποφυγή double-counting
+                df_input = df_pnl[df_pnl['securities_name'].notnull()].copy()
+
+                # 2. Υπολογισμός Κόστους μόνο για τις ανοιχτές θέσεις (Denominator για το YOC)
+                # Το Current Value - Unrealized P&L μας δίνει το κεφάλαιο που είναι "κλειδωμένο" τώρα
+                df_input['current_cost_basis_eur'] = df_input['current_value_eur'] - df_input['unrealized_pnl_eur']
+
+                # 3. Υπολογισμός αναμενόμενου μερίσματος (Numerator για το YOC)
+                df_input['annual_div_cash_eur'] = (df_input['dividend_yoc_pct'] / 100) * df_input['current_cost_basis_eur']
+
+                # 4. Ομαδοποίηση
+                agg_dict = {
+                    'current_value_eur': 'sum',
+                    'pnl_dtd_market_eur': 'sum',
+                    'pnl_dtd_fx_eur': 'sum',
+                    'pnl_dtd_eur': 'sum',
+                    'pnl_wtd_eur': 'sum',
+                    'pnl_mtd_eur': 'sum',
+                    'pnl_ytd_market_eur': 'sum',
+                    'pnl_ytd_fx_eur': 'sum',
+                    'pnl_ytd_eur': 'sum',
+                    'pnl_all_time_eur': 'sum',
+                    'realized_pnl_eur': 'sum',
+                    'unrealized_pnl_eur': 'sum',
+                    'pnl_net_all_time_eur': 'sum',
+                    'annual_div_cash_eur': 'sum', # Προσθέτουμε τα ευρώ των μερισμάτων
+                    'current_cost_basis_eur': 'sum' # Προσθέτουμε το κόστος βάσης
+                }
+
+                # Προσθέστε δυναμικά όποιες άλλες στήλες P&L έχετε (DTD Market, κλπ)
+                for col in df_input.columns:
+                    if col.startswith('pnl_') and col not in agg_dict:
+                        agg_dict[col] = 'sum'
+
+                df_acc = df_input.groupby('accounts_name').agg(agg_dict)
+
+                # 5. Υπολογισμός του σταθμισμένου Yield on Cost για τον λογαριασμό
+                # (Συνολικά αναμενόμενα ευρώ μερισμάτων / Συνολικό τρέχον κόστος αγοράς) * 100
+                df_acc['dividend_yoc_pct'] = (df_acc['annual_div_cash_eur'] / df_acc['current_cost_basis_eur'].replace(0, np.nan)) * 100
+                df_acc['dividend_yoc_pct'] = df_acc['dividend_yoc_pct'].fillna(0)
+
+                # 6. Καθαρισμός βοηθητικών στηλών πριν το display
+            #    df_acc = df_acc.drop(columns=['annual_div_cash_eur', 'current_cost_basis_eur'])
+                df_acc = df_acc.drop(columns=['pnl_all_time_eur','annual_div_cash_eur', 'current_cost_basis_eur'])
+
                 df_acc = df_acc.rename(columns={
                     'current_value_eur': 'Current Value',
                     'pnl_dtd_market_eur': 'Daily Market P&L',
@@ -351,33 +456,60 @@ def render_reports(conn):
                     'pnl_dtd_eur': 'Daily P&L',
                     'pnl_wtd_eur': 'Weekly P&L',
                     'pnl_mtd_eur': 'Monthly P&L',
+                    'pnl_ytd_market_eur': 'YTD Market P&L',
+                    'pnl_ytd_fx_eur': 'YTD FX P&L',
                     'pnl_ytd_eur': 'YTD P&L',
-                    'pnl_all_time_eur': 'Total P&L',
+                #    'pnl_all_time_eur': 'Total P&L',
+                    'realized_pnl_eur': 'Realized P&L',
+                    'unrealized_pnl_eur': 'Unrealized P&L',
                     'pnl_net_all_time_eur': 'Total Net P&L',
-                    'unrealized_pnl_eur': 'Unrealized P&L'            
+                    'dividend_yoc_pct': 'Annual YOC %'
                 })
+
                 df_acc.index.name = "Account"
                 st.dataframe(df_acc.style.map(color_negative_red).format("{:,.2f} €"), width="stretch")
-                
-                selected_acc = st.selectbox(
-                    "Select Account for Details:", 
-                    df_pnl['accounts_name'].unique(),
-                    key="pnl_account_select"
-                )
-                
+
+
+
+                # 1. Δημιουργία στηλών για τα φίλτρα και το Selectbox
+                col1, col2, col3 = st.columns([1, 1, 2])
+
+                with col1:
+                    show_closed_accounts = st.checkbox("Show Closed Accounts", value=False)
+                with col2:
+                    show_closed_positions = st.checkbox("Show Closed Positions", value=False)
+
+                # 2. Φιλτράρισμα Λογαριασμών (βάσει current_value_eur)
+                if show_closed_accounts:
+                    acc_options = df_pnl['accounts_name'].unique()
+                else:
+                    # Μόνο λογαριασμοί που έχουν τουλάχιστον μία εγγραφή με αξία != 0
+                    active_accs = df_pnl.groupby('accounts_name')['current_value_eur'].sum()
+                    acc_options = active_accs[active_accs != 0].index.tolist()
+
+                with col3:
+                    selected_acc = st.selectbox(
+                        "Select Account for Details:", 
+                        acc_options,
+                        key="pnl_account_select"
+                    )
+
                 query_acc_id = f"SELECT Accounts_Id FROM Accounts WHERE Accounts_Name = '{selected_acc}'"
                 df_acc_id = pd.read_sql(query_acc_id, conn)
+
                 if not df_acc_id.empty:
                     account_id = df_acc_id.iloc[0]['accounts_id']
                     
+                    # Φέρνουμε όλα τα δεδομένα (το φιλτράρισμα θα γίνει στο dataframe)
                     query_holdings = f"""
-                        SELECT h.Securities_Id, s.Securities_Name, h.Quantity
-                        FROM Holdings h
-                        JOIN Securities s ON h.Securities_Id = s.Securities_Id
-                        WHERE h.Accounts_Id = {account_id} AND h.Quantity != 0
+                        SELECT h.Securities_Id, s.Securities_Name, h.Quantity 
+                        FROM Holdings h 
+                        JOIN Securities s ON h.Securities_Id = s.Securities_Id 
+                        WHERE h.Accounts_Id = {account_id}
                     """
                     df_holdings = pd.read_sql(query_holdings, conn)
-                    
+                   
+               
                     query_prices = f"""
                         SELECT DISTINCT ON (h.Securities_Id) 
                             h.Securities_Id, 
@@ -416,29 +548,46 @@ def render_reports(conn):
                     
                     df_details['quantity'] = df_details['quantity'].fillna(0)
                     df_details['latest_price'] = df_details['latest_price'].fillna(0)
-                    
+
                     df_display = df_details[[
                         'securities_name', 'quantity', 'latest_price', 'current_value_eur', 
-                        'pnl_dtd_eur', 'pnl_wtd_eur', 'pnl_mtd_eur', 'pnl_ytd_eur', 
-                        'pnl_all_time_eur', 'pnl_net_all_time_eur', 'unrealized_pnl_eur'
+                        'pnl_dtd_market_eur', 'pnl_dtd_fx_eur',
+                        'pnl_dtd_eur', 'pnl_wtd_eur', 'pnl_mtd_eur', 
+                        'pnl_ytd_market_eur', 'pnl_ytd_fx_eur',
+                        'pnl_ytd_eur', 'realized_pnl_eur', 'unrealized_pnl_eur', 'pnl_net_all_time_eur', 'dividend_yoc_pct'
                     ]].rename(columns={
                         'securities_name': 'Security',
                         'quantity': 'Quantity',        
                         'latest_price': 'Latest Price',      
                         'current_value_eur': 'Value (€)',
+                        'pnl_dtd_market_eur': 'Daily Market P&L',
+                        'pnl_dtd_fx_eur': 'Daily FX P&L',
                         'pnl_dtd_eur': 'Daily P&L',
                         'pnl_wtd_eur': 'Weekly P&L',
                         'pnl_mtd_eur': 'Monthly P&L',
+                        'pnl_ytd_market_eur': 'YTD Market P&L',
+                        'pnl_ytd_fx_eur': 'YTD FX P&L',
                         'pnl_ytd_eur': 'YTD P&L',
-                        'pnl_all_time_eur': 'Total P&L',
+                    #    'pnl_all_time_eur': 'Total P&L',
+                        'realized_pnl_eur': 'Realized P&L',
+                        'unrealized_pnl_eur': 'Unrealized P&L',
                         'pnl_net_all_time_eur': 'Total Net P&L',
-                        'unrealized_pnl_eur': 'Unrealized P&L'
+                        'dividend_yoc_pct': 'Annual YOC %'
                     })
-                    
-                    pnl_cols = ['Daily P&L', 'Weekly P&L', 'Monthly P&L', 'YTD P&L', 'Total P&L', 'Total Net P&L', 'Unrealized P&L']
+
+                    # 3. Φιλτράρισμα Κλειστών Θέσεων στο τελικό Dataframe
+                    if not show_closed_positions:
+                        df_display = df_display[df_display['Value (€)'] != 0]
+
+
+                    pnl_cols = ['Daily Market P&L', 'Daily FX P&L', 'Daily P&L', 'Weekly P&L', 'Monthly P&L', 'YTD Market P&L', 'YTD FX P&L', 'YTD P&L', 'Realized P&L', 'Unrealized P&L', 'Total Net P&L', 'Annual YOC %']
+
+                    # 1. Set 'Security' as the index so Streamlit treats it as the frozen lead column
+                    df_to_show = df_display.set_index('Security')
 
                     st.dataframe(
-                        df_display.style
+                    #    df_display.style
+                        df_to_show.style
                         .map(color_negative_red, subset=pnl_cols)
                         .format({
                             # P&L columns
@@ -447,10 +596,11 @@ def render_reports(conn):
                             'Value (€)': "{:,.2f} €",
                             # Price and Quantity columns
                             'Latest Price': "{:,.2f}",
-                            'Quantity': "{:,.8f}"
+                            'Quantity': "{:,.8f}",
+                            'Annual YOC %': "{:.2f}%"
                         }),
                         width="stretch",
-                        hide_index=True
+                        hide_index=False
                     )
 
                 else:
@@ -485,7 +635,7 @@ def render_reports(conn):
                 st.dataframe(top_gainers.style.format({
                     'Daily P&L (€)': "{:,.2f} €",
                     'Daily Change (%)': "{:,.2f}%"
-                }), hide_index=True, use_container_width=True,
+                }), hide_index=True, width="stretch",
                 column_config={
                     "securities_name": st.column_config.TextColumn("Security", width="small"),
                     "accounts_name": st.column_config.TextColumn("Account", width="small"),
@@ -500,7 +650,7 @@ def render_reports(conn):
                 st.dataframe(top_losers.style.format({
                     'Daily P&L (€)': "{:,.2f} €",
                     'Daily Change (%)': "{:,.2f}%"
-                }), hide_index=True, use_container_width=True,
+                }), hide_index=True, width="stretch",
                 column_config={
                     "securities_name": st.column_config.TextColumn("Security", width="small"),
                     "accounts_name": st.column_config.TextColumn("Account", width="small"),
@@ -581,7 +731,7 @@ def render_reports(conn):
                 st.dataframe(
                     top_gainers.style.format({mover_col: "{:,.2f}%"}),
                     hide_index=True,
-                    use_container_width=True,
+                    width='stretch',
                     column_config={
                         "Security": st.column_config.TextColumn("Security"),
                         mover_col: st.column_config.NumberColumn(mover_col, format="%.2f%%"),
@@ -594,7 +744,7 @@ def render_reports(conn):
                 st.dataframe(
                     top_losers.style.format({mover_col: "{:,.2f}%"}),
                     hide_index=True,
-                    use_container_width=True,
+                    width='stretch',
                     column_config={
                         "Security": st.column_config.TextColumn("Security"),
                         mover_col: st.column_config.NumberColumn(mover_col, format="%.2f%%"),
@@ -638,7 +788,7 @@ def render_reports(conn):
                 st.dataframe(
                     top_high_vol.style.format({vol_period: "{:,.2f}%"}),
                     hide_index=True,
-                    use_container_width=True,
+                    width='stretch',
                     column_config={
                         "Security": st.column_config.TextColumn("Security"),
                         vol_period: st.column_config.NumberColumn("Volatility %", format="%.2f%%"),
@@ -651,7 +801,7 @@ def render_reports(conn):
                 st.dataframe(
                     top_low_vol.style.format({vol_period: "{:,.2f}%"}),
                     hide_index=True,
-                    use_container_width=True,
+                    width='stretch',
                     column_config={
                         "Security": st.column_config.TextColumn("Security"),
                         vol_period: st.column_config.NumberColumn("Volatility %", format="%.2f%%"),
@@ -695,7 +845,7 @@ def render_reports(conn):
             fig.add_hline(y=0, line_dash="dash", line_color="white")
             fig.add_vline(x=df_data["vol_1y_ann"].median(), line_dash="dash", line_color="gray")
             
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
             # 2. Top Efficiency Picks Table
             st.markdown("### 🏆 Top Efficiency Picks (High Sharpe Ratio)")
@@ -711,7 +861,7 @@ def render_reports(conn):
                     "quality_score": "Quality Score"
                 },
                 hide_index=True,
-                use_container_width=True
+                width='stretch'
             )
 
         with tab_port_signals:
@@ -764,7 +914,7 @@ def render_reports(conn):
                     "target_price": st.column_config.NumberColumn("Target Price", format="%.2f"),
                 },
                 hide_index=True,
-                use_container_width=True
+                width='stretch'
             )
 
             # Update buttons
@@ -794,7 +944,7 @@ def render_reports(conn):
 
             for i, (label, func) in enumerate(tasks):
                 with grid[i % 2]:
-                    if st.button(f"🔄 Update {label}", use_container_width=True):
+                    if st.button(f"🔄 Update {label}", width='stretch'):
                         with st.spinner(f"Updating {label}..."):
                             func()
                             st.toast(f"{label} updated!") # Less intrusive than balloons for small tasks
@@ -807,7 +957,7 @@ def render_reports(conn):
 
             with center_col:
                 # use 'primary' type to give it the brand color
-                if st.button("🚀 Run Full Update", type="primary", use_container_width=True):
+                if st.button("🚀 Run Full Update", type="primary", width='stretch'):
                     with st.spinner("Processing full update..."):
                         download_historical_fx("3y")
                         download_historical_prices_from_yahoo("3y")
@@ -1165,7 +1315,7 @@ def render_income_expense_reports(conn):
                         hovermode='x unified',
                         legend_traceorder="normal" # Διατηρεί τη σειρά και στο legend
                     )
-                    st.plotly_chart(fig_bar, use_container_width=True)
+                    st.plotly_chart(fig_bar, width='stretch')
 
                     st.markdown("---")
 
@@ -1210,7 +1360,7 @@ def render_income_expense_reports(conn):
                                     insidetextorientation='radial' # Βοηθάει στην ανάγνωση αν είναι πολλά τα slices
                                 )
                                 fig_pie.update_layout(showlegend=False)
-                                st.plotly_chart(fig_pie, use_container_width=True)
+                                st.plotly_chart(fig_pie, width='stretch')
                             else:
                                 st.info(f"No {c_type} data available.")
                 
@@ -1235,7 +1385,7 @@ def render_income_expense_reports(conn):
                     
                     st.dataframe(
                         display_df.style.format(format_dict),
-                        use_container_width=True,
+                        width='stretch',
                         hide_index=True,
                         column_config={
                             "category_full_path": "Category",
@@ -1276,7 +1426,7 @@ def render_income_expense_reports(conn):
                                     markers=True
                                 )
                                 fig_line.update_layout(xaxis_tickangle=-45, hovermode='x unified', height=500)
-                                st.plotly_chart(fig_line, use_container_width=True)
+                                st.plotly_chart(fig_line, width='stretch')
                 
                 with tab_drilldown:
                     st.subheader("Detailed Transaction Drill Down")
@@ -1307,7 +1457,7 @@ def render_income_expense_reports(conn):
                         
                         st.dataframe(
                             display_drill_df,
-                            use_container_width=True,
+                            width='stretch',
                             hide_index=True,
                             column_config={
                                 'date': 'Date',

@@ -147,6 +147,11 @@ class QIFImporter:
         """Import categories directly from QIF file"""
         st.info("📂 Importing Categories...")
         
+        self.cur.execute("SELECT count(*) FROM Categories")
+        result = self.cur.fetchone()
+        cat_entries_before = result[0] if result else 0  # Πρόσβαση στο πρώτο στοιχείο
+        print(f"Entries: {cat_entries_before}")
+
         with open(qif_file_path, 'r', encoding='latin-1') as f:
             current_cat = None
             current_type = 'Expense'
@@ -176,8 +181,15 @@ class QIFImporter:
                             cat_count += 1
                         current_cat = None
                         current_type = 'Expense'
-        
-        st.success(f"✅ Imported {cat_count} categories!")
+
+        self.cur.execute("SELECT count(*) FROM Categories")
+        result = self.cur.fetchone()
+        cat_entries_after = result[0] if result else 0  # Πρόσβαση στο πρώτο στοιχείο
+        print(f"Entries: {cat_entries_after}")
+
+
+        cat_imported = cat_entries_after - cat_entries_before
+        st.success(f"✅ Imported {cat_imported} categories!")
     
     def import_securities(self, qif):
         """Import securities from QIF object"""
@@ -371,13 +383,16 @@ class QIFImporter:
                         
                         # Map Quicken actions to database actions
                         action_map = {
-                            'Buy': 'Buy', 'BuyX': 'Buy', 'Sell': 'Sell', 'SellX': 'Sell',
+                            'Buy': 'Buy', 'BuyX': 'Buy', 
+                            'Sell': 'Sell', 'SellX': 'Sell',
                             'Div': 'Dividend', 'DivX': 'Dividend', 'Dividend': 'Dividend',
-                            'ReinvDiv': 'Reinvest', 'ReinvInt': 'Reinvest', 'Splt': 'Split',
-                            'StkSplit': 'Split', 'ShrsIn': 'ShrIn', 'IntInc': 'IntInc',
-                            'IntIncX': 'IntInc', 'ShrsOut': 'ShrOut', 'Cash': 'CashIn',
-                            'XIn': 'CashIn', 'RtrnCap': 'RtrnCap', 'WithdrwX': 'CashOut',
-                            'XOut': 'CashOut', 'MiscExpX': 'MiscExp', 'Grant': 'Grant',
+                            'ReinvDiv': 'Reinvest', 'ReinvInt': 'Reinvest', 
+                            'Splt': 'Split', 'StkSplit': 'Split', 
+                            'ShrsIn': 'ShrIn', 'ShrsOut': 'ShrOut',
+                            'IntInc': 'IntInc', 'IntIncX': 'IntInc', 
+                            'Cash': 'CashIn', 'XIn': 'CashIn', 'WithdrwX': 'CashOut', 'XOut': 'CashOut', 
+                            'RtrnCap': 'RtrnCap', 'RtrnCapX': 'RtrnCap',
+                            'MiscExpX': 'MiscExp', 'Grant': 'Grant',
                             'Vest': 'Vest', 'ExercisX': 'Exercise', 'Expire': 'Expire'
                         }
                         
