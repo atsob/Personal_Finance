@@ -11,7 +11,7 @@ import tempfile
 import os
 from datetime import datetime
 from database.connection import get_connection
-from database.crud import update_accounts_balances, update_investment_balances, update_pension_balances, update_holdings
+from database.crud import update_accounts_balances, update_db_stats, update_investment_balances, update_pension_balances, update_holdings
 
 class QIFImporter:
     """Handles QIF file import operations"""
@@ -496,6 +496,8 @@ class QIFImporter:
                 self.import_prices_from_qif(qif_file_path)
             
             # Automatic post-processing based on what was imported
+            st.info("🔄 Automatically updating database statistics...")
+            update_db_stats()
             if has_bank_tx or import_options.get('force_update_balances', False):
                 st.info("🔄 Automatically updating account balances (bank & cash accounts)...")
                 update_accounts_balances()
@@ -629,7 +631,7 @@ def render_qif_importer():
         # Import button
         col1, col2, col3 = st.columns([1, 2, 1])
         with col2:
-            if st.button("🚀 Start QIF Import", type="primary", use_container_width=True):
+            if st.button("🚀 Start QIF Import", type="primary", width='stretch'):
                 try:
                     importer = QIFImporter()
                     importer.import_full_qif(temp_path, tables_to_clear, import_options)

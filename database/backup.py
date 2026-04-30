@@ -623,7 +623,7 @@ def render_backup_restore():
                 st.dataframe(
                     df_sizes[['table_name', 'size']],
                     hide_index=True,
-                    use_container_width=True
+                    width='stretch'
                 )
                 total_size = df_sizes['size_bytes'].sum()
                 st.info(f"**Total Database Size:** {total_size / (1024*1024):.2f} MB")
@@ -645,7 +645,7 @@ def render_backup_restore():
                 help="Creates smaller backup by excluding historical_prices and historical_fx tables"
             )
         
-        if st.button("🔒 Create Backup", type="primary", use_container_width=True):
+        if st.button("🔒 Create Backup", type="primary", width='stretch'):
             with st.spinner("Creating backup... This may take a few minutes..."):
                 backup_name = custom_name if custom_name else None
                 result = backup_manager.create_backup(backup_name, include_blobs=not exclude_blobs)
@@ -684,7 +684,7 @@ def render_backup_restore():
                     'modified': 'Date Created'
                 },
                 hide_index=True,
-                use_container_width=True
+                width='stretch'
             )
             
             col1, col2 = st.columns([3, 1])
@@ -695,7 +695,7 @@ def render_backup_restore():
                     key="delete_backup_select"
                 )
             with col2:
-                if st.button("🗑️ Delete Selected", use_container_width=True):
+                if st.button("🗑️ Delete Selected", width='stretch'):
                     result = backup_manager.delete_backup(backup_to_delete)
                     if result['success']:
                         st.success(result['message'])
@@ -732,7 +732,7 @@ def render_backup_restore():
                 key="confirm_restore"
             )
             
-            if st.button("🔄 Restore Selected Backup", type="secondary", use_container_width=True):
+            if st.button("🔄 Restore Selected Backup", type="secondary", width='stretch'):
                 if confirm_restore:
                     with st.spinner("Restoring database... This may take several minutes..."):
                         result = backup_manager.restore_backup(selected_backup_info['filepath'])
@@ -740,7 +740,7 @@ def render_backup_restore():
                         if result['success']:
                             st.success(result['message'])
                             st.info("🔄 Please refresh the page to see the restored data.")
-                            if st.button("Refresh Now"):
+                            if st.button("Refresh Now", width='stretch'):
                                 st.rerun()
                         else:
                             st.error(result['message'])
@@ -770,7 +770,7 @@ def render_backup_restore():
                 key="confirm_upload_restore"
             )
             
-            if st.button("🔄 Restore from Uploaded File", type="secondary", use_container_width=True):
+            if st.button("🔄 Restore from Uploaded File", type="secondary", width='stretch'):
                 if confirm_upload_restore:
                     with st.spinner("Restoring database from uploaded file..."):
                         result = backup_manager.restore_backup(temp_restore_path)
@@ -778,7 +778,7 @@ def render_backup_restore():
                         if result['success']:
                             st.success(result['message'])
                             st.info("🔄 Please refresh the page to see the restored data.")
-                            if st.button("Refresh Now", key="refresh_after_upload"):
+                            if st.button("Refresh Now", key="refresh_after_upload", width='stretch'):
                                 st.rerun()
                         else:
                             st.error(result['message'])
@@ -808,7 +808,7 @@ def render_backup_restore():
         with col1:
             export_table = st.selectbox("Select table to export", tables, key="export_table_select")
         with col2:
-            if st.button("Export to CSV", use_container_width=True):
+            if st.button("Export to CSV", width='stretch'):
                 with st.spinner(f"Exporting {export_table}..."):
                     result = backup_manager.export_to_csv(export_table)
                     if result['success']:
@@ -848,10 +848,10 @@ def render_backup_restore():
             
             with st.expander("Preview CSV data"):
                 df_preview = pd.read_csv(temp_csv_path)
-                st.dataframe(df_preview.head(), use_container_width=True)
+                st.dataframe(df_preview.head(), width='stretch')
                 st.caption(f"Total rows: {len(df_preview)}")
             
-            if st.button("Import CSV", type="secondary", use_container_width=True):
+            if st.button("Import CSV", type="secondary", width='stretch'):
                 with st.spinner(f"Importing into {import_table}..."):
                     result = backup_manager.import_from_csv(import_table, temp_csv_path, truncate_first)
                     if result['success']:
@@ -968,7 +968,7 @@ def render_backup_restore_simple():
     col1, col2 = st.columns(2)
     
     with col1:
-        if st.button("🔒 Simple Backup", use_container_width=True):
+        if st.button("🔒 Simple Backup", width='stretch'):
             with st.spinner("Creating backup..."):
                 try:
                     result = backup_manager.create_backup()
@@ -1007,7 +1007,7 @@ def render_backup_restore_quick():
     col1, col2 = st.columns(2)
     
     with col1:
-        if st.button("🔒 Quick Backup", use_container_width=True):
+        if st.button("🔒 Quick Backup", width='stretch'):
             with st.spinner("Creating backup..."):
                 # Call backup and ensure we handle the result properly
                 backup_result = backup_manager.create_backup()

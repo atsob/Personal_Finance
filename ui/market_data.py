@@ -50,7 +50,7 @@ def render_market_data(conn):
                     y='fx_rate', 
                     x_label="Date",
                     y_label="Rate",
-                    use_container_width=True)
+                    width='stretch')
         
         st.subheader("🔄 Update Exchange Rates")
         col1, col2 = st.columns([2, 1])
@@ -215,7 +215,7 @@ def render_market_data(conn):
                 height=450
             )
 
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
         st.subheader("🔄 Update Prices")
         col1, col2 = st.columns([2, 1])

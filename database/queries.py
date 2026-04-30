@@ -532,12 +532,44 @@ def get_pnl_report_data():
     --     ((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)) - COALESCE(cf.cf_all_time, 0)) - 
             COALESCE((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)),0) - COALESCE(cf.net_invested_all_time, 0) - 
             COALESCE((SELECT Quantity * (pf.price_today - Fifo_Avg_Price) * COALESCE(pf.fx_today, 1) FROM Holdings WHERE Accounts_Id = pf.Accounts_Id AND Securities_Id = pf.Securities_Id), 0) as realized_pnl_eur,
-
+/*
             -- Annual YOC %
             ROUND(((SELECT ABS(SUM(CASE WHEN i.Action = 'Dividend' THEN i.Total_Amount WHEN i.Action = 'Reinvest' THEN (i.Quantity * i.Price_Per_Share) ELSE 0 END)) 
                     FROM Investments i WHERE i.Securities_Id = pf.Securities_Id AND i.Accounts_Id = pf.Accounts_Id AND i.Action IN ('Dividend', 'Reinvest') AND i.Date >= CURRENT_DATE - INTERVAL '1 year') / 
                     NULLIF((SELECT Quantity * Fifo_Avg_Price FROM Holdings WHERE Accounts_Id = pf.Accounts_Id AND Securities_Id = pf.Securities_Id), 0))::numeric * 100, 2) as dividend_yoc_pct
-
+*/
+            -- Annual YOC % - Λεπτομερής Υπολογισμός με Διευκρινίσεις                   
+            ROUND(
+                (
+                    SELECT SUM(
+                        CASE 
+                            -- Αν έχουμε Total_Amount (κλασικό Dividend), το παίρνουμε απευθείας
+                            WHEN i.Action = 'Dividend' THEN i.Total_Amount 
+                            -- Αν είναι Reinvest ή ShrIn, υπολογίζουμε την αξία βάσει Historical_Prices
+                            WHEN i.Action IN ('Reinvest', 'ShrIn') THEN 
+                                i.Quantity * COALESCE(
+                                    NULLIF(i.Price_Per_Share, 0), 
+                                    (SELECT hp.Close FROM Historical_Prices hp 
+                                    WHERE hp.Securities_Id = i.Securities_Id 
+                                    AND hp.Date <= i.Date 
+                                    ORDER BY hp.Date DESC LIMIT 1)
+                                )
+                            ELSE 0 
+                        END
+                    )
+                    FROM Investments i 
+                    WHERE i.Securities_Id = pf.Securities_Id 
+                    AND i.Accounts_Id = pf.Accounts_Id 
+                    AND i.Action IN ('Dividend', 'Reinvest', 'ShrIn') 
+                    AND i.Date >= CURRENT_DATE - INTERVAL '1 year'
+                ) / 
+                NULLIF(
+                    (SELECT Quantity * Fifo_Avg_Price FROM Holdings 
+                    WHERE Accounts_Id = pf.Accounts_Id 
+                    AND Securities_Id = pf.Securities_Id), 0
+                ) * 100, 8
+            ) as dividend_yoc_pct
+          
         FROM prices_fx pf
         LEFT JOIN cash_flows cf ON pf.Accounts_Id = cf.Accounts_Id AND pf.Securities_Id = cf.Securities_Id
         WHERE (pf.qty_today != 0 OR cf.cf_all_time IS NOT NULL) -- Εξασφαλίζει ότι βλέπουμε και κλειστές θέσεις με ιστορικό

@@ -467,7 +467,20 @@ def render_reports(conn):
                 })
 
                 df_acc.index.name = "Account"
-                st.dataframe(df_acc.style.map(color_negative_red).format("{:,.2f} €"), width="stretch")
+            #    st.dataframe(df_acc.style.map(color_negative_red).format("{:,.2f} €"), width="stretch")
+
+                # Ορίζουμε τις στήλες που θέλουν σύμβολο € (όλες εκτός από το YOC)
+                euro_cols = [col for col in df_acc.columns if col != 'Annual YOC %']
+
+                st.dataframe(
+                    df_acc.style
+                    .map(color_negative_red)
+                    .format({
+                        **{col: "{:,.2f} €" for col in euro_cols}, # Όλα τα υπόλοιπα σε €
+                        'Annual YOC %': "{:.4f}%"                  # Το YOC σε %
+                    }), 
+                    width="stretch"
+                )
 
 
 
@@ -597,7 +610,7 @@ def render_reports(conn):
                             # Price and Quantity columns
                             'Latest Price': "{:,.2f}",
                             'Quantity': "{:,.8f}",
-                            'Annual YOC %': "{:.2f}%"
+                            'Annual YOC %': "{:.4f}%"
                         }),
                         width="stretch",
                         hide_index=False

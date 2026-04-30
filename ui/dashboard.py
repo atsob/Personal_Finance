@@ -108,7 +108,6 @@ def render_dashboard(conn):
     # We define the order we want, skipping the 'qty' column
     st.dataframe(
         styled_df, 
-        #use_container_width=True, 
         width="stretch", 
         hide_index=True,
         column_order=("name", "type", "curr", "qty_display", "value_eur"),
@@ -148,7 +147,7 @@ def render_dashboard(conn):
 
     for i, (label, func) in enumerate(tasks):
         with grid[i % 2]:
-            if st.button(f"🔄 Update {label}", use_container_width=True):
+            if st.button(f"🔄 Update {label}", width='stretch'):
                 with st.spinner(f"Updating {label}..."):
                     func()
                     st.toast(f"{label} updated!") # Less intrusive than balloons for small tasks
@@ -161,7 +160,7 @@ def render_dashboard(conn):
 
     with center_col:
         # use 'primary' type to give it the brand color
-        if st.button("🚀 Run Full Update", type="primary", use_container_width=True):
+        if st.button("🚀 Run Full Update", type="primary", width='stretch'):
             with st.spinner("Processing full update..."):
                 update_accounts_balances()
                 update_investment_balances()

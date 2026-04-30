@@ -222,7 +222,7 @@ def update_accounts_balances(target_acc_id=None):
                     FROM Transactions t 
                     WHERE t.Accounts_Id = a.Accounts_Id
                 ), 0)
-                WHERE a.Accounts_Type NOT IN ('Pension');
+                WHERE a.Accounts_Type NOT IN ('Pension', 'Brokerage', 'Other Investment', 'Margin');
             """
             cur.execute(sql)
         conn.commit()
@@ -265,19 +265,16 @@ def update_investment_balances():
             UPDATE Accounts a
             SET Accounts_Balance = COALESCE((
                 SELECT  
-                --    SUM(CASE WHEN Action IN ('Dividend', 'CashIn', 'IntInc') THEN Total_Amount 
-                --             WHEN Action IN ('CashOut') THEN -Total_Amount 
-                --             ELSE 0 END)
                     SUM(CASE WHEN Action IN ('Dividend', 'CashIn', 'IntInc', 'Sell') THEN Total_Amount 
                              WHEN Action IN ('CashOut', 'Buy') THEN -Total_Amount 
                              ELSE 0 END)
-                --    SUM(CASE WHEN Action IN ('Buy', 'Reinvest', 'ShrIn') THEN Quantity ELSE 0 END) 
-                --        OVER (PARTITION BY Accounts_Id, Securities_Id) as total_buys,
-                --    SUM(CASE WHEN Action IN ('Sell', 'ShrOut') THEN Quantity ELSE 0 END) 
-                --        OVER (PARTITION BY Accounts_Id, Securities_Id) as total_sells
                 FROM Investments t 
                 WHERE t.Accounts_Id = a.Accounts_Id
-            ), 0)
+            ), 0) +  COALESCE((
+                    SELECT SUM(Total_Amount) 
+                    FROM Transactions t 
+                    WHERE t.Accounts_Id = a.Accounts_Id
+                ), 0)
             WHERE a.Accounts_Type IN ('Brokerage', 'Other Investment', 'Margin');
         """)
         conn.commit()
@@ -412,3 +409,22 @@ def update_payee_default_category():
     finally:
         cur.close()
         conn.close()
+
+def update_db_stats():
+    """Update database statistics."""
+    conn = get_connection()
+    try:
+        # Χρήση επιπέδου απομόνωσης που επιτρέπει το ANALYZE αν χρειαστεί
+        old_isolation_level = conn.isolation_level
+        conn.set_isolation_level(0) # autocommit mode
+        
+        with conn.cursor() as cursor:
+            cursor.execute("ANALYZE;")
+        
+        conn.set_isolation_level(old_isolation_level)
+        print("Database statistics updated successfully.")
+    except Exception as e:
+        print(f"Error updating stats: {e}")
+
+# Καλέστε το στο τέλος του import process:
+# update_db_stats()

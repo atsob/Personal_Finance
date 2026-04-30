@@ -364,7 +364,7 @@ def render_register(conn):
                             df_new_splits,
                             num_rows="dynamic",
                             hide_index=True,
-                            use_container_width=True,
+                            width='stretch',
                             key=f"new_splits_editor_{st.session_state.reset_counter}",
                             column_config={
                                 "categories_id": st.column_config.SelectboxColumn(
@@ -862,7 +862,167 @@ def render_register(conn):
     else:
 
       #  t_view, t_hold = st.tabs(["👁️ View/Edit Register", "➕ New Transaction / Transfer"])
-        tab_reg, tab_view_hold, tab_edit_hold = st.tabs(["📓 Investment Register", "📊 Current Holdings", "✏️ Edit Holdings"])
+
+        st.subheader(f"Outstanding Cash Balance: {acc_balance:,.2f}")
+
+        cash_view, tab_reg, tab_view_hold, tab_edit_hold = st.tabs(["👁️ Cash Transaction Register", "📓 Investment Register", "📊 Current Holdings", "✏️ Edit Holdings"])
+        with cash_view:
+            query_reg = f"SELECT * FROM Transactions WHERE Accounts_Id = {acc_id} ORDER BY Date DESC"
+            df = pd.read_sql(query_reg, conn)
+            
+            unique_key = f"set_reg_{acc_id}"
+
+            edited_reg = st.data_editor(
+                df, 
+                num_rows="dynamic", 
+                key=unique_key, 
+                width="stretch", 
+                column_config={
+                    "transactions_id": st.column_config.NumberColumn(
+                        "Transaction ID",
+                        width="small",
+                        disabled=True
+                    ),
+                    "accounts_id": None,  # Hiding the duplicate accounts_id column
+                    "date": st.column_config.DateColumn(
+                        "Date", 
+                        width="small",
+                        format="DD/MM/YYYY"
+                    ),
+                    "payees_id": st.column_config.SelectboxColumn(
+                        "Payee", 
+                        width="medium",
+                        options=list(payee_options.keys()), 
+                        format_func=lambda x: payee_options.get(x, "Unknown")
+                    ),
+                    "description": st.column_config.TextColumn(
+                        "Description",
+                    ),
+                    "total_amount": st.column_config.NumberColumn(
+                        "Total Amount",
+                        width="small",
+                        format="%,.2f",  
+                    ),
+                    "cleared": st.column_config.CheckboxColumn(
+                        "Cleared",
+                        width="small"
+                    ),
+                    "accounts_id_target": st.column_config.SelectboxColumn(
+                        "Target Account", 
+                        options=list(acc_options.keys()), 
+                        format_func=lambda x: acc_options.get(x, "Unknown")
+                    ),
+                    "total_amount_target": st.column_config.NumberColumn(
+                        "Target Amount",
+                        width="small",
+                        format="%,.2f",  
+                    ),
+                #    "transfers_id": st.column_config.NumberColumn(
+                #        "Transfer ID",
+                #    ),
+                    "transfers_id": None,  # Hiding the transfers_id column since it's only relevant for linking transfers and not needed for editing
+                    "embedding": None # Hiding the column embedding since it's huge and not needed for editing
+                }
+            )
+
+            if not edited_reg.equals(df):
+                save_changes(df, edited_reg, "Transactions", "transactions_id", current_acc_id=acc_id, conn=conn)
+                # Update cache after save
+                st.session_state.register_df = pd.read_sql(f"SELECT * FROM Transactions WHERE Accounts_Id = {acc_id} ORDER BY Date DESC", conn)
+                st.session_state.df_accs = pd.read_sql("SELECT * FROM Accounts WHERE Is_Active = True", conn)
+                st.rerun()
+            
+            # --- Splits Section ---
+            st.write("---")
+            st.subheader("🔍 Split Analysis")
+            
+            # Προετοιμασία λίστας IDs
+            available_ids = df['transactions_id'].tolist()
+            
+            # Εύρεση του σωστού index για το session_state
+            default_ix = 0
+            if st.session_state.get('current_tx_id') in available_ids:
+                default_ix = available_ids.index(st.session_state.current_tx_id) + 1
+            
+            # 1. Selectbox: Η αλλαγή εδώ ενημερώνει αυτόματα το UI
+            selected_tx_id = st.selectbox(
+                "Select Transaction ID for Splits:", 
+                [None] + available_ids, 
+                index=default_ix,
+                key="tx_selector_widget"
+            )
+
+            # Αυτόματη ενημέρωση του session_state χωρίς κουμπί "View"
+            if selected_tx_id != st.session_state.get('current_tx_id'):
+                st.session_state.current_tx_id = selected_tx_id
+                if selected_tx_id is not None:
+                    st.session_state.show_splits_pane = True
+                else:
+                    st.session_state.show_splits_pane = False
+                st.rerun()
+
+            # 2. Εμφάνιση του Pane αν υπάρχει επιλεγμένο ID
+            if st.session_state.get('show_splits_pane') and st.session_state.get('current_tx_id') is not None:
+                tx_id = int(st.session_state.current_tx_id)
+                
+                st.write("---")
+                st.write(f"### 📑 Edit Splits for ID: {tx_id}")
+                
+                # Φόρτωση δεδομένων
+                df_splits = pd.read_sql(
+                    "SELECT * FROM Splits WHERE Transactions_Id = %s", 
+                    conn, params=(tx_id,)
+                )
+
+                editor_key = f"splits_ed_{tx_id}"
+
+                # 3. Data Editor
+                edited_splits = st.data_editor(
+                    df_splits,
+                    num_rows="dynamic",
+                    key=editor_key,
+                    width="stretch",
+                    column_config={
+                        "splits_id": st.column_config.NumberColumn("Split ID", disabled=True),
+                        "transactions_id": None,
+                        "categories_id": st.column_config.SelectboxColumn(
+                            "Category", options=list(cat_options.keys()), 
+                            format_func=lambda x: cat_options.get(x, "Unknown"), width="large"
+                        ),
+                        "amount": st.column_config.NumberColumn("Amount", format="%,.2f", width="medium"),
+                        "memo": st.column_config.TextColumn("Memo", width="large"),
+                        "embedding": None 
+                    }
+                )
+
+                if not edited_splits.equals(df_splits):
+                    # Προετοιμασία δεδομένων
+                    df_to_save = edited_splits.copy()
+                    df_to_save['transactions_id'] = tx_id
+                    
+                    # Κλήση της "καθαρής" συνάρτησης χωρίς κουμπί
+                    from database.crud import execute_db_save
+                    success, msg = execute_db_save(df_splits, df_to_save, "Splits", "splits_id", conn=conn)
+                    
+                    if success:
+                        st.toast("✅ Splits auto-saved!") # Μικρή ειδοποίηση αντί για rerun
+                        # Ενημερώνουμε το session state ώστε το επόμενο run να μη θεωρεί ότι υπάρχουν αλλαγές
+                        st.session_state[f"df_splits_{tx_id}"] = df_to_save 
+                        st.rerun()
+
+                # 5. Έλεγχος Αθροίσματος (πάντα ορατός όταν το pane είναι ανοιχτό)
+                total_split = float(edited_splits['amount'].sum())
+                cur = conn.cursor()
+                cur.execute("SELECT total_amount FROM Transactions WHERE Transactions_Id = %s", (tx_id,))
+                res = cur.fetchone()
+                
+                if res:
+                    expected_total = float(res[0])
+                    if abs(total_split - expected_total) > 0.01:
+                        st.warning(f"⚠️ Warning: Sum of splits ({total_split:,.2f}) ≠ Transaction Total ({expected_total:,.2f})")
+                    else:
+                        st.info(f"✅ Splits balance correctly ({total_split:,.2f})")
+
         with tab_reg:
 
             df_inv = pd.read_sql(f"SELECT * FROM Investments WHERE Accounts_Id = {acc_id} ORDER BY Date DESC", conn)
@@ -993,7 +1153,7 @@ def render_register(conn):
             # 3. Display the date (Caution: st.dataframe is not editable)
             st.dataframe(
                 styled_df,
-                use_container_width=True,
+                width='stretch',
                 hide_index=True,
                 column_config={
                     "holdings_id": None,

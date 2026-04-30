@@ -20,12 +20,20 @@ from ui.market_data import render_market_data
 from ui.ai_assistant import render_ai_assistant
 from ui.settings import render_settings
 
+@st.cache_resource
+def startup_db_maintenance():
+    conn = get_connection()
+    with conn.cursor() as cursor:
+        cursor.execute("ANALYZE;")
+    return True
+
 def main():
     """Main application entry point."""
     # Page configuration
     st.set_page_config(page_title="Personal Finance", layout="wide")
     
     # Initialize
+    startup_db_maintenance()
     configure_warnings_and_ssl()
     init_session_state()
     
@@ -44,7 +52,6 @@ def main():
     try:
         import os
         from llama_index.core import StorageContext, load_index_from_storage
-    #    persist_dir = "/app/storage_rag"
         persist_dir=ENV_CONFIG['persist_dir']
         docstore_path = os.path.join(persist_dir, "docstore.json")
         if os.path.exists(docstore_path):
