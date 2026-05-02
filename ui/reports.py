@@ -728,12 +728,38 @@ def render_reports(conn):
             # 2. Προετοιμασία του DataFrame για την επιλεγμένη περίοδο
             selected_sql_col = period_map[mover_col]
             
-            # Φιλτράρουμε και μετονομάζουμε δυναμικά
-            df_display = df_data[['securities_name', selected_sql_col]].copy()
+            # --- ΝΕΟ: Φιλτράρισμα βάσει price_today_date ---
+            # Μετατροπή σε datetime αν δεν είναι ήδη
+            df_filtered = df_data.copy()
+            df_filtered['price_today_date'] = pd.to_datetime(df_filtered['price_today_date']).dt.date
+            today = pd.Timestamp.now().date()
+
+            if mover_col == "Daily (%)":
+                # Μόνο αν η τιμή είναι σημερινή
+                df_filtered = df_filtered[df_filtered['price_today_date'] == today]
+            elif mover_col == "Weekly (%)":
+                # Μόνο αν η τιμή είναι εντός των τελευταίων 7 ημερών
+                week_ago = today - pd.Timedelta(days=7)
+                df_filtered = df_filtered[df_filtered['price_today_date'] >= week_ago]
+            else:
+                # Για όλες τις άλλες περιόδους (Monthly, YTD κλπ), 
+                # ίσως θέλετε ένα "λογικό" όριο, π.χ. εντός τελευταίου μήνα
+                month_ago = today - pd.Timedelta(days=30)
+                df_filtered = df_filtered[df_filtered['price_today_date'] >= month_ago]
+            # ----------------------------------------------
+
+            # Προετοιμασία του DataFrame για την εμφάνιση
+            df_display = df_filtered[['securities_name', selected_sql_col]].copy()
             df_display.columns = ['Security', mover_col]
+            df_display = df_display.dropna(subset=[mover_col])
+
+
+            # Φιλτράρουμε και μετονομάζουμε δυναμικά
+        #    df_display = df_data[['securities_name', selected_sql_col]].copy()
+        #    df_display.columns = ['Security', mover_col]
             
             # Αφαίρεση εγγραφών με NaN (αν υπάρχουν) για σωστό sorting
-            df_display = df_display.dropna(subset=[mover_col])
+        #    df_display = df_display.dropna(subset=[mover_col])
 
             # 3. Εμφάνιση Gainers / Losers
             gainer_col, loser_col = st.columns(2)

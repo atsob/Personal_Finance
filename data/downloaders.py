@@ -5,10 +5,16 @@ import pdfplumber
 import requests
 import io
 import re
+import time
 import pandas as pd
 from database.connection import get_connection
 from ai.llm import get_custom_session
-from datetime import datetime
+from datetime import datetime, timedelta
+from decimal import Decimal
+from config.settings import ENV_CONFIG
+from psycopg2.extras import execute_batch
+
+
 
 def download_historical_fx(tsperiod=None):
     """Download historical FX rates from Yahoo Finance."""
@@ -203,6 +209,331 @@ def download_historical_prices_from_yahoo(tsperiod=None, target_sec_id=None):
         st.error(f"❌ Error: {e}")
         logging.error(f"Error: {e}")
     finally:
+        cur.close()
+        conn.close()
+
+
+
+# ======================================================
+# DATE RANGE HELPER
+# ======================================================
+
+def get_smart_date_range(time_input="1mo"):
+    """
+    Converts Yahoo Finance / EODHD style period strings to a date range.
+        15d  = 15 days
+        1w   = 1 week
+        1mo  = 1 month   (also accepts legacy '1m')
+        3mo  = 3 months  (also accepts legacy '3m')
+        1y   = 1 year
+    Returns:
+        from_date, to_date (YYYY-MM-DD)
+    """
+ 
+    to_date_obj = datetime.today()
+ 
+    if not time_input:
+        time_input = "1mo"
+ 
+    s = str(time_input).lower().strip()
+ 
+    # Normalise legacy short-month format: '1m' → '1mo', '3m' → '3mo'
+    # (but don't touch 'min' or other non-month uses of 'm')
+    s = re.sub(r'^(\d+)m$', r'mo', s)
+ 
+    # Accept: 15d, 1w, 1mo, 3mo, 1y
+    match = re.match(r"^(\d+)(d|w|mo|y)$", s)
+ 
+    if not match:
+        logging.warning(f"Invalid period format {time_input!r}, defaulting to 1mo")
+        match = re.match(r"^(\d+)(d|w|mo|y)$", "1mo")
+ 
+    value = int(match.group(1))
+    unit = match.group(2)
+ 
+    multiplier = {
+        "d":  1,
+        "w":  7,
+        "mo": 30,
+        "y":  365
+    }
+ 
+    days = value * multiplier[unit]
+ 
+    from_date_obj = to_date_obj - timedelta(days=days)
+ 
+    return (
+        from_date_obj.strftime("%Y-%m-%d"),
+        to_date_obj.strftime("%Y-%m-%d")
+    )
+ 
+
+# ======================================================
+# FETCH DATA FROM EODHD
+# ======================================================
+
+def fetch_prices_from_eodhd(api_key, symbol, from_date, to_date, retries=3):
+    """
+    Download historical prices from EODHD
+    """
+
+    url = f"https://eodhd.com/api/eod/{symbol}"
+
+    params = {
+        "api_token": api_key,
+        "fmt": "json",
+        "from": from_date,
+        "to": to_date,
+        "period": "d",
+        "order": "a"
+    }
+
+    for attempt in range(retries):
+        try:
+            response = requests.get(url, params=params, timeout=30)
+            response.raise_for_status()
+
+            data = response.json()
+
+            if not isinstance(data, list):
+                raise Exception(f"Unexpected API response for {symbol}: {str(data)[:200]}")
+
+            logging.info(f"Sample: {data[:3]}")
+            print(f"Sample: {data[:3]}")
+
+            return data
+
+        except Exception as e:
+            logging.warning(
+                f"{symbol} attempt {attempt+1}/{retries} failed: {e}"
+            )
+            print(
+                f"{symbol} attempt {attempt+1}/{retries} failed: {e}"
+            )
+
+            time.sleep(2)
+
+    raise Exception(f"Failed downloading data for {symbol}")
+
+
+# ======================================================
+# TRANSFORM TO DATAFRAME
+# ======================================================
+
+def transform_data_from_eodhd(sec_id, rows):
+
+    clean = []
+
+    for r in rows:
+
+        try:
+            if not isinstance(r, dict):
+                continue
+
+            if "date" not in r:
+                continue
+
+            if "close" not in r:
+                continue
+
+            clean.append({
+                "Securities_Id": sec_id,
+                "Date": pd.to_datetime(r["date"]),
+                "Close": float(r["close"]),
+                "High": float(r["high"]) if r.get("high") not in [None, ""] else None,
+                "Low": float(r["low"]) if r.get("low") not in [None, ""] else None,
+                "Volume": int(r["volume"]) if r.get("volume") not in [None, ""] else 0
+            })
+
+        except Exception as e:
+            logging.warning(f"Skipped bad row {r}: {e}")
+
+    if not clean:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(clean)
+
+    df = df.sort_values("Date")
+    df = df.set_index("Date")
+
+    return df
+
+# ======================================================
+# MAIN IMPORT FUNCTION
+# ======================================================
+
+def download_historical_prices_from_eodhd(tsperiod="1m", target_sec_id=None):
+    """
+    Download and upsert historical prices into DB
+    """
+    logging.info(f"Starting EODHD download with period={tsperiod} and target_sec_id={target_sec_id}")
+    print(f"Starting EODHD download with period={tsperiod} and target_sec_id={target_sec_id}")  
+
+
+    # Normalise period: treat None/empty as default, uppercase → lowercase
+    if not tsperiod:
+        tsperiod = "1m"
+    tsperiod = str(tsperiod).lower().strip()
+
+    conn = get_connection()
+    cur = conn.cursor()
+
+    try:
+
+        # ----------------------------------------
+        # Build Query Safely
+        # ----------------------------------------
+
+        query = """
+            SELECT Securities_Id, Securities_Name, EODHD_Symbol
+            FROM Securities
+            WHERE EODHD_Symbol IS NOT NULL
+              AND EODHD_Symbol != ''
+        """
+
+        params = []
+
+        if target_sec_id:
+            query += " AND Securities_Id = %s"
+            params.append(int(target_sec_id))
+
+        query += " ORDER BY Securities_Name"
+
+        cur.execute(query, params)
+
+        securities = cur.fetchall()
+
+        if not securities:
+            logging.warning("No securities found.")
+            print("No securities found.")
+            return
+
+        from_date, to_date = get_smart_date_range(tsperiod)
+
+        api_key = ENV_CONFIG["eodhd_api_key"]
+
+        logging.info(f"Downloading from {from_date} to {to_date}")
+        print(f"Downloading from {from_date} to {to_date}")
+
+        # ----------------------------------------
+        # Process each security
+        # ----------------------------------------
+
+        for sec_id, sec_name, symbol in securities:
+
+            try:
+                logging.info(f"Downloading {sec_name} ({symbol})")
+                print(f"Downloading {sec_name} ({symbol})")
+
+                data = fetch_prices_from_eodhd(
+                    api_key,
+                    symbol,
+                    from_date,
+                    to_date
+                )
+
+                if not data:
+                    logging.warning(f"No data for {symbol}")
+                    print(f"No data for {symbol}")
+                    continue
+
+                data = [x for x in data if isinstance(x, dict)]
+
+                logging.info(f"{symbol}: {len(data)} rows downloaded")
+                print(f"{symbol}: {len(data)} rows downloaded")
+                if data:
+                    logging.info(f"First row = {data[0]}")
+                    print(f"First row = {data[0]}")
+                    logging.info(f"Last row = {data[-1]}")
+                    print(f"Last row = {data[-1]}")
+
+                df = transform_data_from_eodhd(sec_id, data)
+
+                if df.empty:
+                    logging.warning(f"Empty dataframe for {symbol}")
+                    print(f"Empty dataframe for {symbol}")
+                    continue
+
+                rows_to_insert = []
+
+                for date, row in df.iterrows():
+
+                    rows_to_insert.append((
+                        int(row["Securities_Id"]),
+                        date.strftime("%Y-%m-%d"),
+                        float(row["Close"]),
+                        None if pd.isna(row["High"]) else float(row["High"]),
+                        None if pd.isna(row["Low"]) else float(row["Low"]),
+                        0 if pd.isna(row["Volume"]) else int(row["Volume"])
+                    ))
+
+                # ----------------------------------------
+                # FAST BULK UPSERT
+                # ----------------------------------------
+
+                sql = """
+                    INSERT INTO Historical_Prices
+                    (
+                        Securities_Id,
+                        Date,
+                        Close,
+                        High,
+                        Low,
+                        Volume
+                    )
+                    VALUES (%s,%s,%s,%s,%s,%s)
+
+                    ON CONFLICT (Securities_Id, Date)
+                    DO UPDATE SET
+                        Close  = EXCLUDED.Close,
+                        High   = EXCLUDED.High,
+                        Low    = EXCLUDED.Low,
+                        Volume = EXCLUDED.Volume
+                """
+
+                if not rows_to_insert:
+                    continue
+
+                execute_batch(cur, sql, rows_to_insert, page_size=500)
+
+                conn.commit()
+
+                logging.info(
+                    f"Completed {symbol} ({len(rows_to_insert)} rows)"
+                )
+                print(
+                    f"Completed {symbol} ({len(rows_to_insert)} rows)"
+                )
+
+            except Exception as sec_error:
+
+                conn.rollback()
+
+                import traceback
+                logging.error(
+                    f"Failed {symbol}: {sec_error}\n{traceback.format_exc()}"
+                )
+                print(
+                    f"Failed {symbol}: {sec_error}\n{traceback.format_exc()}"
+                )
+
+        logging.info("All imports completed.")
+        print("All imports completed.")
+
+    except Exception as e:
+
+        conn.rollback()
+
+        logging.error(f"Global error: {e}")
+        print(f"Global error: {e}")
+
+        try:
+            st.error(f"❌ Error: {e}")
+        except:
+            pass
+
+    finally:
+
         cur.close()
         conn.close()
 

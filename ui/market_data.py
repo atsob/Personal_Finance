@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 from database.crud import save_changes_no_serial, save_changes_mid
-from data.downloaders import download_historical_fx, download_historical_prices_from_yahoo, download_bond_prices_from_solidus
+from data.downloaders import download_historical_fx, download_historical_prices_from_eodhd, download_historical_prices_from_yahoo, download_bond_prices_from_solidus
 
 def render_market_data(conn):
     """Render the Market Data page."""
@@ -16,8 +16,8 @@ def render_market_data(conn):
     sec_options = df_sec_list.set_index('securities_id')['securities_name'].to_dict()
 
     period_options = {
-        "1 Day": "1d", "5 Days": "5d", "1 Month": "1mo", "6 Months": "6mo",
-        "1 Year": "1y", "5 Years": "5y", "10 Years": "10y", "15 Years": "15y",
+        "1 Day": "1d", "5 Days": "5d", "1 Month": "1mo", "3 Months": "3mo", "6 Months": "6mo",
+        "1 Year": "1y", "3 Years": "3y", "5 Years": "5y", "10 Years": "10y", "15 Years": "15y",
         "20 Years": "20y", "25 Years": "25y", "30 Years": "30y"
     }
     
@@ -237,12 +237,20 @@ def render_market_data(conn):
             ts_period_price = period_options[selected_label_price]
             
         with col2:
-            if st.button("🚀 Download All", key="download_all", width="stretch"):
+            if st.button("🚀 Download All from Yahoo", key="download_all_yahoo", width="stretch"):
                 download_historical_prices_from_yahoo(ts_period_price)
                 st.rerun()
 
-            if st.button(f"🚀 Update {selected_inv_sec['securities_name']}", key="download_one", width="stretch"):
+            if st.button(f"🚀 Update {selected_inv_sec['securities_name']} from Yahoo", key="download_one_yahoo", width="stretch"):
                 download_historical_prices_from_yahoo(ts_period_price, inv_sec_id)
+                st.rerun()
+
+            if st.button("🚀 Download All from EODHD", key="download_all_eodhd", width="stretch"):
+                download_historical_prices_from_eodhd(ts_period_price)
+                st.rerun()
+
+            if st.button(f"🚀 Update {selected_inv_sec['securities_name']} from EODHD", key="download_one_eodhd", width="stretch"):
+                download_historical_prices_from_eodhd(ts_period_price, inv_sec_id)
                 st.rerun()
 
             if st.button("🚀 Download Bond Prices from Solidus", key="download_solidus", width="stretch"):

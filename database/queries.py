@@ -379,7 +379,8 @@ def get_portfolio_signals(selected_acc_id=None): # Προσθήκη '=' εδώ
                 WHEN recommendation_signal LIKE '🔴%%' AND (wall_street_view IS NULL OR wall_street_view = 'none') THEN '⚙️ ALGO SELL'
                 WHEN recommendation_signal LIKE '🔴%%' AND wall_street_view IN ('sell', 'underperform') THEN '⚠️ CONVICTION SELL'
                 ELSE recommendation_signal 
-            END as final_signal            
+            END as final_signal,
+			(SELECT Date FROM Historical_Prices WHERE Securities_Id = recommendations.Securities_Id AND Date <= CURRENT_DATE ORDER BY Date DESC LIMIT 1) as price_today_date
         FROM recommendations
         ORDER BY sharpe_ratio DESC;
     """

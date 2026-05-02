@@ -115,7 +115,7 @@ class DatabaseBackup:
     def get_backup_history(self):
         """Get list of existing backups with metadata"""
         backups = []
-        print(f"Looking for backups in: {self.backup_dir}")     ## Debugging line to check backup directory
+    #    print(f"Looking for backups in: {self.backup_dir}")     ## Debugging line to check backup directory
         if os.path.exists(self.backup_dir):
             for filename in os.listdir(self.backup_dir):
                 if filename.endswith('.dump'):

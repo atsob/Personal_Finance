@@ -2,17 +2,13 @@ import streamlit as st
 import pandas as pd
 from database.crud import save_changes
 from database.crud import update_payee_default_category
-from data.qif_importer import render_qif_importer
-from database.backup import render_backup_restore
-from database.backup import render_backup_restore_simple
-from database.backup import render_backup_restore_quick
 from data.downloaders import download_securities_info_from_yahoo
 
 
 def render_settings(conn):
     """Render the Settings page."""
     st.title("System Settings")
-    t1, t2, t3, t4, t5, t6, t7, t8, t9, t10 = st.tabs(["Currencies", "Institutions", "Categories", "Securities", "Payees", "Accounts", "📁 QIF Importer", "💾 Backup & Restore", "💾 Backup & Restore Simple", "💾 Quick Backup & Restore"])
+    t1, t2, t3, t4, t5, t6 = st.tabs(["Currencies", "Institutions", "Categories", "Securities", "Payees", "Accounts"])
     
     df_curr_list = pd.read_sql("SELECT Currencies_Id, Currencies_ShortName FROM Currencies ORDER BY Currencies_ShortName ASC", conn)
     df_inst_list = pd.read_sql("SELECT Institutions_Id, Institutions_Name FROM Institutions ORDER BY Institutions_Name ASC", conn)
@@ -181,7 +177,7 @@ def render_settings(conn):
             save_changes(df, edited_cat, "Categories", "categories_id")
     
     with t4:
-        df = pd.read_sql("SELECT Securities_Id, Ticker, Securities_Name, Securities_Type, Currencies_Id, Sector, Industry, Analyst_Rating, Analyst_Target_Price, Is_Active, Yahoo_Ticker, embedding FROM Securities ORDER BY Securities_Name", conn)
+        df = pd.read_sql("SELECT Securities_Id, Ticker, Securities_Name, Securities_Type, Currencies_Id, Sector, Industry, Analyst_Rating, Analyst_Target_Price, Is_Active, Yahoo_Ticker, EODHD_Symbol,embedding FROM Securities ORDER BY Securities_Name", conn)
         edited_sec = st.data_editor(
              df, 
              num_rows="dynamic", 
@@ -228,6 +224,10 @@ def render_settings(conn):
                 ),
                 "yahoo_ticker": st.column_config.TextColumn(
                     "Yahoo Ticker",
+                    width="small"
+                ),
+                "eodhd_symbol": st.column_config.TextColumn(
+                    "EODHD Symbol",
                     width="small"
                 ),
                 "embedding": None
@@ -354,15 +354,4 @@ def render_settings(conn):
             save_df = edited_acc.drop(columns=["Balance"])
             save_changes(df.drop(columns=["Balance"]), save_df, "Accounts", "accounts_id")
 
-    with t7:  # QIF Importer tab
-        render_qif_importer()
-
-    with t8:  # Backup & Restore
-        render_backup_restore()
-
-    with t9:  # Backup & Restore Simple
-        render_backup_restore_simple()
-
-    with t10:  # Backup & Restore Quick
-        render_backup_restore_quick()
         

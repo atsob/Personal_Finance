@@ -18,6 +18,7 @@ from ui.investments import render_investments
 from ui.reports import render_reports
 from ui.market_data import render_market_data
 from ui.ai_assistant import render_ai_assistant
+from ui.tools import render_tools
 from ui.settings import render_settings
 
 @st.cache_resource
@@ -104,6 +105,7 @@ def main():
             "⏳ Reports",
             "🌍 Market Data",
             "🧠 AI Assistant",
+            "🛠️ Tools",   
             "🔧 Settings"
         ]
     )
@@ -124,6 +126,8 @@ def main():
             render_market_data(conn)
         elif menu == "🧠 AI Assistant":
             render_ai_assistant(llm, agent_with_history, rag_engine)
+        elif menu == "🛠️ Tools":
+            render_tools(conn)
         elif menu == "🔧 Settings":
             render_settings(conn)
     finally:

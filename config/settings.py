@@ -12,6 +12,7 @@ def get_env_config():
         'ollama_port': os.getenv("OLLAMA_PORT", "11434"),
         'ollama_model': os.getenv("OLLAMA_MODEL", "llama3.2:3b"),
         'persist_dir': os.getenv("PERSIST_DIR", "/app/storage_rag"),
+        'eodhd_api_key': os.getenv("EODHD_API_KEY", "69f3a12eacbd88.96449070"),
     }
 
 ENV_CONFIG = get_env_config()

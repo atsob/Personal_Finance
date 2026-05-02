@@ -6,4 +6,5 @@ from ui.investments import render_investments
 from ui.reports import render_reports
 from ui.market_data import render_market_data
 from ui.ai_assistant import render_ai_assistant
+from ui.tools import render_tools
 from ui.settings import render_settings

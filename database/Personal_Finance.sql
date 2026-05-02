@@ -71,10 +71,13 @@ CREATE TABLE Securities (
     Analyst_Target_Price NUMERIC(20, 8),
     Is_Active BOOLEAN DEFAULT TRUE,
     Yahoo_Ticker VARCHAR(30),
+    EODHD_Symbol VARCHAR(50),
     embedding vector(768)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_securities_id ON Securities(Securities_Id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_securities_name ON Securities(Securities_Name);
+CREATE INDEX IF NOT EXISTS idx_securities_yahoo_ticker ON Securities(Yahoo_Ticker) WHERE Yahoo_Ticker IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_securities_eodhd_symbol ON Securities(EODHD_Symbol) WHERE EODHD_Symbol IS NOT NULL;
 
 CREATE TABLE Accounts (
     Accounts_Id SERIAL PRIMARY KEY,
@@ -328,6 +331,22 @@ CREATE TABLE Historical_FX (
 ALTER TABLE Historical_FX ADD UNIQUE (Currencies_Id_1, Currencies_Id_2, Date);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_fxrate_id ON Historical_FX(Currencies_Id_1, Currencies_Id_2, Date);
 
+CREATE TABLE IF NOT EXISTS Transfer_Issues (
+    Issue_Id SERIAL PRIMARY KEY,
+    Issue_Type VARCHAR(50) NOT NULL,
+    Status VARCHAR(20) NOT NULL DEFAULT 'Open',
+    Transactions_Id_A INTEGER REFERENCES Transactions(Transactions_Id) ON DELETE CASCADE,
+    Transactions_Id_B INTEGER REFERENCES Transactions(Transactions_Id) ON DELETE CASCADE,
+    Date_A DATE, Date_B DATE,
+    Amount_A NUMERIC(28,18), Amount_B NUMERIC(28,18),
+    Accounts_Id_A INTEGER REFERENCES Accounts(Accounts_Id),
+    Accounts_Id_B INTEGER REFERENCES Accounts(Accounts_Id),
+    Description_A TEXT, Description_B TEXT,
+    Notes TEXT,
+    Created_At TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    Resolved_At TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_transfer_issues_status ON Transfer_Issues(Status);
 
 ALTER DATABASE "Finance" REFRESH COLLATION VERSION;
 

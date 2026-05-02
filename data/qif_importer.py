@@ -115,6 +115,103 @@ class QIFImporter:
         
         return parent_id
     
+    def ensure_transfer_issues_table(self):
+        """Create Transfer_Issues table if it doesn't exist"""
+        self.cur.execute("""
+            CREATE TABLE IF NOT EXISTS Transfer_Issues (
+                Issue_Id           SERIAL PRIMARY KEY,
+                Issue_Type         VARCHAR(50) NOT NULL,
+                Status             VARCHAR(20) NOT NULL DEFAULT 'Open',
+                Transactions_Id_A  INTEGER REFERENCES Transactions(Transactions_Id) ON DELETE CASCADE,
+                Transactions_Id_B  INTEGER REFERENCES Transactions(Transactions_Id) ON DELETE CASCADE,
+                Date_A             DATE,
+                Date_B             DATE,
+                Amount_A           NUMERIC(28,18),
+                Amount_B           NUMERIC(28,18),
+                Accounts_Id_A      INTEGER REFERENCES Accounts(Accounts_Id),
+                Accounts_Id_B      INTEGER REFERENCES Accounts(Accounts_Id),
+                Description_A      TEXT,
+                Description_B      TEXT,
+                Notes              TEXT,
+                Created_At         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                Resolved_At        TIMESTAMP
+            )
+        """)
+        self.cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_transfer_issues_status
+            ON Transfer_Issues(Status)
+        """)
+        self.conn.commit()
+
+    def scan_date_mismatched_transfers(self):
+        """
+        Post-import scan for transfers where the two linked sides have different dates.
+        These arise when a Quicken user edits the date on one side of a transfer
+        without updating the other. Each genuine mismatch is recorded in Transfer_Issues.
+
+        Only flags pairs where the date difference is 1–3 days and no existing issue
+        already covers the same pair.
+        """
+        self.cur.execute("""
+            SELECT
+                t1.Transactions_Id, t1.Date, t1.Total_Amount,
+                t1.Accounts_Id, t1.Description,
+                t2.Transactions_Id, t2.Date, t2.Total_Amount,
+                t2.Accounts_Id, t2.Description,
+                t1.Transfers_Id
+            FROM Transactions t1
+            JOIN Transactions t2
+              ON  t2.Transfers_Id      = t1.Transfers_Id
+              AND t2.Accounts_Id       = t1.Accounts_Id_Target
+              AND t2.Accounts_Id_Target = t1.Accounts_Id
+              AND t2.Transactions_Id   > t1.Transactions_Id  -- avoid double-counting
+            WHERE t1.Transfers_Id IS NOT NULL
+              AND t1.Date != t2.Date
+              AND ABS(t1.Date - t2.Date) BETWEEN 1 AND 3
+              -- skip pairs already flagged
+              AND NOT EXISTS (
+                  SELECT 1 FROM Transfer_Issues i
+                  WHERE (i.Transactions_Id_A = t1.Transactions_Id
+                         OR i.Transactions_Id_B = t1.Transactions_Id)
+              )
+        """)
+        rows = self.cur.fetchall()
+        count = 0
+        for row in rows:
+            (tx_id_a, date_a, amt_a, acc_a, desc_a,
+             tx_id_b, date_b, amt_b, acc_b, desc_b, _tid) = row
+            self.flag_transfer_issue(
+                issue_type = 'DATE_MISMATCH',
+                tx_id_a    = tx_id_a,
+                tx_id_b    = tx_id_b,
+                date_a     = date_a,
+                date_b     = date_b,
+                amount_a   = amt_a,
+                amount_b   = amt_b,
+                acc_id_a   = acc_a,
+                acc_id_b   = acc_b,
+                desc_a     = desc_a,
+                desc_b     = desc_b,
+                notes      = f"Date difference: {abs((date_a - date_b).days)} day(s)"
+            )
+            count += 1
+        self.conn.commit()
+        return count
+
+    def flag_transfer_issue(self, issue_type, tx_id_a, tx_id_b,
+                            date_a, date_b, amount_a, amount_b,
+                            acc_id_a, acc_id_b, desc_a, desc_b, notes=None):
+        """Record a transfer issue for manual review"""
+        self.cur.execute("""
+            INSERT INTO Transfer_Issues (
+                Issue_Type, Transactions_Id_A, Transactions_Id_B,
+                Date_A, Date_B, Amount_A, Amount_B,
+                Accounts_Id_A, Accounts_Id_B, Description_A, Description_B, Notes
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (issue_type, tx_id_a, tx_id_b,
+              date_a, date_b, amount_a, amount_b,
+              acc_id_a, acc_id_b, desc_a, desc_b, notes))
+
     def disable_triggers(self):
         """Disable triggers for faster import"""
         st.info("⏸️ Disabling triggers for faster import...")
@@ -140,6 +237,10 @@ class QIFImporter:
         for table in tables_to_clear:
             st.write(f"  - Clearing {table}...")
             self.cur.execute(f"TRUNCATE TABLE {table} RESTART IDENTITY CASCADE;")
+        self.conn.commit()
+        st.write("All specified tables cleared.")
+        st.write("Resetting sequence transfers_id_seq...")
+        self.cur.execute("SELECT setval('Transfers_Id_Seq', GREATEST(1, COALESCE((SELECT MAX(Transfers_Id) FROM Transactions), 1)));")
         self.conn.commit()
         st.success(f"✅ Cleared {len(tables_to_clear)} tables successfully!")
     
@@ -223,6 +324,8 @@ class QIFImporter:
         acc_count = 0
         bank_tx_count = 0
         inv_tx_count = 0
+
+
         
         for acc_name, acc_obj in qif.accounts.items():
             # Get currency
@@ -250,39 +353,164 @@ class QIFImporter:
 
             # Process transactions
             for tx_list in acc_obj.transactions.values():
+                # Per-account occurrence counter: tracks how many times each
+                # (date, amount, to_account) combination has been processed so far.
+                # Used by the duplicate guard to distinguish genuine duplicate
+                # transfers from cross-account mirror detection.
+                _tx_occurrence_count = {}
+
+                # Separate counter for X-type investment cash legs:
+                # tracks (date, cash_acc_id, inv_acc_id) occurrences within this account.
+                _x_type_occurrence_count = {}
+
                 for tx in tx_list:
+                    # Skip sentinel transactions inserted by the malformed-QIF patch
+                    if getattr(tx, 'memo', None) == '__QIF_SKIP__':
+                        continue
+
                     # Bank Transaction
                     if hasattr(tx, 'payee'):
                         # Παράλειψη αν το συνολικό ποσό της συναλλαγής είναι 0 (προαιρετικό, ανάλογα με τη λογική σας)
                         if tx.amount == 0:
                             continue
 
-                        # 1. Ανίχνευση Μεταφοράς
+                        # 1. Transfer detection
+                        #
+                        # Quiffen exposes the L field in two ways depending on content:
+                        #   tx.to_account  — when L is [AccountName]  (already bracket-stripped)
+                        #   tx.category    — when L is a plain category, possibly "Cat|[Account]"
+                        #
+                        # Priority: to_account first, then fall back to category parsing.
                         is_transfer = False
                         target_acc_id = None
-                        raw_cat = str(tx.category) if tx.category else ""
+                        target_acc_name = None
 
-                        if raw_cat.startswith('[') and raw_cat.endswith(']'):
-                            is_transfer = True
-                            target_acc_name = raw_cat[1:-1]
-                            target_acc_id = self.get_or_create_id(
-                                "Accounts", "Accounts_Id", "Accounts_Name", target_acc_name
-                            )
+                        raw_to_account = getattr(tx, 'to_account', None)
+                        if raw_to_account:
+                            # Direct transfer: quiffen already stripped the brackets
+                            target_acc_name = raw_to_account.strip().strip('[]')
+                        else:
+                            # Fallback: parse category for embedded [AccountName]
+                            raw_cat = str(tx.category) if tx.category else ""
+                            # Handle "Category|[AccountName]" pipe format
+                            if '|' in raw_cat:
+                                raw_cat = raw_cat.split('|')[-1].strip()
+                            if raw_cat.startswith('[') and raw_cat.endswith(']'):
+                                target_acc_name = raw_cat[1:-1]
 
-                        # 2. Έλεγχος για Διπλότυπη Μεταφορά (Matching)
+                        if target_acc_name:
+                            resolved_target_id = self.clean_id(self.get_or_create_id(
+                                "Accounts", "Accounts_Id", "Accounts_Name", target_acc_name,
+                                {"Accounts_Type": "Checking", "Currencies_Id": account_currency_id}
+                            ))
+                            # Skip self-transfers (L field points to the current account)
+                            if resolved_target_id != c_acc_id:
+                                is_transfer = True
+                                target_acc_id = resolved_target_id
+                            else:
+                                pass
+                        # 2. Duplicate-transfer guard
+                        #
+                        # For each transfer, one of three situations applies:
+                        #
+                        # A) NEW transfer (first account to process it):
+                        #    No rows exist in DB → INSERT source + mirror
+                        #
+                        # B) MIRROR SIDE (second account to process it):
+                        #    The other account already inserted a source+mirror pair.
+                        #    This tx is the "other side" — identified by finding a row
+                        #    where (target_acc → c_acc) exists with a Transfers_Id.
+                        #    Action: UPDATE both rows with correct cross-currency amounts,
+                        #    then skip. For same-currency this is a no-op on amounts.
+                        #
+                        # C) FULL DUPLICATE (re-import, or own source row exists):
+                        #    (c_acc → target_acc) source row already exists → skip entirely.
+                        #
+                        # Multiple genuine transfers same date+accounts are handled by the
+                        # per-account occurrence counter: each time this account processes
+                        # a (date, target_acc) pair, the counter increments. We only consider
+                        # situation B/C if the DB has at least that many rows already.
                         existing_transfer_id = None
+                        _is_mirror_side = False
                         if is_transfer:
+                            # Per-account occurrence counter for (date, target_acc).
+                            # Counts how many times THIS account has processed this pair.
+                            _tx_key = (tx.date, target_acc_id)
+                            _tx_occurrence_count[_tx_key] = _tx_occurrence_count.get(_tx_key, 0) + 1
+                            _nth = _tx_occurrence_count[_tx_key]
+
+                            # Count own source rows: (c_acc → target_acc)
                             self.cur.execute("""
-                                SELECT Transfers_Id FROM Transactions 
-                                WHERE Accounts_Id = %s AND Accounts_Id_Target = %s 
-                                AND Date = %s AND Total_Amount = %s
-                                LIMIT 1
-                            """, (target_acc_id, c_acc_id, tx.date, -tx.amount))
-                            
-                            res = self.cur.fetchone()
-                            if res:
-                                existing_transfer_id = res[0]
-                                
+                                SELECT COUNT(*) FROM Transactions
+                                WHERE Date = %s AND Accounts_Id = %s
+                                  AND Accounts_Id_Target = %s AND Transfers_Id IS NOT NULL
+                            """, (tx.date, c_acc_id, target_acc_id))
+                            _own_count = (self.cur.fetchone() or (0,))[0]
+
+                            # Count mirror rows: (target_acc → c_acc)
+                            self.cur.execute("""
+                                SELECT COUNT(*) FROM Transactions
+                                WHERE Date = %s AND Accounts_Id = %s
+                                  AND Accounts_Id_Target = %s AND Transfers_Id IS NOT NULL
+                            """, (tx.date, target_acc_id, c_acc_id))
+                            _mir_count = (self.cur.fetchone() or (0,))[0]
+
+                            # Select the Nth transfers_id (1-based) in insertion order.
+                            # Using OFFSET(_nth-1) ensures each occurrence of a repeated
+                            # transfer pair maps to its own distinct row, not always MAX.
+                            def _nth_transfers_id(acc_from, acc_to, n):
+                                self.cur.execute("""
+                                    SELECT Transfers_Id FROM Transactions
+                                    WHERE Date = %s AND Accounts_Id = %s
+                                      AND Accounts_Id_Target = %s AND Transfers_Id IS NOT NULL
+                                    ORDER BY Transfers_Id ASC
+                                    LIMIT 1 OFFSET %s
+                                """, (tx.date, acc_from, acc_to, n - 1))
+                                _r = self.cur.fetchone()
+                                return _r[0] if _r else None
+
+                            if _mir_count >= _nth:
+                                # Situation B: mirror row exists for this occurrence.
+                                # Check mirror direction FIRST — critical for cross-currency
+                                # where own_count also >= _nth due to the inserted mirror row.
+                                _is_mirror_side = True
+                                # Try to match by exact amount first (same-currency):
+                                # the mirror's Total_Amount should equal -tx.amount.
+                                self.cur.execute("""
+                                    SELECT Transfers_Id FROM Transactions
+                                    WHERE Date = %s AND Accounts_Id = %s
+                                      AND Accounts_Id_Target = %s AND Transfers_Id IS NOT NULL
+                                      AND Total_Amount = %s
+                                    ORDER BY Transfers_Id ASC
+                                    LIMIT 1
+                                """, (tx.date, target_acc_id, c_acc_id, -tx.amount))
+                                _r = self.cur.fetchone()
+                                if _r:
+                                    existing_transfer_id = _r[0]
+                                else:
+                                    # Cross-currency: amounts differ, fall back to Nth by order
+                                    existing_transfer_id = _nth_transfers_id(target_acc_id, c_acc_id, _nth)
+                            elif _own_count >= _nth:
+                                # Situation C: own source row exists → full duplicate, skip
+                                # Match by exact amount for same-currency, Nth for cross-currency
+                                self.cur.execute("""
+                                    SELECT Transfers_Id FROM Transactions
+                                    WHERE Date = %s AND Accounts_Id = %s
+                                      AND Accounts_Id_Target = %s AND Transfers_Id IS NOT NULL
+                                      AND Total_Amount = %s
+                                    ORDER BY Transfers_Id ASC
+                                    LIMIT 1
+                                """, (tx.date, c_acc_id, target_acc_id, tx.amount))
+                                _r = self.cur.fetchone()
+                                if _r:
+                                    existing_transfer_id = _r[0]
+                                else:
+                                    existing_transfer_id = _nth_transfers_id(c_acc_id, target_acc_id, _nth)
+
+                        # 2b. Date-mismatch detection is done as a post-import scan
+                        #     after all accounts are processed (see scan_date_mismatched_transfers).
+                        _pending_date_mismatch = None
+
                         # 3. Payee & Cleared status
                         p_id = self.get_or_create_id("Payees", "payees_id", "payees_name", tx.payee) if tx.payee else None
                         c_payee_id = self.clean_id(p_id)
@@ -291,11 +519,59 @@ class QIFImporter:
                         # 4. Καθορισμός Transfers_Id
                         current_transfer_id = existing_transfer_id
                         if is_transfer and not current_transfer_id:
-                            # Χρήση sequence για παραγωγή νέου ID μεταφοράς
-                            self.cur.execute("SELECT nextval('transactions_transactions_id_seq')") 
+                            self.cur.execute("SELECT nextval('transfers_id_seq')")
                             current_transfer_id = self.cur.fetchone()[0]
 
-                        # 5. Εισαγωγή στην Transactions
+                        # 5. Insert or update
+                        # If this is the mirror side of a cross-account transfer: update the
+                        # existing source row's Total_Amount_Target with the correct amount
+                        # (critical for cross-currency transfers), then skip INSERT.
+                        if is_transfer and _is_mirror_side:
+                            # This is the second/mirror side of the transfer.
+                            # Update both rows with the correct cross-currency amounts:
+                            #
+                            # Source row (target_acc → c_acc, e.g. ABN -66.48 → RON):
+                            #   Total_Amount_Target should be tx.amount (e.g. +300.00 RON)
+                            #
+                            # Mirror row (c_acc → target_acc, e.g. RON +66.48 placeholder):
+                            #   Total_Amount should be tx.amount (e.g. +300.00 RON)
+                            #   Total_Amount_Target should be the source amount (e.g. -66.48 EUR)
+                            #   (We get the source amount from the source row itself)
+
+                            # Get the source row's actual amount for updating the mirror
+                            self.cur.execute("""
+                                SELECT Total_Amount FROM Transactions
+                                WHERE Transfers_Id = %s
+                                  AND Accounts_Id = %s
+                                  AND Accounts_Id_Target = %s
+                            """, (existing_transfer_id, target_acc_id, c_acc_id))
+                            _src_amount_row = self.cur.fetchone()
+                            _src_amount = _src_amount_row[0] if _src_amount_row else None
+
+                            # Update source row: set correct Total_Amount_Target
+                            self.cur.execute("""
+                                UPDATE Transactions
+                                SET Total_Amount_Target = %s
+                                WHERE Transfers_Id = %s
+                                  AND Accounts_Id = %s
+                                  AND Accounts_Id_Target = %s
+                            """, (tx.amount, existing_transfer_id, target_acc_id, c_acc_id))
+
+                            # Update mirror row: set correct Total_Amount and Total_Amount_Target
+                            self.cur.execute("""
+                                UPDATE Transactions
+                                SET Total_Amount = %s,
+                                    Total_Amount_Target = %s
+                                WHERE Transfers_Id = %s
+                                  AND Accounts_Id = %s
+                                  AND Accounts_Id_Target = %s
+                            """, (tx.amount, _src_amount, existing_transfer_id, c_acc_id, target_acc_id))
+
+                            continue
+
+                        if is_transfer and existing_transfer_id:
+                            continue
+
                         self.cur.execute("""
                             INSERT INTO Transactions (
                                 Accounts_Id, Date, Payees_Id, Description, 
@@ -314,7 +590,53 @@ class QIFImporter:
                         bt_id = self.cur.fetchone()[0]
                         bank_tx_count += 1
 
-                        # 6. Εισαγωγή Splits με έλεγχο μηδενικού ποσού
+                        # 6. For transfers: insert the mirror leg in the target account.
+                        #    Only for NEW transfers (no existing_transfer_id) to avoid duplicates.
+                        #    For brokerage/investment targets: the Investments table CashIn/CashOut
+                        #    row already represents the brokerage side, so we skip the Transactions
+                        #    mirror. The source row (bank/card side) keeps its target fields so the
+                        #    register still shows where the money went.
+                        # Only 'Brokerage' accounts use the Investments table as their
+                        # cash ledger. Pension/Other Investment/Margin accounts still need
+                        # a Transactions mirror row — they don't have brokerage-style CashIn rows.
+                        BROKERAGE_ONLY = ('Brokerage',)
+                        if is_transfer and not existing_transfer_id and target_acc_id:
+                            c_target_acc_id = self.clean_id(target_acc_id)
+                            self.cur.execute(
+                                "SELECT Accounts_Type FROM Accounts WHERE Accounts_Id = %s",
+                                (c_target_acc_id,)
+                            )
+                            _tgt_type_row = self.cur.fetchone()
+                            _target_is_brokerage = (
+                                _tgt_type_row and _tgt_type_row[0] in BROKERAGE_ONLY
+                            )
+                            if not _target_is_brokerage:
+                                # Non-brokerage: insert the mirror row as normal
+                                self.cur.execute("""
+                                    INSERT INTO Transactions (
+                                        Accounts_Id, Date, Payees_Id, Description,
+                                        Total_Amount, Cleared, Accounts_Id_Target,
+                                        Total_Amount_Target, Transfers_Id
+                                    )
+                                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                """, (
+                                    c_target_acc_id, tx.date, c_payee_id,
+                                    tx.memo or tx.payee,
+                                    -tx.amount,
+                                    is_cleared,
+                                    c_acc_id,
+                                    tx.amount,
+                                    current_transfer_id
+                                ))
+                                bank_tx_count += 1
+
+                            # Brokerage target: no mirror INSERT — source row already has
+                            # Accounts_Id_Target and Transfers_Id set (from step 5),
+                            # which is sufficient for the bank register to show the destination.
+
+                            bank_tx_count += 1
+
+                        # 7. Εισαγωγή Splits με έλεγχο μηδενικού ποσού
                         if hasattr(tx, 'splits') and tx.splits:
                             for split in tx.splits:
                                 # ΕΔΩ: Έλεγχος για split amount != 0
@@ -358,26 +680,21 @@ class QIFImporter:
                     elif hasattr(tx, 'security'):
                         ticker_val = (tx.security or "UNKNOWN")[:255]
                         
-                        # Προσπάθεια εύρεσης του security
+                        # Attempt to find security by name
                         s_id = self.get_id("Securities", "securities_id", "securities_name", ticker_val)
                         
-                    #    if not s_id and ticker_val is not None and ticker_val != "UNKNOWN":
                         if not s_id and ticker_val != "UNKNOWN":
-                            # 2. Δημιουργία security με το νόμισμα του λογαριασμού
-                            # Προσαρμόζουμε το dictionary των extra πεδίων για να περιλαμβάνει το Currencies_Id
+                            # Create security using the account's currency
                             extra_fields = {
                                 "ticker": ticker_val[:10], 
                                 "securities_type": 'Stock',
-                                "currencies_id": account_currency_id,  # Εδώ μπαίνει το νόμισμα του λογαριασμού
+                                "currencies_id": account_currency_id,
                                 "is_active": True
                             }
-                            
-                            # Χρήση της get_or_create_id (βεβαιωθείτε ότι η μέθοδος δέχεται extra_fields για το INSERT)
                             s_id = self.get_or_create_id(
                                 "Securities", "securities_id", "securities_name", ticker_val,
                                 extra_fields
                             )
-                   
                         
                         c_sec_id = self.clean_id(s_id)
                         
@@ -412,6 +729,196 @@ class QIFImporter:
                               tx.memo if hasattr(tx, 'memo') else None))
                         
                         inv_tx_count += 1
+
+                        # ----------------------------------------------------------------
+                        # Handle X-type actions: BuyX, SellX, DivX, IntIncX, RtrnCapX,
+                        # MiscExpX, WithdrwX, ExercisX — cash goes to/from another account
+                        # (L field = transfer_account, $ field = to_amount)
+                        # ----------------------------------------------------------------
+                        is_x_action = raw_action.endswith('X') or raw_action in ('XIn', 'XOut')
+                        
+                        if is_x_action:
+                            # ------------------------------------------------------------------
+                            # Resolve the linked cash account from the L field.
+                            #
+                            # The L field can arrive in several forms:
+                            #   [Account Name]                  -> pure transfer
+                            #   Category|[Account Name]         -> category piped with transfer
+                            #   Category:Sub|[Account Name]     -> hierarchical category + transfer
+                            #
+                            # quiffen may expose this as transfer_account / to_account, or
+                            # leave the raw string inside tx.category.
+                            # ------------------------------------------------------------------
+                            raw_transfer = getattr(tx, 'transfer_account', None) or getattr(tx, 'to_account', None)
+
+                            if raw_transfer is None and hasattr(tx, 'category'):
+                                raw_cat_str = str(tx.category) if tx.category else ""
+
+                                # Handle pipe-separated "Category|[Account]" format
+                                if '|' in raw_cat_str:
+                                    raw_cat_str = raw_cat_str.split('|')[-1].strip()
+
+                                if raw_cat_str.startswith('[') and raw_cat_str.endswith(']'):
+                                    raw_transfer = raw_cat_str[1:-1]
+
+                            # Normalise: strip brackets and pipe prefix regardless of source.
+                            # quiffen sometimes leaves brackets on to_account for investment entries.
+                            if raw_transfer:
+                                raw_transfer = str(raw_transfer).strip()
+                                if '|' in raw_transfer:
+                                    raw_transfer = raw_transfer.split('|')[-1].strip()
+                                raw_transfer = raw_transfer.strip('[]').strip()
+
+                            # Cash amount: the $ field (to_amount); fall back to transaction amount
+                            cash_amt = getattr(tx, 'to_amount', None)
+                            if cash_amt is None:
+                                cash_amt = amt
+
+                            if raw_transfer and cash_amt:
+                                # Get or create the linked cash account.
+                                # Must supply Accounts_Type (NOT NULL) and a default currency.
+                                cash_acc_id = self.clean_id(
+                                    self.get_or_create_id(
+                                        "Accounts", "Accounts_Id", "Accounts_Name", raw_transfer,
+                                        {"Accounts_Type": "Checking", "Currencies_Id": account_currency_id}
+                                    )
+                                )
+
+                                # Skip if the L field resolved to the SAME account that is
+                                # currently being processed — that would create a self-referential
+                                # duplicate row (the "within same account" issue).
+                                if cash_acc_id == c_acc_id:
+                                    pass  # self-transfer: investment account manages its own cash
+                                else:
+                                    # Determine cash flow direction from the linked account's perspective:
+                                    # BuyX / MiscExpX / WithdrwX  → cash leaves the linked account (debit, negative)
+                                    # SellX / DivX / IntIncX / RtrnCapX / ExercisX → cash arrives (credit, positive)
+                                    # cash_tx_amount: the amount as it appears in the CASH account.
+                                    # Cash OUT actions (BuyX, XIn, WithdrwX, MiscExpX):
+                                    #   cash account loses money → negative
+                                    # Cash IN actions (SellX, DivX, IntIncX, RtrnCapX, XOut):
+                                    #   cash account gains money → positive
+                                    CASH_OUT_ACTIONS = {
+                                        'BuyX', 'MiscExpX', 'WithdrwX', 'XIn'
+                                    }
+                                    CASH_IN_ACTIONS = {
+                                        'SellX', 'DivX', 'IntIncX', 'RtrnCapX', 'ExercisX', 'XOut'
+                                    }
+                                    if raw_action in CASH_OUT_ACTIONS:
+                                        cash_tx_amount = -abs(cash_amt)
+                                    else:
+                                        cash_tx_amount = abs(cash_amt)
+
+                                    # Duplicate guard: the bank transfer block may have already
+                                    # inserted a mirror row for this cash leg when both the bank
+                                    # account and investment account appear in the QIF.
+                                    # Match on date + amount + both account IDs (both directions)
+                                    # to avoid false positives from unrelated same-date/amount rows.
+                                    # Check whether the bank transfer block already created
+                                    # rows for this cash leg. The bank block always records the
+                                    # cash account as source with the natural sign (negative for
+                                    # outflows, positive for inflows). We check both +/- abs(amt)
+                                    # to cover all action types (BuyX, SellX, XIn, DivX, etc.)
+                                    # regardless of the sign convention used by cash_tx_amount.
+                                    # Match on date + account pair only (no amount).
+                                    # Cross-currency transfers have different amounts on each
+                                    # side (e.g. -100 EUR bank / +103.12 USD brokerage), so
+                                    # amount-based matching would miss the existing row.
+                                    # Use occurrence counter to allow multiple genuine
+                                    # transfers between the same accounts on the same date.
+                                    _x_key = (tx.date, min(cash_acc_id, c_acc_id),
+                                              max(cash_acc_id, c_acc_id))
+                                    _x_type_occurrence_count[_x_key] = (
+                                        _x_type_occurrence_count.get(_x_key, 0) + 1
+                                    )
+                                    _x_nth = _x_type_occurrence_count[_x_key]
+
+                                    self.cur.execute("""
+                                        SELECT Transfers_Id FROM Transactions
+                                        WHERE Date = %s
+                                          AND Accounts_Id = %s
+                                          AND Accounts_Id_Target = %s
+                                          AND Transfers_Id IS NOT NULL
+                                        UNION
+                                        SELECT Transfers_Id FROM Transactions
+                                        WHERE Date = %s
+                                          AND Accounts_Id = %s
+                                          AND Accounts_Id_Target = %s
+                                          AND Transfers_Id IS NOT NULL
+                                        ORDER BY 1 ASC
+                                        LIMIT 1 OFFSET %s
+                                    """, (
+                                        tx.date, cash_acc_id, c_acc_id,
+                                        tx.date, c_acc_id,   cash_acc_id,
+                                        _x_nth - 1
+                                    ))
+                                    existing_x_transfer = self.cur.fetchone()
+
+                                    if not existing_x_transfer:
+                                        # Check if the investment account (c_acc_id) is a
+                                        # Brokerage/investment-type account. For those, the
+                                        # Investments table CashIn/CashOut row already captures
+                                        # the cash movement — inserting a Transactions mirror
+                                        # into the brokerage account would be redundant.
+                                        # We only insert into the CASH account side (e.g. Revolut).
+                                        BROKERAGE_ONLY = ('Brokerage',)
+                                        self.cur.execute(
+                                            "SELECT Accounts_Type FROM Accounts WHERE Accounts_Id = %s",
+                                            (c_acc_id,)
+                                        )
+                                        _acc_type_row = self.cur.fetchone()
+                                        _inv_acc_is_brokerage = (
+                                            _acc_type_row and
+                                            _acc_type_row[0] in BROKERAGE_ONLY
+                                        )
+
+                                        self.cur.execute("SELECT nextval('transfers_id_seq')")
+                                        transfer_link_id = self.cur.fetchone()[0]
+
+                                        # Always insert the cash-side (bank/card) transaction
+                                        self.cur.execute("""
+                                            INSERT INTO Transactions (
+                                                Accounts_Id, Date, Payees_Id, Description,
+                                                Total_Amount, Cleared, Accounts_Id_Target,
+                                                Total_Amount_Target, Transfers_Id
+                                            )
+                                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                        """, (
+                                            cash_acc_id,
+                                            tx.date,
+                                            None,
+                                            tx.memo if hasattr(tx, 'memo') else raw_action,
+                                            cash_tx_amount,
+                                            True,
+                                            None if _inv_acc_is_brokerage else c_acc_id,
+                                            None if _inv_acc_is_brokerage else -cash_tx_amount,
+                                            None if _inv_acc_is_brokerage else transfer_link_id
+                                        ))
+                                        bank_tx_count += 1
+
+                                        # Only insert the investment-account mirror in Transactions
+                                        # if it is NOT a brokerage account (the Investments table
+                                        # CashIn/CashOut row already serves as the mirror for those).
+                                        if not _inv_acc_is_brokerage:
+                                            self.cur.execute("""
+                                                INSERT INTO Transactions (
+                                                    Accounts_Id, Date, Payees_Id, Description,
+                                                    Total_Amount, Cleared, Accounts_Id_Target,
+                                                    Total_Amount_Target, Transfers_Id
+                                                )
+                                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                            """, (
+                                                c_acc_id,
+                                                tx.date,
+                                                None,
+                                                tx.memo if hasattr(tx, 'memo') else raw_action,
+                                                -cash_tx_amount,
+                                                True,
+                                                cash_acc_id,
+                                                cash_tx_amount,
+                                                transfer_link_id
+                                            ))
+                                            bank_tx_count += 1
             
             self.conn.commit()
         
@@ -466,6 +973,9 @@ class QIFImporter:
         try:
             self.connect()
             
+            # Ensure Transfer_Issues table exists
+            self.ensure_transfer_issues_table()
+
             # Disable triggers
             self.disable_triggers()
             
@@ -475,7 +985,158 @@ class QIFImporter:
             
             # Parse QIF file
             st.info("📄 Parsing QIF file...")
-            qif = quiffen.Qif.parse(qif_file_path, day_first=False, encoding='latin-1')
+
+            # Pre-clean the QIF file before parsing.
+            # Handles two classes of malformed transactions that crash quiffen:
+            #   1. Amount fields (T/U/O/$) with no digits -> replaced with 0.00
+            #   2. Transaction blocks with no D (date) line -> dropped entirely
+            import re as _re, tempfile as _tempfile, os as _os
+            _amount_line_re = _re.compile(r'^([TUO$])(.*)$')
+            _valid_decimal_re = _re.compile(r'[0-9]')
+
+            with open(qif_file_path, 'r', encoding='latin-1') as _f:
+                _raw_lines = _f.readlines()
+
+            # Split into transaction blocks (separated by ^), clean each one,
+            # then drop blocks that have no date line.
+            _cleaned_lines = []
+            _current_block = []
+            for _line in _raw_lines:
+                _stripped = _line.rstrip('\n\r')
+                if _stripped == '^':
+                    # End of block — validate and flush
+                    _has_date = any(l.startswith('D') for l in _current_block)
+                    _is_header = any(l.startswith('!') for l in _current_block)
+                    if _is_header or _has_date:
+                        # Fix any bad amount lines before keeping
+                        _fixed_block = []
+                        for _bl in _current_block:
+                            _m = _amount_line_re.match(_bl.rstrip('\n\r'))
+                            if _m:
+                                _prefix, _val = _m.group(1), _m.group(2)
+                                if not _valid_decimal_re.search(_val):
+                                    _bl = _prefix + '0.00\n'
+                            _fixed_block.append(_bl)
+                        _cleaned_lines.extend(_fixed_block)
+                        _cleaned_lines.append('^\n')
+                    # else: silently drop the dateless block
+                    _current_block = []
+                else:
+                    _current_block.append(_line)
+            # Flush any trailing lines after last ^
+            if _current_block:
+                _cleaned_lines.extend(_current_block)
+
+            # Remove stray !Type: lines that appear immediately before !Account.
+            # This QIF format emits !Type:<x> between every pair of !Account blocks
+            # as a separator, but quiffen misinterprets them as setting the type
+            # context for the PREVIOUS account, causing transactions to be attributed
+            # to the wrong account. Strip them out entirely.
+            _stripped_lines = []
+            _n = len(_cleaned_lines)
+            for _i, _cl in enumerate(_cleaned_lines):
+                if _cl.rstrip('\n\r').startswith('!Type:'):
+                    # Look ahead (skip blank lines) for next non-blank line
+                    _j = _i + 1
+                    while _j < _n and _cleaned_lines[_j].strip() == '':
+                        _j += 1
+                    if _j < _n and _cleaned_lines[_j].strip() == '!Account':
+                        continue  # drop this stray !Type: line
+                _stripped_lines.append(_cl)
+            _cleaned_lines = _stripped_lines
+
+            with _tempfile.NamedTemporaryFile(mode='w', encoding='latin-1',
+                                              suffix='.qif', delete=False) as _tmp:
+                _tmp.writelines(_cleaned_lines)
+                _clean_path = _tmp.name
+
+            try:
+                # Monkey-patch quiffen's Transaction.from_list to skip dateless/invalid
+                # transactions instead of raising ValidationError. Handles QIF files where
+                # a missing ^ separator causes quiffen to see a no-date sub-block.
+                import quiffen.core.transaction as _qtx
+                from pydantic import ValidationError as _ValErr
+
+                _orig_from_list = _qtx.Transaction.from_list.__func__
+
+                import datetime as _dt
+
+                @classmethod
+                def _safe_from_list(cls, lst, day_first=False, line_number=0):
+                    try:
+                        return _orig_from_list(cls, lst, day_first=day_first, line_number=line_number)
+                    except Exception as _e:
+                        # Catch any transaction-level parse failure and return a sentinel
+                        # that the import loop will recognise and skip:
+                        #   - Missing date field      (ValidationError: "field required")
+                        #   - Unparseable date value  (ParserError: "unknown string format")
+                        #   - Bad amount value        (InvalidOperation / ConversionSyntax)
+                        _sentinel = cls(
+                            date=_dt.datetime(1, 1, 1),
+                            amount=0,
+                            memo='__QIF_SKIP__'
+                        )
+                        return _sentinel, {}
+
+                _qtx.Transaction.from_list = _safe_from_list
+
+                # Patch ALL quiffen from_list methods that can crash on malformed QIF data.
+                # Each returns a minimal sentinel/placeholder so parse_string can continue.
+                import quiffen.core.category as _qcat
+                import quiffen.core.investment as _qinv
+                import quiffen.core.class_type as _qcls
+                import quiffen.core.security as _qsec
+
+                _orig_cat_from_list = _qcat.Category.from_list.__func__
+                _orig_inv_from_list = _qinv.Investment.from_list.__func__
+                _orig_cls_from_list = _qcls.Class.from_list.__func__
+                _orig_sec_from_list = _qsec.Security.from_list.__func__
+
+                @classmethod
+                def _safe_cat_from_list(cls, lst):
+                    try:
+                        return _orig_cat_from_list(cls, lst)
+                    except Exception:
+                        return cls(name='__INVALID_CATEGORY__')
+
+                @classmethod
+                def _safe_inv_from_list(cls, lst, day_first=False, line_number=0):
+                    try:
+                        return _orig_inv_from_list(cls, lst, day_first=day_first, line_number=line_number)
+                    except Exception:
+                        return cls(date=_dt.datetime(1, 1, 1), memo='__QIF_SKIP__')
+
+                @classmethod
+                def _safe_cls_from_list(cls, lst):
+                    try:
+                        return _orig_cls_from_list(cls, lst)
+                    except Exception:
+                        return cls(name='__INVALID_CLASS__')
+
+                @classmethod
+                def _safe_sec_from_list(cls, lst, line_number=0):
+                    try:
+                        return _orig_sec_from_list(cls, lst, line_number=line_number)
+                    except Exception:
+                        return cls(name='__INVALID_SECURITY__')
+
+                _qcat.Category.from_list = _safe_cat_from_list
+                _qinv.Investment.from_list = _safe_inv_from_list
+                _qcls.Class.from_list = _safe_cls_from_list
+                _qsec.Security.from_list = _safe_sec_from_list
+
+                qif = quiffen.Qif.parse(_clean_path, day_first=False, encoding='latin-1')
+            finally:
+                _os.unlink(_clean_path)
+                # Restore all patched methods
+                try:
+                    _qtx.Transaction.from_list = classmethod(_orig_from_list)
+                    _qcat.Category.from_list = classmethod(_orig_cat_from_list)
+                    _qinv.Investment.from_list = classmethod(_orig_inv_from_list)
+                    _qcls.Class.from_list = classmethod(_orig_cls_from_list)
+                    _qsec.Security.from_list = classmethod(_orig_sec_from_list)
+                except Exception:
+                    pass
             st.success("✅ QIF file parsed successfully!")
             
             # Track what was imported
@@ -491,6 +1152,9 @@ class QIFImporter:
             
             if import_options.get('import_accounts', True):
                 has_bank_tx, has_inv_tx = self.import_accounts_and_transactions(qif)
+                issue_count = self.scan_date_mismatched_transfers()
+                if issue_count:
+                    st.warning(f"⚠️ {issue_count} transfer(s) flagged with date mismatches — review in Transfer Issues.")
             
             if import_options.get('import_prices', True):
                 self.import_prices_from_qif(qif_file_path)
