@@ -1,69 +1,58 @@
 import streamlit as st
 import pandas as pd
+from database.connection import get_db
 from database.crud import save_changes
 from database.crud import update_payee_default_category
 from data.downloaders import download_securities_info_from_yahoo
 
 
-def render_settings(conn):
+def render_settings():
     """Render the Settings page."""
     st.title("System Settings")
     t1, t2, t3, t4, t5, t6 = st.tabs(["Currencies", "Institutions", "Categories", "Securities", "Payees", "Accounts"])
-    
-    df_curr_list = pd.read_sql("SELECT Currencies_Id, Currencies_ShortName FROM Currencies ORDER BY Currencies_ShortName ASC", conn)
-    df_inst_list = pd.read_sql("SELECT Institutions_Id, Institutions_Name FROM Institutions ORDER BY Institutions_Name ASC", conn)
-    df_sec_list = pd.read_sql("SELECT Securities_Id, Securities_Name FROM Securities ORDER BY Securities_Name ASC", conn)
 
-    # Category hierarchy
-    query_cat_hierarchy = """
-    WITH RECURSIVE CategoryHierarchy AS (
-        SELECT Categories_Id, Categories_Name::TEXT as Full_Path
-        FROM Categories 
-        WHERE Categories_Id_Parent IS NULL
-        UNION ALL
-        SELECT c.Categories_Id, ch.Full_Path || ' : ' || c.Categories_Name
-        FROM Categories c
-        JOIN CategoryHierarchy ch ON c.Categories_Id_Parent = ch.Categories_Id
-    )
-    SELECT Categories_Id, Full_Path FROM CategoryHierarchy ORDER BY Full_Path;
-    """
-    df_cat_list = pd.read_sql(query_cat_hierarchy, conn)
+    with get_db() as conn:
+        df_curr_list = pd.read_sql("SELECT Currencies_Id, Currencies_ShortName FROM Currencies ORDER BY Currencies_ShortName ASC", conn)
+        df_inst_list = pd.read_sql("SELECT Institutions_Id, Institutions_Name FROM Institutions ORDER BY Institutions_Name ASC", conn)
+        df_sec_list = pd.read_sql("SELECT Securities_Id, Securities_Name FROM Securities ORDER BY Securities_Name ASC", conn)
 
-    df_moodys_list = pd.read_sql("SELECT Moodys FROM Credit_Ratings_LT ORDER BY Credit_Ratings_LT_Id ASC ", conn)
-    df_s_p_list = pd.read_sql("SELECT S_P FROM Credit_Ratings_LT ORDER BY Credit_Ratings_LT_Id ASC ", conn)
-    df_fitch_list = pd.read_sql("SELECT Fitch FROM Credit_Ratings_LT ORDER BY Credit_Ratings_LT_Id ASC ", conn)
+        # Category hierarchy
+        query_cat_hierarchy = """
+        WITH RECURSIVE CategoryHierarchy AS (
+            SELECT Categories_Id, Categories_Name::TEXT as Full_Path
+            FROM Categories 
+            WHERE Categories_Id_Parent IS NULL
+            UNION ALL
+            SELECT c.Categories_Id, ch.Full_Path || ' : ' || c.Categories_Name
+            FROM Categories c
+            JOIN CategoryHierarchy ch ON c.Categories_Id_Parent = ch.Categories_Id
+        )
+        SELECT Categories_Id, Full_Path FROM CategoryHierarchy ORDER BY Full_Path;
+        """
+        df_cat_list = pd.read_sql(query_cat_hierarchy, conn)
+
+        df_moodys_list = pd.read_sql("SELECT Moodys FROM Credit_Ratings_LT ORDER BY Credit_Ratings_LT_Id ASC ", conn)
+        df_s_p_list = pd.read_sql("SELECT S_P FROM Credit_Ratings_LT ORDER BY Credit_Ratings_LT_Id ASC ", conn)
+        df_fitch_list = pd.read_sql("SELECT Fitch FROM Credit_Ratings_LT ORDER BY Credit_Ratings_LT_Id ASC ", conn)
     
     
     curr_options = df_curr_list.set_index('currencies_id')['currencies_shortname'].to_dict()
     inst_options = df_inst_list.set_index('institutions_id')['institutions_name'].to_dict()
     sec_options = df_sec_list.set_index('securities_id')['securities_name'].to_dict()
     cat_options = df_cat_list.set_index('categories_id')['full_path'].to_dict()
-
-    # Μετατροπή των στηλών σε πεζά για να συμβαδίζουν με τον υπόλοιπο κώδικα
-#    df_moodys_list.columns = df_moodys_list.columns.str.lower()
-#    df_s_p_list.columns = df_s_p_list.columns.str.lower()
-#    df_fitch_list.columns = df_fitch_list.columns.str.lower()
-
-#    moodys_options = df_moodys_list.set_index('moodys')['moodys'].to_dict()
-#    s_p_options = df_s_p_list.set_index('s_p')['s_p'].to_dict()
-#    fitch_options = df_fitch_list.set_index('fitch')['fitch'].to_dict()
-    
+   
     moodys_options = dict(zip(df_moodys_list['moodys'], df_moodys_list['moodys']))
     s_p_options = dict(zip(df_s_p_list['s_p'], df_s_p_list['s_p']))
     fitch_options = dict(zip(df_fitch_list['fitch'], df_fitch_list['fitch']))
 
     
     with t1:
-        df = pd.read_sql("SELECT * FROM Currencies ORDER BY Currencies_ShortName ASC", conn)
+        with get_db() as conn:
+            df = pd.read_sql("SELECT * FROM Currencies ORDER BY Currencies_ShortName ASC", conn)
         edited_curr = st.data_editor(df, 
             num_rows="dynamic", 
             key="set_curr",
             column_config={
-            #    "currencies_id": st.column_config.NumberColumn(
-            #        "Currency ID", 
-            #        width="small",
-            #        disabled=True
-            #    ),
                 "currencies_id": None,
                 "currencies_shortname": st.column_config.TextColumn(
                     "Currency ISO Code",
@@ -77,10 +66,11 @@ def render_settings(conn):
             }
         )
         if not edited_curr.equals(df):
-                save_changes(df, edited_curr, "Currencies", "currencies_id")
+            save_changes(df, edited_curr, "Currencies", "currencies_id")
     
     with t2:
-        df = pd.read_sql("SELECT Institutions_Id, Institutions_Name, Institutions_Type, BIC_Code, Moodys, S_P, Fitch, Contact, Phone, Email, Website, Notes, embedding FROM Institutions ORDER BY Institutions_Name ASC", conn)
+        with get_db() as conn:
+            df = pd.read_sql("SELECT Institutions_Id, Institutions_Name, Institutions_Type, BIC_Code, Moodys, S_P, Fitch, Contact, Phone, Email, Website, Notes, embedding FROM Institutions ORDER BY Institutions_Name ASC", conn)
         edited_inst = st.data_editor(
             df, 
             num_rows="dynamic", 
@@ -135,7 +125,7 @@ def render_settings(conn):
             }
         )
         if not edited_inst.equals(df):
-                save_changes(df, edited_inst, "Institutions", "institutions_id")
+            save_changes(df, edited_inst, "Institutions", "institutions_id")
     
     with t3:
 
@@ -144,6 +134,7 @@ def render_settings(conn):
             SELECT Categories_Id, Categories_Name::TEXT as Full_Path
             FROM Categories 
             WHERE Categories_Id_Parent IS NULL
+            AND Categories_Name NOT IN (SELECT Accounts_Name FROM Accounts) -- Exclude categories that have the same name as accounts to avoid confusion, since they won't be editable here but in the Accounts tab instead
             UNION ALL
             SELECT c.Categories_Id, ch.Full_Path || ' : ' || c.Categories_Name
             FROM Categories c
@@ -151,10 +142,32 @@ def render_settings(conn):
         )
         SELECT Categories_Id, Full_Path FROM CategoryHierarchy ORDER BY Full_Path;
         """
-        df_cat_list = pd.read_sql(query_cat_hierarchy, conn)
-        cat_options = df_cat_list.set_index('categories_id')['full_path'].to_dict()
+        with get_db() as conn:
+            df_cat_list = pd.read_sql(query_cat_hierarchy, conn)
+            cat_options = df_cat_list.set_index('categories_id')['full_path'].to_dict()
+            df = pd.read_sql("SELECT c.*, COALESCE((SELECT COUNT(*) FROM Splits WHERE Categories_Id = c.Categories_Id), 0) as transactions_count FROM Categories c WHERE Categories_Name NOT IN (SELECT Accounts_Name FROM Accounts) ORDER BY c.Categories_Id", conn)
 
-        df = pd.read_sql("SELECT * FROM Categories ORDER BY Categories_Id", conn)
+        _cat_sort_labels = {
+            "categories_id_parent":    "Parent Category",
+            "categories_name":    "Category Name",
+            "categories_type":    "Type",
+            "transactions_count": "Transactions Count",
+        }
+        _c1, _c2 = st.columns([2, 1])
+        with _c1:
+            _cat_sort_col = st.selectbox(
+                "Sort by", options=list(_cat_sort_labels.keys()),
+                format_func=lambda x: _cat_sort_labels[x],
+                index=0, key="cat_sort_col"
+            )
+        with _c2:
+            _cat_sort_asc = st.radio(
+                "Direction", options=["Ascending", "Descending"],
+                horizontal=True, key="cat_sort_dir"
+            ) == "Ascending"
+
+        df = df.sort_values(_cat_sort_col, ascending=_cat_sort_asc).reset_index(drop=True)
+
         edited_cat = st.data_editor(
             df, 
             num_rows="dynamic", 
@@ -170,14 +183,201 @@ def render_settings(conn):
                     "Parent Category", options=list(cat_options.keys()), 
                     format_func=lambda x: cat_options.get(x, "Unknown"), width="large"
                 ),
+                "transactions_count": st.column_config.NumberColumn(
+                    "Transactions Count",
+                    width="small",
+                    disabled=True
+                ),
                 "embedding": None
             }
         )
-        if not edited_cat.equals(df):
-            save_changes(df, edited_cat, "Categories", "categories_id")
+        _cat_computed = ["transactions_count"]
+        df_cat_save     = df.drop(columns=[c for c in _cat_computed if c in df.columns])
+        edited_cat_save = edited_cat.drop(columns=[c for c in _cat_computed if c in edited_cat.columns])
+        if not edited_cat_save.equals(df_cat_save):
+            save_changes(df_cat_save, edited_cat_save, "Categories", "categories_id")
+
+        st.divider()
+        st.subheader("🔀 Merge Category Splits")
+        st.caption(
+            "Reassign all splits from one category to another of the same type. "
+            "Only categories with the same type are shown as valid targets."
+        )
+
+        # Reuse the hierarchy CTE already loaded above for full paths in merge selectboxes
+        _cat_full_path = cat_options  # {id: "Parent : Child"} from the CTE loaded at tab top
+
+        with get_db() as conn:
+            df_cats_with_splits = pd.read_sql("""
+                WITH RECURSIVE CategoryHierarchy AS (
+                    SELECT Categories_Id, Categories_Name::TEXT AS Full_Path
+                    FROM Categories WHERE Categories_Id_Parent IS NULL
+                    UNION ALL
+                    SELECT c.Categories_Id, ch.Full_Path || ' : ' || c.Categories_Name
+                    FROM Categories c
+                    JOIN CategoryHierarchy ch ON c.Categories_Id_Parent = ch.Categories_Id
+                )
+                SELECT c.Categories_Id, c.Categories_Type,
+                       ch.Full_Path, COUNT(s.Splits_Id) AS splits_count
+                FROM Categories c
+                JOIN CategoryHierarchy ch ON ch.Categories_Id = c.Categories_Id
+                JOIN Splits s ON s.Categories_Id = c.Categories_Id
+                GROUP BY c.Categories_Id, c.Categories_Type, ch.Full_Path
+                ORDER BY c.Categories_Type, ch.Full_Path
+            """, conn)
+            df_all_cats = pd.read_sql("""
+                WITH RECURSIVE CategoryHierarchy AS (
+                    SELECT Categories_Id, Categories_Name::TEXT AS Full_Path
+                    FROM Categories WHERE Categories_Id_Parent IS NULL
+                    UNION ALL
+                    SELECT c.Categories_Id, ch.Full_Path || ' : ' || c.Categories_Name
+                    FROM Categories c
+                    JOIN CategoryHierarchy ch ON c.Categories_Id_Parent = ch.Categories_Id
+                )
+                SELECT c.Categories_Id, c.Categories_Type, ch.Full_Path
+                FROM Categories c
+                JOIN CategoryHierarchy ch ON ch.Categories_Id = c.Categories_Id
+                ORDER BY c.Categories_Type, ch.Full_Path
+            """, conn)
+
+        if df_cats_with_splits.empty:
+            st.info("No categories with splits found.")
+        else:
+            _from_cat_options = {
+                int(row.categories_id): (
+                    f"[{row.categories_type}]  {row.full_path}"
+                    f"  ({int(row.splits_count)} splits)"
+                )
+                for row in df_cats_with_splits.itertuples()
+            }
+
+            _cm1, _cm2 = st.columns(2)
+            with _cm1:
+                _cat_from_id = st.selectbox(
+                    "From Category (source)",
+                    options=list(_from_cat_options.keys()),
+                    format_func=lambda x: _from_cat_options[x],
+                    key="merge_cat_from"
+                )
+
+            _from_type_rows = df_cats_with_splits.loc[
+                df_cats_with_splits["categories_id"] == _cat_from_id, "categories_type"
+            ]
+            _from_cat_type = _from_type_rows.iloc[0] if not _from_type_rows.empty else None
+
+            _to_cat_options = {
+                int(row.categories_id): f"{row.full_path}"
+                for row in df_all_cats.itertuples()
+                if row.categories_type == _from_cat_type
+                and int(row.categories_id) != _cat_from_id
+            }
+
+            with _cm2:
+                if _to_cat_options:
+                    _cat_to_id = st.selectbox(
+                        f"To Category (target — {_from_cat_type} only)",
+                        options=list(_to_cat_options.keys()),
+                        format_func=lambda x: _to_cat_options[x],
+                        key="merge_cat_to"
+                    )
+                else:
+                    st.warning(f"No other **{_from_cat_type}** categories available as target.")
+                    _cat_to_id = None
+
+            # Preview: show transactions for the selected source category
+            with get_db() as conn:
+                df_cat_preview = pd.read_sql("""
+                    SELECT DISTINCT
+                        t.Date,
+                        a1.Accounts_Name,
+                        COALESCE(
+                            (SELECT Payees_Name FROM Payees WHERE Payees_Id = t.Payees_Id),
+                            'NO PAYEE'
+                        ) AS Payees_Name,
+                        t.Description,
+                        t.Total_Amount,
+                        (SELECT a2.Accounts_Name FROM Accounts a2
+                         WHERE a2.Accounts_Id = t.Accounts_Id_Target) AS Accounts_Name_Target,
+                        t.Total_Amount_Target
+                    FROM Transactions t
+                    JOIN Splits s ON s.Transactions_Id = t.Transactions_Id
+                    JOIN Accounts a1 ON a1.Accounts_Id = t.Accounts_Id
+                    WHERE s.Categories_Id = %s
+                    ORDER BY t.Date DESC
+                """, conn, params=(_cat_from_id,))
+
+            _from_label = _from_cat_options.get(_cat_from_id, str(_cat_from_id))
+            st.markdown(f"**Transactions for:** {_from_label}")
+            st.dataframe(
+                df_cat_preview,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "date":                  st.column_config.DateColumn("Date", width="small"),
+                    "accounts_name":         st.column_config.TextColumn("Account", width="medium"),
+                    "payees_name":           st.column_config.TextColumn("Payee", width="medium"),
+                    "description":           st.column_config.TextColumn("Description", width="medium"),
+                    "total_amount":          st.column_config.NumberColumn("Amount", format="%,.2f", width="small"),
+                    "accounts_name_target":  st.column_config.TextColumn("Target Account", width="medium"),
+                    "total_amount_target":   st.column_config.NumberColumn("Target Amount", format="%,.2f", width="small"),
+                }
+            )
+
+            if _cat_to_id:
+                _from_cat_name = _from_cat_options.get(_cat_from_id, "")
+                _to_cat_name   = _to_cat_options.get(_cat_to_id, "")
+                _splits_count  = int(df_cats_with_splits.loc[
+                    df_cats_with_splits["categories_id"] == _cat_from_id, "splits_count"
+                ].iloc[0])
+
+                st.warning(
+                    f"This will move **{_splits_count} split(s)** from "
+                    f"**{_from_cat_name}** → **{_to_cat_name}**. This cannot be undone."
+                )
+
+                if st.button("▶️ Merge Category Splits", type="primary", key="merge_cat_btn"):
+                    with st.spinner(f"Moving {_splits_count} splits…"):
+                        try:
+                            with get_db() as conn:
+                                cur = conn.cursor()
+                                cur.execute(
+                                    "UPDATE Splits SET Categories_Id = %s WHERE Categories_Id = %s",
+                                    (_cat_to_id, _cat_from_id)
+                                )
+                            st.success(
+                                f"✅ {_splits_count} split(s) moved from "
+                                f"**{_from_cat_name}** to **{_to_cat_name}** successfully."
+                            )
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ Error during merge: {e}")
     
     with t4:
-        df = pd.read_sql("SELECT Securities_Id, Ticker, Securities_Name, Securities_Type, Currencies_Id, Sector, Industry, Analyst_Rating, Analyst_Target_Price, Is_Active, Yahoo_Ticker, EODHD_Symbol,embedding FROM Securities ORDER BY Securities_Name", conn)
+        with get_db() as conn:
+            df = pd.read_sql("SELECT Securities_Id, Ticker, Securities_Name, Securities_Type, Currencies_Id, Sector, Industry, Analyst_Rating, Analyst_Target_Price, Is_Active, Yahoo_Ticker, EODHD_Symbol, embedding, COALESCE((SELECT COUNT(*) FROM Investments WHERE Investments.Securities_Id = Securities.Securities_Id), 0) as investment_count FROM Securities ORDER BY Securities_Name", conn)
+
+        _sec_sort_labels = {
+            "ticker":    "Ticker",
+            "securities_name":    "Security Name",
+            "securities_type":    "Type",
+            "investment_count": "Investment Count",
+        }
+        _c1, _c2 = st.columns([2, 1])
+        with _c1:
+            _sec_sort_col = st.selectbox(
+                "Sort by", options=list(_sec_sort_labels.keys()),
+                format_func=lambda x: _sec_sort_labels[x],
+                index=1, key="sec_sort_col"
+            )
+        with _c2:
+            _sec_sort_asc = st.radio(
+                "Direction", options=["Ascending", "Descending"],
+                horizontal=True, key="sec_sort_dir"
+            ) == "Ascending"
+
+        df = df.sort_values(_sec_sort_col, ascending=_sec_sort_asc).reset_index(drop=True)
+
+
         edited_sec = st.data_editor(
              df, 
              num_rows="dynamic", 
@@ -230,18 +430,50 @@ def render_settings(conn):
                     "EODHD Symbol",
                     width="small"
                 ),
+                "investment_count": st.column_config.NumberColumn(
+                    "Investment Count",
+                    width="small",
+                    disabled=True
+                ),
                 "embedding": None
             }
         )
-        if not edited_sec.equals(df):
-            save_changes(df, edited_sec, "Securities", "securities_id")
-        
+
+        _sec_computed = ["investment_count"]
+        df_sec_save     = df.drop(columns=[c for c in _sec_computed if c in df.columns])
+        edited_sec_save = edited_sec.drop(columns=[c for c in _sec_computed if c in edited_sec.columns])
+        if not edited_sec_save.equals(df_sec_save):
+            save_changes(df_sec_save, edited_sec_save, "Securities", "securities_id")
+
         if st.button("🚀 Update Securities Information from Yahoo", key="download_sec_info", width="stretch"):
             download_securities_info_from_yahoo()
             st.rerun
     
     with t5:
-        df = pd.read_sql("SELECT * FROM Payees ORDER BY Payees_Name ASC", conn)
+        with get_db() as conn:
+            df = pd.read_sql("SELECT p.*, COALESCE((SELECT COUNT(*) FROM Transactions WHERE Transactions.Payees_Id = p.Payees_Id), 0) as transactions_count FROM Payees p ORDER BY p.Payees_Name ASC", conn)
+
+        _payee_sort_labels = {
+            "payees_name":    "Payee Name",
+            "categories_id_default":    "Default Category",
+            "transactions_count": "Transactions Count",
+        }
+        _c1, _c2 = st.columns([2, 1])
+        with _c1:
+            _payee_sort_col = st.selectbox(
+                "Sort by", options=list(_payee_sort_labels.keys()),
+                format_func=lambda x: _payee_sort_labels[x],
+                index=0, key="payee_sort_col"
+            )
+        with _c2:
+            _payee_sort_asc = st.radio(
+                "Direction", options=["Ascending", "Descending"],
+                horizontal=True, key="payee_sort_dir"
+            ) == "Ascending"
+
+        df = df.sort_values(_payee_sort_col, ascending=_payee_sort_asc).reset_index(drop=True)
+
+
         edited_payee = st.data_editor(
             df, 
             num_rows="dynamic", 
@@ -260,11 +492,20 @@ def render_settings(conn):
                     "Notes",
                     width="medium"
                 ),
+                "transactions_count": st.column_config.NumberColumn(
+                    "Transactions Count",
+                    width="small",
+                    disabled=True
+                ),
                 "embedding": None
             }
         )
-        if not edited_payee.equals(df):
-             save_changes(df, edited_payee, "Payees", "payees_id")
+
+        _payee_computed = ["transactions_count"]
+        df_payee_save     = df.drop(columns=[c for c in _payee_computed if c in df.columns])
+        edited_payee_save = edited_payee.drop(columns=[c for c in _payee_computed if c in edited_payee.columns])
+        if not edited_payee_save.equals(df_payee_save):
+            save_changes(df_payee_save, edited_payee_save, "Payees", "payees_id")
 
         if st.button("🔄 Update Default Category based on usage, in case not defined"):
             with st.spinner("Processing..."):
@@ -272,9 +513,138 @@ def render_settings(conn):
                 st.success("Updated successfully!")
                 st.balloons()
                 st.rerun() 
-    
+
+        st.divider()
+        st.subheader("🔀 Merge Payee Transactions")
+        st.caption(
+            "Reassign all transactions from one payee to another. "
+            "This is useful for merging duplicates or correcting misspellings. "
+        )
+
+
+        with get_db() as conn:
+            df_payees_with_transactions = pd.read_sql("""
+                SELECT p.Payees_Id, p.Payees_Name, COUNT(t.Transactions_Id) AS transactions_count
+                FROM Payees p
+                JOIN Transactions t ON t.Payees_Id = p.Payees_Id
+                GROUP BY p.Payees_Id, p.Payees_Name
+                ORDER BY p.Payees_Name
+            """, conn)
+            df_all_payees = pd.read_sql("""
+                SELECT Payees_Id, Payees_Name
+                FROM Payees
+                ORDER BY Payees_Name
+            """, conn)
+
+        if df_payees_with_transactions.empty:
+            st.info("No payees with transactions found.")
+        else:
+            _from_payee_options = {
+                int(row.payees_id): f"{row.payees_name} ({row.transactions_count} transactions)"
+                for row in df_payees_with_transactions.itertuples()
+            }
+
+            _cm1, _cm2 = st.columns(2)
+            with _cm1:
+                _payee_from_id = st.selectbox(
+                    "From Payee (source)",
+                    options=list(_from_payee_options.keys()),
+                    format_func=lambda x: _from_payee_options[x],
+                    key="merge_payee_from"
+                )
+
+            with _cm2:
+                _to_payee_options = {
+                    int(row.payees_id): f"{row.payees_name}"
+                    for row in df_all_payees.itertuples()
+                    if int(row.payees_id) != _payee_from_id
+                }
+                if _to_payee_options:
+                    _payee_to_id = st.selectbox(
+                        "To Payee (target)",
+                        options=list(_to_payee_options.keys()),
+                        format_func=lambda x: _to_payee_options[x],
+                        key="merge_payee_to"
+                    )
+                else:
+                    st.warning("No other payees available as target.")
+                    _payee_to_id = None
+
+
+            # Preview: show transactions for the selected source category
+            with get_db() as conn:
+                df_payee_preview = pd.read_sql("""
+                    SELECT DISTINCT
+                        t.Date,
+                        a1.Accounts_Name,
+                        p.Payees_Name,
+                        t.Description,
+                        t.Total_Amount,
+                        (SELECT a2.Accounts_Name FROM Accounts a2
+                         WHERE a2.Accounts_Id = t.Accounts_Id_Target) AS Accounts_Name_Target,
+                        t.Total_Amount_Target
+                    FROM Transactions t
+                    JOIN Payees p ON p.Payees_Id = t.Payees_Id
+                    JOIN Accounts a1 ON a1.Accounts_Id = t.Accounts_Id
+                    WHERE p.Payees_Id = %s
+                    ORDER BY t.Date DESC
+                """, conn, params=(_payee_from_id,))
+
+            _from_label = _from_payee_options.get(_payee_from_id, str(_payee_from_id))
+            st.markdown(f"**Transactions for:** {_from_label}")
+            st.dataframe(
+                df_payee_preview,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "date":                  st.column_config.DateColumn("Date", width="small"),
+                    "accounts_name":         st.column_config.TextColumn("Account", width="medium"),
+                    "payees_name":           st.column_config.TextColumn("Payee", width="medium"),
+                    "description":           st.column_config.TextColumn("Description", width="medium"),
+                    "total_amount":          st.column_config.NumberColumn("Amount", format="%,.2f", width="small"),
+                    "accounts_name_target":  st.column_config.TextColumn("Target Account", width="medium"),
+                    "total_amount_target":   st.column_config.NumberColumn("Target Amount", format="%,.2f", width="small"),
+                }
+            )
+
+            if _payee_to_id:
+                _from_payee_name = _from_payee_options.get(_payee_from_id, "")
+                _to_payee_name   = _to_payee_options.get(_payee_to_id, "")
+                _transactions_count  = int(df_payees_with_transactions.loc[
+                    df_payees_with_transactions["payees_id"] == _payee_from_id, "transactions_count"
+                ].iloc[0])
+
+                st.warning(
+                    f"This will move **{_transactions_count} transaction(s)** from "
+                    f"**{_from_payee_name}** → **{_to_payee_name}**. This cannot be undone."
+                )
+
+                if st.button("▶️ Merge Payee Transactions", type="primary", key="merge_payee_btn"):
+                    with st.spinner(f"Moving {_transactions_count} transactions…"):
+                        try:
+                            with get_db() as conn:
+                                cur = conn.cursor()
+                                cur.execute("ALTER TABLE Transactions DISABLE TRIGGER trg_update_balance;") # Disable balance update trigger for performance, since we'll update all transactions in one go and will recalculate balances at the end    
+                                conn.commit() # Commit the trigger disable before the update to ensure it takes effect immediately
+                                cur.execute(
+                                    "UPDATE Transactions SET Payees_Id = %s WHERE Payees_Id = %s",
+                                    (_payee_to_id, _payee_from_id)
+                                )
+                                conn.commit() # Commit the updates before re-enabling the trigger
+                                cur.execute("ALTER TABLE Transactions ENABLE TRIGGER trg_update_balance;") # Re-enable the trigger after the update
+                                conn.commit() # Final commit to ensure all changes are saved        
+                            st.success(
+                                f"✅ {_transactions_count} transaction(s) moved from "
+                                f"**{_from_payee_name}** to **{_to_payee_name}** successfully."
+                            )
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ Error during merge: {e}")
+
+
     with t6:
-        df = pd.read_sql("SELECT * FROM Accounts ORDER BY Accounts_Name ASC", conn)
+        with get_db() as conn:
+            df = pd.read_sql("SELECT * FROM Accounts ORDER BY Accounts_Name ASC", conn)
 
         column_order = [
             "accounts_id", 

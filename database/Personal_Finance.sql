@@ -368,3 +368,7 @@ CREATE INDEX idx_splits_category ON Splits(Categories_Id) WHERE Categories_Id IS
 
 -- Investments: filtered by action type in many queries
 CREATE INDEX idx_investments_action ON Investments(Action);
+
+CREATE INDEX IF NOT EXISTS idx_transactions_date ON Transactions(Date);
+CREATE INDEX IF NOT EXISTS idx_transactions_transfers_id ON Transactions(Transfers_Id) WHERE Transfers_Id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_investments_date ON Investments(Date);
