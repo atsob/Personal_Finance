@@ -151,7 +151,7 @@ def _render_transaction_table(acc_id, payee_options, acc_options, cat_options, t
         df_original,   # always render from the stored original so edits persist
         num_rows="dynamic",
         key=unique_key,
-        use_container_width=True,
+        width="stretch",
         column_config=col_config,
     )
 
@@ -286,7 +286,7 @@ def _render_transaction_table(acc_id, payee_options, acc_options, cat_options, t
             df_splits,
             num_rows="dynamic",
             key=editor_key,
-            use_container_width=True,
+            width="stretch",
             column_config={
                 "splits_id": st.column_config.NumberColumn("Split ID", disabled=True),
                 "transactions_id": None,

@@ -310,7 +310,7 @@ def render_settings():
             st.markdown(f"**Transactions for:** {_from_label}")
             st.dataframe(
                 df_cat_preview,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 column_config={
                     "date":                  st.column_config.DateColumn("Date", width="small"),
@@ -594,7 +594,7 @@ def render_settings():
             st.markdown(f"**Transactions for:** {_from_label}")
             st.dataframe(
                 df_payee_preview,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 column_config={
                     "date":                  st.column_config.DateColumn("Date", width="small"),
