@@ -1,4 +1,3 @@
-
 CREATE EXTENSION IF NOT EXISTS vector;
 
 CREATE TYPE Institutions_Type AS ENUM ('Bank', 'Credit Union', 'Insurance', 'Pension Fund', 'Broker', 'Crypto Exchange', 'Internal', 'Other');
@@ -372,3 +371,9 @@ CREATE INDEX idx_investments_action ON Investments(Action);
 CREATE INDEX IF NOT EXISTS idx_transactions_date ON Transactions(Date);
 CREATE INDEX IF NOT EXISTS idx_transactions_transfers_id ON Transactions(Transfers_Id) WHERE Transfers_Id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_investments_date ON Investments(Date);
+
+-- Covering index for P&L query: eliminates heap fetches when reconstructing historical quantities
+-- and calculating cash flows — Action, Quantity, Total_Amount, Price_Per_Share are all needed inline.
+CREATE INDEX IF NOT EXISTS idx_investments_accsec_covering
+    ON Investments(Accounts_Id, Securities_Id, Date DESC)
+    INCLUDE (Action, Quantity, Total_Amount, Price_Per_Share);
