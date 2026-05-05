@@ -122,7 +122,8 @@ def main():
     #    elif menu == "🥧 Investments (DEPRECIATED)":
     #        render_investments(conn)
         elif menu == "⏳ Reports":
-            render_reports(conn)
+    #        render_reports(conn)
+            render_reports()
         elif menu == "🌍 Market Data":
             render_market_data(conn)
         elif menu == "🧠 AI Assistant":

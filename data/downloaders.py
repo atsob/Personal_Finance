@@ -165,7 +165,7 @@ def download_historical_prices_from_yahoo(tsperiod=None, target_sec_id=None):
 
         base_query += " ORDER BY Securities_Name ASC"
         
-        print(base_query)
+    #    print(base_query)
 
         #cur.execute(base_query, params)
         cur.execute(base_query)
@@ -272,7 +272,7 @@ def get_smart_date_range(time_input="1mo"):
 # FETCH DATA FROM EODHD
 # ======================================================
 
-def fetch_prices_from_eodhd(api_key, symbol, from_date, to_date, retries=3):
+def fetch_prices_from_eodhd(api_key, symbol, from_date, to_date, retries=1):
     """
     Download historical prices from EODHD
     """

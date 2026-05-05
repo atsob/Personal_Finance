@@ -406,6 +406,7 @@ def get_pnl_report_data():
                 (date_trunc('day', CURRENT_DATE) - INTERVAL '1 day')::date as dtd_start,
                 (date_trunc('week', CURRENT_DATE) - INTERVAL '1 day')::date as wtd_start,
                 (date_trunc('month', CURRENT_DATE) - INTERVAL '1 day')::date as mtd_start,
+                (date_trunc('quarter', CURRENT_DATE) - INTERVAL '1 day')::date as qtd_start,
                 (date_trunc('year', CURRENT_DATE) - INTERVAL '1 day')::date as ytd_start,
                 '1900-01-01'::date as all_time_start,
                 CURRENT_DATE::date as today
@@ -432,7 +433,10 @@ def get_pnl_report_data():
                 -- Υπολογισμός ποσότητας MTD
                 COALESCE((SELECT SUM(CASE WHEN Action IN ('Buy', 'Reinvest', 'ShrIn') THEN Quantity WHEN Action IN ('Sell', 'ShrOut') THEN -Quantity ELSE 0 END) 
                         FROM Investments WHERE Securities_Id = he.Securities_Id AND Accounts_Id = he.Accounts_Id AND Date <= p.mtd_start), 0) as qty_mtd,
-                -- Υπολογισμός ποσότητας YTD
+                -- Υπολογισμός ποσότητας QTD
+                COALESCE((SELECT SUM(CASE WHEN Action IN ('Buy', 'Reinvest', 'ShrIn') THEN Quantity WHEN Action IN ('Sell', 'ShrOut') THEN -Quantity ELSE 0 END) 
+                        FROM Investments WHERE Securities_Id = he.Securities_Id AND Accounts_Id = he.Accounts_Id AND Date <= p.qtd_start), 0) as qty_qtd,
+				-- Υπολογισμός ποσότητας YTD
                 COALESCE((SELECT SUM(CASE WHEN Action IN ('Buy', 'Reinvest', 'ShrIn') THEN Quantity WHEN Action IN ('Sell', 'ShrOut') THEN -Quantity ELSE 0 END) 
                         FROM Investments WHERE Securities_Id = he.Securities_Id AND Accounts_Id = he.Accounts_Id AND Date <= p.ytd_start), 0) as qty_ytd
             FROM periods p
@@ -445,11 +449,13 @@ def get_pnl_report_data():
                 (SELECT Close FROM Historical_Prices WHERE Securities_Id = hh.Securities_Id AND Date <= hh.dtd_start ORDER BY Date DESC LIMIT 1) as price_dtd,
                 (SELECT Close FROM Historical_Prices WHERE Securities_Id = hh.Securities_Id AND Date <= hh.wtd_start ORDER BY Date DESC LIMIT 1) as price_wtd,
                 (SELECT Close FROM Historical_Prices WHERE Securities_Id = hh.Securities_Id AND Date <= hh.mtd_start ORDER BY Date DESC LIMIT 1) as price_mtd,
+                (SELECT Close FROM Historical_Prices WHERE Securities_Id = hh.Securities_Id AND Date <= hh.qtd_start ORDER BY Date DESC LIMIT 1) as price_qtd,
                 (SELECT Close FROM Historical_Prices WHERE Securities_Id = hh.Securities_Id AND Date <= hh.ytd_start ORDER BY Date DESC LIMIT 1) as price_ytd,
                 (SELECT FX_Rate FROM Historical_FX WHERE Currencies_Id_1 = s.Currencies_Id AND Date <= hh.today ORDER BY Date DESC LIMIT 1) as fx_today,
                 (SELECT FX_Rate FROM Historical_FX WHERE Currencies_Id_1 = s.Currencies_Id AND Date <= hh.dtd_start ORDER BY Date DESC LIMIT 1) as fx_dtd,
                 (SELECT FX_Rate FROM Historical_FX WHERE Currencies_Id_1 = s.Currencies_Id AND Date <= hh.wtd_start ORDER BY Date DESC LIMIT 1) as fx_wtd,
                 (SELECT FX_Rate FROM Historical_FX WHERE Currencies_Id_1 = s.Currencies_Id AND Date <= hh.mtd_start ORDER BY Date DESC LIMIT 1) as fx_mtd,
+                (SELECT FX_Rate FROM Historical_FX WHERE Currencies_Id_1 = s.Currencies_Id AND Date <= hh.qtd_start ORDER BY Date DESC LIMIT 1) as fx_qtd,
                 (SELECT FX_Rate FROM Historical_FX WHERE Currencies_Id_1 = s.Currencies_Id AND Date <= hh.ytd_start ORDER BY Date DESC LIMIT 1) as fx_ytd,
                 s.Securities_Name, a.Accounts_Name, s.Currencies_Id as sec_curr_id
             FROM historical_holdings hh
@@ -474,20 +480,25 @@ def get_pnl_report_data():
                     (CASE WHEN Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(Total_Amount, 0), Quantity * Price_Per_Share) 
                         WHEN Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(Total_Amount, 0), Quantity * Price_Per_Share) 
                         ELSE 0 END) ELSE 0 END) as cf_mtd,
+                -- QTD CF
+                SUM(CASE WHEN Date > (SELECT qtd_start FROM periods) THEN 
+                    (CASE WHEN Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(Total_Amount, 0), Quantity * Price_Per_Share) 
+                        WHEN Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(Total_Amount, 0), Quantity * Price_Per_Share) 
+                        ELSE 0 END) ELSE 0 END) as cf_qtd,
                 -- YTD CF
                 SUM(CASE WHEN Date > (SELECT ytd_start FROM periods) THEN 
                     (CASE WHEN Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(Total_Amount, 0), Quantity * Price_Per_Share) 
                         WHEN Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(Total_Amount, 0), Quantity * Price_Per_Share) 
                         ELSE 0 END) ELSE 0 END) as cf_ytd,
+				SUM(CASE WHEN Date > (SELECT ytd_start FROM periods) THEN
+                    (CASE	WHEN Action IN ('Buy', 'CashOut', 'MiscExp') THEN Total_Amount * COALESCE((SELECT FX_Rate FROM Historical_FX WHERE Date = Investments.Date AND Currencies_Id_1 = (SELECT Currencies_Id FROM Accounts WHERE Accounts_Id = Investments.Accounts_Id)), 1)
+                    		WHEN Action IN ('Sell', 'Dividend', 'IntInc', 'CashIn', 'RtrnCap') THEN -Total_Amount * COALESCE((SELECT FX_Rate FROM Historical_FX WHERE Date = Investments.Date AND Currencies_Id_1 = (SELECT Currencies_Id FROM Accounts WHERE Accounts_Id = Investments.Accounts_Id)), 1)
+                    		ELSE 0 END) 
+					ELSE 0 END) as net_invested_ytd,
                 -- Συνολικό CF (για Realized P&L)
                 SUM(CASE WHEN Action IN ('Buy', 'MiscExp', 'Reinvest', 'Exercise', 'ShrIn') THEN COALESCE(NULLIF(Total_Amount, 0), Quantity * Price_Per_Share)
                         WHEN Action IN ('Sell', 'Dividend', 'IntInc', 'RtrnCap', 'ShrOut') THEN -COALESCE(NULLIF(Total_Amount, 0), Quantity * Price_Per_Share)
                         ELSE 0 END) as cf_all_time,
-
-     --           SUM(CASE 
-     --               WHEN Action IN ('Buy', 'CashOut', 'MiscExp') THEN Total_Amount 
-     --               WHEN Action IN ('Sell', 'Dividend', 'IntInc', 'CashIn', 'RtrnCap') THEN -Total_Amount 
-     --               ELSE 0 END) as net_invested_all_time    
 				SUM(CASE 
                     WHEN Action IN ('Buy', 'CashOut', 'MiscExp') THEN Total_Amount * COALESCE((SELECT FX_Rate FROM Historical_FX WHERE Date = Investments.Date AND Currencies_Id_1 = (SELECT Currencies_Id FROM Accounts WHERE Accounts_Id = Investments.Accounts_Id)), 1)
                     WHEN Action IN ('Sell', 'Dividend', 'IntInc', 'CashIn', 'RtrnCap') THEN -Total_Amount * COALESCE((SELECT FX_Rate FROM Historical_FX WHERE Date = Investments.Date AND Currencies_Id_1 = (SELECT Currencies_Id FROM Accounts WHERE Accounts_Id = Investments.Accounts_Id)), 1)
@@ -497,6 +508,7 @@ def get_pnl_report_data():
         )
         SELECT 
             pf.Accounts_Name, pf.Securities_Name,
+			
             (pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)) as current_value_eur,
             
             -- DTD Analysis
@@ -507,19 +519,53 @@ def get_pnl_report_data():
             -- 3. Total P&L DTD		
             ((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)) - (pf.qty_dtd * pf.price_dtd * COALESCE(pf.fx_dtd, 1)) - COALESCE(cf.cf_dtd, 0)) as pnl_dtd_eur,
             
-            -- WTD/MTD Analysis
+            -- WTD/MTD/QTD Analysis
             ((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)) - (pf.qty_wtd * pf.price_wtd * COALESCE(pf.fx_wtd, 1)) - COALESCE(cf.cf_wtd, 0)) as pnl_wtd_eur,
             ((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)) - (pf.qty_mtd * pf.price_mtd * COALESCE(pf.fx_mtd, 1)) - COALESCE(cf.cf_mtd, 0)) as pnl_mtd_eur,
+            ((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)) - (pf.qty_qtd * pf.price_qtd * COALESCE(pf.fx_qtd, 1)) - COALESCE(cf.cf_qtd, 0)) as pnl_qtd_eur,
             
             -- YTD Analysis
             -- 1. P&L λόγω μεταβολής Τιμής (Market Effect YTD)
-            ((pf.qty_today * pf.price_today) - (pf.qty_ytd * pf.price_ytd) - (COALESCE(cf.cf_ytd, 0) / NULLIF(COALESCE(pf.fx_today, 1), 0))) * COALESCE(pf.fx_today, 1) as pnl_ytd_market_eur,
+			(CASE WHEN pf.qty_today = 0 THEN COALESCE((pf.qty_today * pf.price_today), 0) - COALESCE((pf.qty_ytd * pf.price_ytd),0) -- this is required for positions closed within the year and by today
+				 ELSE COALESCE((pf.qty_today * pf.price_today), 0) - COALESCE((pf.qty_ytd * pf.price_ytd),0) -- this is required for outstanding positions
+			END   - COALESCE(cf.cf_ytd, 0) / COALESCE(pf.fx_today, 1) -- this is required for positions closed within the year and by today
+			) * COALESCE(pf.fx_today, 1) as pnl_ytd_market_eur,
             -- 2. P&L λόγω μεταβολής Ισοτιμίας (FX Effect YTD)
-            (pf.qty_ytd * pf.price_ytd) * (COALESCE(pf.fx_today, 1) - COALESCE(pf.fx_ytd, 1)) as pnl_ytd_fx_eur,
+			CASE WHEN pf.qty_today = 0 THEN COALESCE((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)), 0) - COALESCE((pf.qty_ytd * pf.price_ytd * COALESCE(pf.fx_ytd, 1)),0) -- this is required for positions closed within the year and by today
+				 ELSE COALESCE((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)), 0) - COALESCE((pf.qty_ytd * pf.price_ytd * COALESCE(pf.fx_ytd, 1)),0) -- this is required for outstanding positions
+			END   - COALESCE(cf.cf_ytd, 0) * COALESCE(pf.fx_today, 1) -- this is required for positions closed within the year and by today
+			-
+			(CASE WHEN pf.qty_today = 0 THEN COALESCE((pf.qty_today * pf.price_today), 0) - COALESCE((pf.qty_ytd * pf.price_ytd),0) -- this is required for positions closed within the year and by today
+				 ELSE COALESCE((pf.qty_today * pf.price_today), 0) - COALESCE((pf.qty_ytd * pf.price_ytd),0) -- this is required for outstanding positions
+			END   - COALESCE(cf.cf_ytd, 0) / COALESCE(pf.fx_today, 1) -- this is required for positions closed within the year and by today
+			) * COALESCE(pf.fx_today, 1)			
+			as pnl_ytd_fx_eur,
+			
             -- Total YTD P&L
-            ((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)) - (pf.qty_ytd * pf.price_ytd * COALESCE(pf.fx_ytd, 1)) - COALESCE(cf.cf_ytd, 0)) as pnl_ytd_eur,
-            
-            -- All Time P&L
+			CASE WHEN pf.qty_today = 0 THEN COALESCE((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)), 0) - COALESCE((pf.qty_ytd * pf.price_ytd * COALESCE(pf.fx_ytd, 1)),0) -- this is required for positions closed within the year and by today
+				 ELSE COALESCE((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)), 0) - COALESCE((pf.qty_ytd * pf.price_ytd * COALESCE(pf.fx_ytd, 1)),0) -- this is required for outstanding positions
+			END   - COALESCE(cf.cf_ytd, 0) * COALESCE(pf.fx_today, 1) -- this is required for positions closed within the year and by today
+			as pnl_ytd_eur,	 
+
+            -- YTD UNREALIZED P&L
+			CASE WHEN pf.qty_today <> 0 AND pf.qty_ytd = 0 THEN COALESCE((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)), 0) - COALESCE(cf.cf_ytd, 0) * COALESCE(pf.fx_today, 1) 
+				 WHEN pf.qty_today <> 0 AND pf.qty_ytd <> 0 AND pf.qty_today >= pf.qty_ytd AND COALESCE(cf.net_invested_ytd, 0) >= 0 THEN COALESCE((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)), 0) - COALESCE((pf.qty_ytd * pf.price_ytd * COALESCE(pf.fx_ytd, 1)), 0) - COALESCE(cf.net_invested_ytd, 0)
+				 WHEN pf.qty_today <> 0 AND pf.qty_ytd <> 0 AND pf.qty_today >= pf.qty_ytd AND COALESCE(cf.net_invested_ytd, 0) < 0 THEN COALESCE((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)), 0) - COALESCE((pf.qty_ytd * pf.price_ytd * COALESCE(pf.fx_ytd, 1)), 0) 
+			 ELSE 0
+			END	AS unrealized_pnl_ytd_eur,
+
+            -- YTD REALIZED P&L
+			CASE WHEN pf.qty_today = 0 THEN COALESCE((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)), 0) - COALESCE((pf.qty_ytd * pf.price_ytd * COALESCE(pf.fx_ytd, 1)),0) -- this is required for positions closed within the year and by today
+				 ELSE COALESCE((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)), 0) - COALESCE((pf.qty_ytd * pf.price_ytd * COALESCE(pf.fx_ytd, 1)),0) -- this is required for outstanding positions
+			END   - COALESCE(cf.cf_ytd, 0) * COALESCE(pf.fx_today, 1) -- this is required for positions closed within the year and by today
+			-
+			CASE WHEN pf.qty_today <> 0 AND pf.qty_ytd = 0 THEN COALESCE((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)), 0) - COALESCE(cf.cf_ytd, 0) * COALESCE(pf.fx_today, 1) 
+				 WHEN pf.qty_today <> 0 AND pf.qty_ytd <> 0 AND pf.qty_today >= pf.qty_ytd AND COALESCE(cf.net_invested_ytd, 0) >= 0 THEN COALESCE((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)), 0) - COALESCE((pf.qty_ytd * pf.price_ytd * COALESCE(pf.fx_ytd, 1)), 0) - COALESCE(cf.net_invested_ytd, 0)
+				 WHEN pf.qty_today <> 0 AND pf.qty_ytd <> 0 AND pf.qty_today >= pf.qty_ytd AND COALESCE(cf.net_invested_ytd, 0) < 0 THEN COALESCE((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)), 0) - COALESCE((pf.qty_ytd * pf.price_ytd * COALESCE(pf.fx_ytd, 1)), 0) 
+			 ELSE 0
+			END realized_pnl_ytd_eur,
+
+            -- All Time P&L - ERROR - Use the NET instead
             ((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)) - COALESCE(cf.cf_all_time, 0)) as pnl_all_time_eur,
 
             -- Συνολικό P&L από την αρχή (Total Net Economic Gain)
@@ -530,16 +576,10 @@ def get_pnl_report_data():
             FROM Holdings WHERE Accounts_Id = pf.Accounts_Id AND Securities_Id = pf.Securities_Id) as unrealized_pnl_eur,
             
             -- Realized P&L (Total - Unrealized)
-    --     ((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)) - COALESCE(cf.cf_all_time, 0)) - 
             COALESCE((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)),0) - COALESCE(cf.net_invested_all_time, 0) - 
             COALESCE((SELECT Quantity * (pf.price_today - Fifo_Avg_Price) * COALESCE(pf.fx_today, 1) FROM Holdings WHERE Accounts_Id = pf.Accounts_Id AND Securities_Id = pf.Securities_Id), 0) as realized_pnl_eur,
-/*
-            -- Annual YOC %
-            ROUND(((SELECT ABS(SUM(CASE WHEN i.Action = 'Dividend' THEN i.Total_Amount WHEN i.Action = 'Reinvest' THEN (i.Quantity * i.Price_Per_Share) ELSE 0 END)) 
-                    FROM Investments i WHERE i.Securities_Id = pf.Securities_Id AND i.Accounts_Id = pf.Accounts_Id AND i.Action IN ('Dividend', 'Reinvest') AND i.Date >= CURRENT_DATE - INTERVAL '1 year') / 
-                    NULLIF((SELECT Quantity * Fifo_Avg_Price FROM Holdings WHERE Accounts_Id = pf.Accounts_Id AND Securities_Id = pf.Securities_Id), 0))::numeric * 100, 2) as dividend_yoc_pct
-*/
-            -- Annual YOC % - Λεπτομερής Υπολογισμός με Διευκρινίσεις                   
+
+			-- Annual YOC % - Λεπτομερής Υπολογισμός με Διευκρινίσεις                   
             ROUND(
                 (
                     SELECT SUM(
@@ -574,7 +614,7 @@ def get_pnl_report_data():
         FROM prices_fx pf
         LEFT JOIN cash_flows cf ON pf.Accounts_Id = cf.Accounts_Id AND pf.Securities_Id = cf.Securities_Id
         WHERE (pf.qty_today != 0 OR cf.cf_all_time IS NOT NULL) -- Εξασφαλίζει ότι βλέπουμε και κλειστές θέσεις με ιστορικό
-	--	AND pf.Accounts_Id = 112
+	--	AND pf.Accounts_Id = 89
         ORDER BY pf.Accounts_Name, pf.Securities_Name;
     """
     
