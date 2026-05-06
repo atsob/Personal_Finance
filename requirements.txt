@@ -19,3 +19,4 @@ ollama>=0.1.0
 pgvector>=0.3.0
 pdfplumber
 requests
+tradingview-datafeed

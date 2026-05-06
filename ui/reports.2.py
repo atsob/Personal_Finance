@@ -3,13 +3,14 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import numpy as np
+from database.connection import get_db
 from database.crud import update_holdings
 from database.queries import get_category_hierarchy, get_hist_net_worth_data, get_hist_inv_positions_data, get_pnl_report_data, get_income_expense_data, get_portfolio_signals
 from data.downloaders import download_historical_fx, download_historical_prices_from_eodhd, download_historical_prices_from_yahoo, download_bond_prices_from_solidus, download_securities_info_from_yahoo
 from ui.components import color_negative_red, color_value, custom_metric, get_color
 from datetime import datetime, timedelta
 
-def render_reports(conn):
+def render_reports():
     """Render the Reports page."""
     st.title("Reports")
     
@@ -509,37 +510,42 @@ def render_reports(conn):
                         key="pnl_account_select"
                     )
 
-                query_acc_id = f"SELECT Accounts_Id FROM Accounts WHERE Accounts_Name = '{selected_acc}'"
-                df_acc_id = pd.read_sql(query_acc_id, conn)
+                with get_db() as conn:
+                    query_acc_id = f"SELECT Accounts_Id FROM Accounts WHERE Accounts_Name = '{selected_acc}'"
+                    df_acc_id = pd.read_sql(query_acc_id, conn)
+
+                    if not df_acc_id.empty:
+                        account_id = df_acc_id.iloc[0]['accounts_id']
+                        query_holdings = f"""
+                            SELECT h.Securities_Id, s.Securities_Name, h.Quantity 
+                            FROM Holdings h 
+                            JOIN Securities s ON h.Securities_Id = s.Securities_Id 
+                            WHERE h.Accounts_Id = {account_id}
+                        """
+                        df_holdings = pd.read_sql(query_holdings, conn)
+
+                        query_prices = f"""
+                            SELECT DISTINCT ON (h.Securities_Id) 
+                                h.Securities_Id, 
+                                s.Securities_Name,
+                                h.Quantity,
+                                (SELECT hp.Close 
+                                FROM Historical_Prices hp 
+                                WHERE hp.Securities_Id = h.Securities_Id 
+                                AND hp.Date <= CURRENT_DATE 
+                                ORDER BY hp.Date DESC LIMIT 1) AS Latest_Price
+                            FROM Holdings h
+                            JOIN Securities s ON h.Securities_Id = s.Securities_Id
+                            WHERE h.Accounts_Id = {account_id} AND h.Quantity != 0
+                        """
+                        df_prices = pd.read_sql(query_prices, conn)
+                    else:
+                        df_acc_id = pd.DataFrame()
+                        df_holdings = pd.DataFrame()
+                        df_prices = pd.DataFrame()
 
                 if not df_acc_id.empty:
                     account_id = df_acc_id.iloc[0]['accounts_id']
-                    
-                    # Φέρνουμε όλα τα δεδομένα (το φιλτράρισμα θα γίνει στο dataframe)
-                    query_holdings = f"""
-                        SELECT h.Securities_Id, s.Securities_Name, h.Quantity 
-                        FROM Holdings h 
-                        JOIN Securities s ON h.Securities_Id = s.Securities_Id 
-                        WHERE h.Accounts_Id = {account_id}
-                    """
-                    df_holdings = pd.read_sql(query_holdings, conn)
-                   
-               
-                    query_prices = f"""
-                        SELECT DISTINCT ON (h.Securities_Id) 
-                            h.Securities_Id, 
-                            s.Securities_Name,
-                            h.Quantity,
-                            (SELECT hp.Close 
-                            FROM Historical_Prices hp 
-                            WHERE hp.Securities_Id = h.Securities_Id 
-                            AND hp.Date <= CURRENT_DATE 
-                            ORDER BY hp.Date DESC LIMIT 1) AS Latest_Price
-                        FROM Holdings h
-                        JOIN Securities s ON h.Securities_Id = s.Securities_Id
-                        WHERE h.Accounts_Id = {account_id} AND h.Quantity != 0
-                    """
-                    df_prices = pd.read_sql(query_prices, conn)
                     
                     df_details = df_pnl[df_pnl['accounts_name'] == selected_acc].copy()
                     
@@ -674,12 +680,359 @@ def render_reports(conn):
                 }                
                 )
 
+        with tab_savings:
+            st.subheader("💰 Savings Accounts — Yield over Cost & APY")
+            st.caption(
+                "**Principal** = non-interest cash inflows (deposits/transfers in, excluding interest). "
+                "**Total Interest** = sum of splits categorised as 'Interest'. "
+                "**Cumulative YoC** = Total Interest ÷ Principal × 100. "
+                "**APY** = (1 + Total Interest / Principal) ^ (365 / holding days) − 1, "
+                "i.e. the compound annualised rate implied by actual interest earned over the holding period."
+            )
+
+            with get_db() as conn:
+                df_savings = pd.read_sql("""
+                    WITH CategorizedSplits AS (
+                        -- Ταξινομούμε κάθε split και μεταφέρουμε την πληροφορία αν είναι Interest ή Principal
+                        SELECT 
+                            t.Accounts_Id,
+                            t.Transactions_Id,
+                            t.Date,
+                            t.Transfers_Id,
+                            CASE 	WHEN t.Transfers_Id IS NOT NULL THEN t.Total_Amount
+                                    WHEN cat.Categories_Type = 'Interest' THEN s.Amount
+                                    ELSE s.Amount
+                            END AS Amount,
+                            cat.Categories_Type,
+                            CASE 	WHEN t.Transfers_Id IS NOT NULL THEN 'Principal'
+                                    WHEN cat.Categories_Type = 'Interest' THEN 'Interest' 
+                                    ELSE 'Principal' END AS Kind
+                        FROM Transactions t
+                        LEFT JOIN Splits s ON s.Transactions_Id = t.Transactions_Id
+                        LEFT JOIN Categories cat ON cat.Categories_Id = s.Categories_Id
+                    ),
+                    NonEURAccounts AS (
+                        SELECT	DISTINCT a.Accounts_Id, a.Currencies_Id
+                        FROM	Accounts a
+                        WHERE a.Currencies_Id NOT IN (SELECT Currencies_Id FROM Currencies WHERE Currencies_ShortName = 'EUR')
+                    ),
+                    HFX_Dates AS (
+                        SELECT  nea.Accounts_Id,
+                                hfx.Currencies_Id_1,
+                                MAX(hfx.Date) AS Date
+                        FROM Historical_FX hfx
+                        JOIN NonEURAccounts nea ON nea.Currencies_Id = hfx.Currencies_Id_1
+                        WHERE	hfx.Currencies_Id_2 = (SELECT Currencies_Id FROM Currencies WHERE Currencies_ShortName = 'EUR')
+                        AND		hfx.Date <= CURRENT_DATE
+                        GROUP BY nea.Accounts_Id, hfx.Currencies_Id_1
+                    ),
+                    Account_FXRates AS (
+                        SELECT	DISTINCT nea.Accounts_Id,
+                                hfx.Currencies_Id_1,
+                                cs.Transactions_Id,
+                                hfx.Date,
+                                hfx.FX_Rate
+                        FROM Historical_FX hfx
+                        JOIN NonEURAccounts nea ON nea.Currencies_Id = hfx.Currencies_Id_1
+                        JOIN CategorizedSplits cs ON cs.Accounts_Id = nea.Accounts_Id
+                        WHERE	hfx.Currencies_Id_2 = (SELECT Currencies_Id FROM Currencies WHERE Currencies_ShortName = 'EUR')
+                        AND		hfx.Date = cs.Date
+                    ),
+                    Last_FXRates AS (
+                        SELECT  nea.Accounts_Id,
+                                hfx.Currencies_Id_1,
+                                hfx.FX_Rate
+                        FROM Historical_FX hfx
+                        JOIN NonEURAccounts nea ON nea.Currencies_Id = hfx.Currencies_Id_1
+                        WHERE	hfx.Currencies_Id_2 = (SELECT Currencies_Id FROM Currencies WHERE Currencies_ShortName = 'EUR')
+                        AND		hfx.Date = (SELECT Date FROM HFX_Dates WHERE Accounts_Id = nea.Accounts_Id)
+                        GROUP BY nea.Accounts_Id, hfx.Currencies_Id_1, hfx.FX_Rate
+                    ),
+                    AccountStats AS (
+                        -- Υπολογίζουμε τα βασικά αθροίσματα και ημερομηνίες ανά λογαριασμό
+                        SELECT 
+                            cs.Accounts_Id,
+                            MIN(cs.Date) AS first_tx_date,
+                            MAX(cs.Date) AS last_tx_date,
+                            MAX(CASE WHEN Kind = 'Principal' OR Transfers_Id IS NOT NULL THEN cs.Date END) AS last_principal_date,
+                            MAX(CASE WHEN Kind = 'Interest' THEN cs.Date END) AS last_interest_date,
+                            SUM(CASE WHEN Kind = 'Principal' OR Transfers_Id IS NOT NULL THEN COALESCE(Amount, 0) ELSE 0 END) AS principal,
+                            SUM(CASE WHEN Kind = 'Principal' OR Transfers_Id IS NOT NULL THEN COALESCE(Amount, 0) * COALESCE(FX_Rate, 1) ELSE 0 END) AS principal_eur,
+                            SUM(CASE WHEN Kind = 'Interest' THEN COALESCE(Amount, 0) ELSE 0 END) AS total_interest,
+                            SUM(CASE WHEN Kind = 'Interest' THEN COALESCE(Amount, 0) * COALESCE(FX_Rate, 1) ELSE 0 END) AS total_interest_eur
+                        FROM CategorizedSplits cs
+                        LEFT  JOIN Last_FXRates fx ON cs.Accounts_Id = fx.Accounts_Id
+                        GROUP BY cs.Accounts_Id
+                    ),
+                    LastPrincipalvsInterestDate AS (
+                        -- Υπολογίζουμε την ημερομηνία του κεφαλαίου πριν την τελευταία ημερομηνία interest
+                        SELECT 
+                            cs.Accounts_Id,
+                            MAX(cs.Date) AS last_principal_prior_interest_date
+                        FROM CategorizedSplits cs
+                        JOIN AccountStats ast ON cs.Accounts_Id = ast.Accounts_Id
+                        WHERE cs.Kind = 'Principal' AND cs.Date <= ast.last_interest_date
+                        GROUP BY cs.Accounts_Id
+                    ),
+                    LastInterest AS (
+                        -- Υπολογίζουμε το sum του τόκου μόνο για την τελευταία ημερομηνία principal
+                        SELECT 
+                            cs.Accounts_Id,
+                            SUM(cs.Amount) AS last_interest_sum,
+                            SUM(cs.Amount) * COALESCE(FX_Rate, 1) AS last_interest_sum_eur
+                        FROM CategorizedSplits cs
+                        JOIN LastPrincipalvsInterestDate lpvid ON cs.Accounts_Id = lpviD.Accounts_Id
+                        LEFT  JOIN Last_FXRates fx ON cs.Accounts_Id = fx.Accounts_Id
+                        WHERE cs.Kind = 'Interest' AND cs.Date >= lpvid.last_principal_prior_interest_date
+                        GROUP BY cs.Accounts_Id, FX_Rate
+                    ),
+                    LastPrincipal AS (
+                        -- Υπολογίζουμε το sum του κεφαλαίου πριν την τελευταία ημερομηνία interest
+                        SELECT 
+                            cs.Accounts_Id,
+                            SUM(cs.Amount) AS last_principal,
+                            SUM(cs.Amount) * COALESCE(FX_Rate, 1) AS last_principal_eur
+                        FROM CategorizedSplits cs
+                        JOIN AccountStats ast ON cs.Accounts_Id = ast.Accounts_Id
+                        LEFT  JOIN Last_FXRates fx ON cs.Accounts_Id = fx.Accounts_Id
+                        WHERE cs.Kind = 'Principal' AND cs.Date <= ast.last_interest_date
+                        GROUP BY cs.Accounts_Id, FX_Rate
+                    )
+                    SELECT 
+                        a.Accounts_Id,
+                        a.Accounts_Name,
+                        a.Accounts_Type,
+                        c.Currencies_ShortName AS currency,
+                        a.Accounts_Balance AS current_balance,
+                        ast.last_principal_date,
+                        lpvid.last_principal_prior_interest_date,
+                        ast.last_interest_date,
+                        ast.first_tx_date,
+                        ast.last_tx_date,
+                        ast.principal,
+                        ast.principal_eur,
+                        ast.total_interest,
+                        ast.total_interest_eur,
+                        lp.last_principal,
+                        lp.last_principal_eur,
+                        li.last_interest_sum,
+                        li.last_interest_sum_eur
+                    FROM Accounts a
+                    JOIN Currencies c ON c.Currencies_Id = a.Currencies_Id
+                    LEFT JOIN AccountStats ast ON ast.Accounts_Id = a.Accounts_Id
+                    LEFT JOIN LastInterest li ON li.Accounts_Id = a.Accounts_Id
+                    LEFT JOIN LastPrincipalvsInterestDate lpvid ON lpvid.Accounts_Id = a.Accounts_Id
+                    LEFT JOIN LastPrincipal lp ON lp.Accounts_Id = a.Accounts_Id
+                    WHERE a.Accounts_Type = 'Savings'
+                    ORDER BY a.Accounts_Name;
+                """, conn)
+
+            if df_savings.empty:
+                st.info("No Savings accounts found.")
+            else:
+                df_savings.columns = [c.lower() for c in df_savings.columns]
+
+                df_savings['first_tx_date'] = pd.to_datetime(df_savings['first_tx_date'])
+                df_savings['last_tx_date']  = pd.to_datetime(df_savings['last_tx_date'])
+                df_savings['last_principal_date'] = pd.to_datetime(df_savings['last_principal_date'])
+                df_savings['last_interest_date'] = pd.to_datetime(df_savings['last_interest_date'])
+                df_savings['last_principal_prior_interest_date'] = pd.to_datetime(df_savings['last_principal_prior_interest_date'])
+
+                # Holding period in days (minimum 1 to avoid division by zero)
+                df_savings['holding_days_total'] = (
+                    (df_savings['last_tx_date'] - df_savings['first_tx_date'])
+                    .dt.days.clip(lower=1)
+                )
+
+                df_savings['holding_days_last'] = (
+                    (df_savings['last_interest_date'] - df_savings['last_principal_prior_interest_date'])
+                    .dt.days.clip(lower=1)
+                )
+
+                _principal = df_savings['principal'].replace(0, float('nan'))
+                _principal_eur = df_savings['principal_eur'].replace(0, float('nan'))
+                _principal_last = df_savings['last_principal'].replace(0, float('nan'))
+                _principal_last_eur = df_savings['last_principal_eur'].replace(0, float('nan'))
+
+                # Annual interest cash: annualise actual interest over holding period.
+                # Mirrors P&L securities logic:
+                #   annual_div_cash = (dividend_yoc_pct / 100) * cost_basis
+                # Here we derive the annualised interest from actual earned interest.
+                df_savings['annual_interest_cash'] = (
+                    df_savings['total_interest'] / df_savings['holding_days_total'] * 365
+                )
+                df_savings['annual_interest_cash_last'] = (
+                    df_savings['last_interest_sum'] / df_savings['holding_days_last'] * 365
+                )
+
+                # Annual YOC % = annualised interest / principal * 100
+                # Same formula as P&L: dividend_yoc_pct = (annual_div_cash / cost_basis) * 100
+                # Principal = cost basis for a savings account.
+                df_savings['annual_yoc_pct'] = (
+                    df_savings['annual_interest_cash'] / _principal * 100
+                ).fillna(0)
+                df_savings['annual_yoc_pct_last'] = (
+                    df_savings['annual_interest_cash_last'] / _principal * 100
+                ).fillna(0)
+
+                # APY = (1 + total_interest/principal)^(365/holding_days) - 1
+                # Compound annualised rate for reference.
+                _r = df_savings['total_interest'] / _principal
+                df_savings['apy_pct'] = (
+                    ((1 + _r) ** (365 / df_savings['holding_days_total']) - 1) * 100
+                ).fillna(0)
+                _r_last = df_savings['last_interest_sum'] / _principal_last
+                df_savings['apy_pct_last'] = (
+                    ((1 + _r_last) ** (365 / df_savings['holding_days_last']) - 1) * 100
+                ).fillna(0)
+
+
+                # ── Summary metrics ───────────────────────────────────────────
+                m1, m2, m3, m4, m5 = st.columns(5)
+                with m1:
+                    st.metric("Savings Accounts", len(df_savings))
+                with m2:
+                    st.metric("Total Principal",
+                              f"{df_savings['principal_eur'].sum():,.2f} €")
+                with m3:
+                    st.metric("Total Interest Received",
+                              f"{df_savings['total_interest_eur'].sum():,.2f} €")
+                with m4:
+                    _avg_yoc = df_savings['annual_yoc_pct'].replace(0, float('nan')).mean()
+                    st.metric("Avg Annual YOC",
+                              f"{_avg_yoc:.2f}%" if not pd.isna(_avg_yoc) else "N/A")
+                with m5:
+                    _avg_apy = df_savings['apy_pct'].replace(0, float('nan')).mean()
+                    st.metric("Avg APY",
+                              f"{_avg_apy:.2f}%" if not pd.isna(_avg_apy) else "N/A")
+
+                st.write("---")
+
+                # ── Bar chart: Annual YOC per account ─────────────────────────
+                df_chart = df_savings[df_savings['annual_yoc_pct'] != 0].copy()
+                if not df_chart.empty:
+                    fig_yoc = px.bar(
+                        df_chart.sort_values('annual_yoc_pct', ascending=True),
+                        x='annual_yoc_pct',
+                        y='accounts_name',
+                        orientation='h',
+                        color='annual_yoc_pct',
+                        color_continuous_scale='RdYlGn',
+                        labels={'annual_yoc_pct': 'Annual YOC (%)', 'accounts_name': 'Account'},
+                        title='Annual Yield over Cost (%) per Savings Account',
+                        template='plotly_dark',
+                        text=df_chart['annual_yoc_pct'].apply(lambda x: f"{x:.2f}%"),
+                    )
+                    fig_yoc.update_traces(textposition='outside')
+                    fig_yoc.update_layout(
+                        coloraxis_showscale=False,
+                        margin=dict(l=0, r=60, t=50, b=0),
+                        yaxis_title=None
+                    )
+                    st.plotly_chart(fig_yoc, width="stretch")
+
+                # ── Detail table ──────────────────────────────────────────────
+                st.subheader("Detail")
+                df_display = df_savings[[
+                    'accounts_name', 'accounts_type', 'currency',
+                    'principal', 'total_interest', 'annual_interest_cash',
+                    'current_balance', 'annual_yoc_pct', 'apy_pct',
+                    'holding_days_total', 'first_tx_date', 'last_tx_date'
+                ]].copy()
+
+                df_display['first_tx_date'] = df_display['first_tx_date'].dt.strftime('%Y-%m-%d')
+                df_display['last_tx_date']  = df_display['last_tx_date'].dt.strftime('%Y-%m-%d')
+
+                st.dataframe(
+                    df_display.style.format({
+                        'principal':             "{:,.2f}",
+                        'total_interest':        "{:,.2f}",
+                        'annual_interest_cash':  "{:,.2f}",
+                        'current_balance':       "{:,.2f}",
+                        'annual_yoc_pct':        "{:.4f}%",
+                        'apy_pct':               "{:.4f}%",
+                        'holding_days_total':          "{:,.0f}",
+                    }),
+                    hide_index=True,
+                    width="stretch",
+                    column_config={
+                        'accounts_name':        'Account',
+                        'accounts_type':        'Type',
+                        'currency':             'Currency',
+                        'principal':            st.column_config.NumberColumn('Principal', format="%,.2f"),
+                        'total_interest':       st.column_config.NumberColumn('Total Interest', format="%,.2f"),
+                        'annual_interest_cash': st.column_config.NumberColumn('Ann. Interest', format="%,.2f",
+                                                    help="Total interest annualised over holding period"),
+                        'current_balance':      st.column_config.NumberColumn('Current Balance', format="%,.2f"),
+                        'annual_yoc_pct':       st.column_config.NumberColumn('Annual YOC %', format="%.4f%%",
+                                                    help="Annualised interest / Principal × 100 — same method as P&L securities"),
+                        'apy_pct':              st.column_config.NumberColumn('APY %', format="%.4f%%",
+                                                    help="(1 + Interest/Principal)^(365/days) − 1"),
+                        'holding_days_total':         st.column_config.NumberColumn('Days Held', format="%,d"),
+                        'first_tx_date':        'First Transaction',
+                        'last_tx_date':         'Last Transaction',
+                    }
+                )
+
+                csv = df_display.to_csv(index=False)
+                st.download_button(
+                    label="📥 Download as CSV",
+                    data=csv,
+                    file_name="savings_yield_over_cost.csv",
+                    mime="text/csv"
+                )
+
+                # ── Detail table based on last interest period ───────────────────────────────────────────────
+                st.subheader("Detail for Last Interest Period")
+                df_display = df_savings[[
+                    'accounts_name', 'accounts_type', 'currency',
+                    'last_principal', 'last_interest_sum', 'annual_interest_cash_last',
+                    'annual_yoc_pct_last', 'apy_pct_last',
+                    'holding_days_last', 'last_principal_prior_interest_date', 'last_interest_date'
+                ]].copy()
+
+                df_display['last_principal_prior_interest_date'] = df_display['last_principal_prior_interest_date'].dt.strftime('%Y-%m-%d')
+                df_display['last_interest_date'] = df_display['last_interest_date'].dt.strftime('%Y-%m-%d')
+
+                st.dataframe(
+                    df_display.style.format({
+                        'last_principal':             "{:,.2f}",
+                        'last_interest_sum':        "{:,.2f}",
+                        'annual_interest_cash_last':  "{:,.2f}",
+                        'annual_yoc_pct_last':        "{:.4f}%",
+                        'apy_pct_last':               "{:.4f}%",
+                        'holding_days_last':          "{:,.0f}",
+                    }),
+                    hide_index=True,
+                    width="stretch",
+                    column_config={
+                        'accounts_name':        'Account',
+                        'accounts_type':        'Type',
+                        'currency':             'Currency',
+                        'last_principal':            st.column_config.NumberColumn('Last Principal', format="%,.2f"),
+                        'last_interest_sum':       st.column_config.NumberColumn('Total Last Interest', format="%,.2f"),
+                        'annual_interest_cash_last': st.column_config.NumberColumn('Ann. Interest', format="%,.2f",
+                                                    help="Total interest annualised over holding period"),
+                        'annual_yoc_pct_last':       st.column_config.NumberColumn('Annual YOC %', format="%.4f%%",
+                                                    help="Annualised interest / Principal × 100 — same method as P&L securities"),
+                        'apy_pct_last':              st.column_config.NumberColumn('APY %', format="%.4f%%",
+                                                    help="(1 + Interest/Principal)^(365/days) − 1"),
+                        'holding_days_last':         st.column_config.NumberColumn('Days Held', format="%,d"),
+                        'last_principal_prior_interest_date':        'Last Prior Principal',
+                        'last_interest_date':         'Last Interest',
+                    }
+                )
+
+
+
+
     elif hist_sub_menu == "Securities & Portfolio Analysis":
         # 1. Tabs
         tab_change, tab_volat, tab_inv_signals, tab_port_signals = st.tabs(["📈 Price Change %", "🌊 Volatility", "🎯 Investment Signals", "📢 Portfolio Action Signals"])
 
         # 2. Sidebar (Διασφάλιση σωστών ονομάτων στηλών)
-        db_accounts = pd.read_sql("SELECT accounts_id, accounts_name FROM accounts WHERE accounts_type IN ('Brokerage', 'Margin', 'Other Investment') AND is_active = TRUE ORDER BY accounts_name", conn)
+        with get_db() as conn:
+            db_accounts = pd.read_sql("SELECT accounts_id, accounts_name FROM accounts WHERE accounts_type IN ('Brokerage', 'Margin', 'Other Investment') AND is_active = TRUE ORDER BY accounts_name", conn)
         
         # Δημιουργούμε το dictionary χρησιμοποιώντας τα πεζά ονόματα που επιστρέφει η Postgres
         account_options = {"All Portfolio": None}
@@ -1013,11 +1366,11 @@ def render_reports(conn):
  
  
     elif hist_sub_menu == "Income & Expense":
-        render_income_expense_reports(conn)
+        render_income_expense_reports()
 
 
 
-def render_income_expense_reports(conn):
+def render_income_expense_reports():
     """Render Income and Expense Reports page"""
     st.subheader("📊 Income & Expense Analysis")
     

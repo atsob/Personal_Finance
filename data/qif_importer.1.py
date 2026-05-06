@@ -722,15 +722,12 @@ class QIFImporter:
                         amt = tx.amount if hasattr(tx, 'amount') and tx.amount else 0
                         
                         self.cur.execute("""
-                            INSERT INTO Investments
+                            INSERT INTO Investments 
                             (Accounts_Id, Securities_Id, Date, Action, Quantity, Price_Per_Share, Commission, Total_Amount, Description)
                             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                            RETURNING Investments_Id
-                        """, (c_acc_id, c_sec_id, tx.date, my_action, qnt, prc, comm, amt,
+                        """, (c_acc_id, c_sec_id, tx.date, my_action, qnt, prc, comm, amt, 
                               tx.memo if hasattr(tx, 'memo') else None))
-                        inv_row = self.cur.fetchone()
-                        inv_id = inv_row[0] if inv_row else None
-
+                        
                         inv_tx_count += 1
 
                         # ----------------------------------------------------------------
@@ -878,10 +875,7 @@ class QIFImporter:
                                         self.cur.execute("SELECT nextval('transfers_id_seq')")
                                         transfer_link_id = self.cur.fetchone()[0]
 
-                                        # Always insert the cash-side (bank/card) transaction.
-                                        # For brokerage accounts: Accounts_Id_Target points to
-                                        # the investment account (informational — no mirror
-                                        # Transactions row; the Investments table is authoritative).
+                                        # Always insert the cash-side (bank/card) transaction
                                         self.cur.execute("""
                                             INSERT INTO Transactions (
                                                 Accounts_Id, Date, Payees_Id, Description,
@@ -889,7 +883,6 @@ class QIFImporter:
                                                 Total_Amount_Target, Transfers_Id
                                             )
                                             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                                            RETURNING Transactions_Id
                                         """, (
                                             cash_acc_id,
                                             tx.date,
@@ -897,20 +890,11 @@ class QIFImporter:
                                             tx.memo if hasattr(tx, 'memo') else raw_action,
                                             cash_tx_amount,
                                             True,
-                                            c_acc_id,               # always set target to investment account
-                                            abs(amt) if amt else abs(cash_tx_amount),  # investment amount
+                                            None if _inv_acc_is_brokerage else c_acc_id,
+                                            None if _inv_acc_is_brokerage else -cash_tx_amount,
                                             None if _inv_acc_is_brokerage else transfer_link_id
                                         ))
-                                        cash_tx_id = self.cur.fetchone()[0]
                                         bank_tx_count += 1
-
-                                        # Back-fill Transactions_Id on the Investments row
-                                        # so cascade delete/update can find this cash transaction.
-                                        if inv_id and _inv_acc_is_brokerage:
-                                            self.cur.execute(
-                                                "UPDATE Investments SET Transactions_Id = %s WHERE Investments_Id = %s",
-                                                (cash_tx_id, inv_id)
-                                            )
 
                                         # Only insert the investment-account mirror in Transactions
                                         # if it is NOT a brokerage account (the Investments table

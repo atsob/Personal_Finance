@@ -42,8 +42,14 @@ def execute_db_save(df_original, df_edited, table_name, id_col, current_acc_id=N
         elif ids_to_delete and table_name == "Investments":
             for deleted_id in ids_to_delete:
                 deleted_row = df_original[df_original[id_col] == deleted_id].iloc[0]
-                linked_tx_id = deleted_row.get('linked_transactions_id')
+                linked_tx_id = deleted_row.get('transactions_id')
                 if pd.notna(linked_tx_id) and linked_tx_id:
+                    # Must NULL-out the FK on the Investments row BEFORE deleting the
+                    # Transactions row — otherwise the FK constraint fires.
+                    cur.execute(
+                        "UPDATE Investments SET Transactions_Id = NULL WHERE Investments_Id = %s",
+                        (int(deleted_id),)
+                    )
                     cur.execute("DELETE FROM Splits WHERE transactions_id = %s", (int(linked_tx_id),))
                     cur.execute("DELETE FROM Transactions WHERE transactions_id = %s", (int(linked_tx_id),))
             cur.execute(f"DELETE FROM {table_name} WHERE {id_col} IN %s", (tuple(ids_to_delete),))
@@ -70,7 +76,7 @@ def execute_db_save(df_original, df_edited, table_name, id_col, current_acc_id=N
             if table_name == "Investments":
                 # Sync date and total_amount to the linked cash transaction when changed
                 for _, row in df_updates.iterrows():
-                    linked_tx_id = _safe_val(row.get('linked_transactions_id'))
+                    linked_tx_id = _safe_val(row.get('transactions_id'))
                     if not linked_tx_id:
                         continue
                     inv_id = int(row[id_col])
@@ -145,12 +151,8 @@ def execute_db_save(df_original, df_edited, table_name, id_col, current_acc_id=N
 def save_changes(df_original, df_edited, table_name, id_col, current_acc_id=None, conn=None):
     """Save changes from data editor to database."""
     if st.button(f"💾 Save {table_name}"):
-        success, msg = execute_db_save(df_original, df_edited, table_name, id_col, current_acc_id, conn)
-        if success:
-            st.success(msg)
-            st.rerun()
-        else:
-            st.error(msg)
+        # execute_db_save handles its own st.success / st.error / st.rerun internally.
+        execute_db_save(df_original, df_edited, table_name, id_col, current_acc_id, conn)
 
 def save_changes_no_serial(df_original, df_edited, table_name, id_col):
     """Save changes for tables without serial ID."""

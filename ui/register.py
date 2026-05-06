@@ -744,9 +744,9 @@ def _render_new_investment_form(acc_id, acc_type, df_accs, df_securities, get_db
                                 cash_description,
                                 cash_tx_amount_linked,
                                 True,
-                                None,   # brokerage side has no Transactions row
-                                None,
-                                None,
+                                acc_id,          # investment account (informational — no mirror Transactions row)
+                                abs(calc_total), # investment amount in investment account currency
+                                None,            # no Transfers_Id — Investments table is the authoritative record
                             ),
                         )
                         linked_tx_id = cur.fetchone()[0]
@@ -1422,7 +1422,7 @@ def render_register():
                 "commission",
                 "total_amount",
                 "description",
-                "Transactions_Id",
+                "transactions_id",
                 "embedding",
             ]
             df_inv = df_inv[[col for col in column_order if col in df_inv.columns]]
@@ -1476,7 +1476,7 @@ def render_register():
                         "Memo",
                         width="large"
                     ),
-                    "Transactions_Id": None,  # hidden — used for cascade delete/update
+                    "transactions_id": None,  # hidden — used for cascade delete/update
                     "embedding": None,
                 },
             )

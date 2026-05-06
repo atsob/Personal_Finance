@@ -70,13 +70,14 @@ CREATE TABLE Securities (
     Analyst_Target_Price NUMERIC(20, 8),
     Is_Active BOOLEAN DEFAULT TRUE,
     Yahoo_Ticker VARCHAR(30),
-    EODHD_Symbol VARCHAR(50),
+    TV_Symbol VARCHAR(30),
+    TV_Exchange VARCHAR(30),
     embedding vector(768)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_securities_id ON Securities(Securities_Id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_securities_name ON Securities(Securities_Name);
 CREATE INDEX IF NOT EXISTS idx_securities_yahoo_ticker ON Securities(Yahoo_Ticker) WHERE Yahoo_Ticker IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_securities_eodhd_symbol ON Securities(EODHD_Symbol) WHERE EODHD_Symbol IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_securities_tv_symbol ON Securities(TV_Symbol) WHERE TV_Symbol IS NOT NULL;
 
 CREATE TABLE Accounts (
     Accounts_Id SERIAL PRIMARY KEY,

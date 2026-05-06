@@ -6,7 +6,7 @@ import numpy as np
 from database.connection import get_db
 from database.crud import update_holdings
 from database.queries import get_category_hierarchy, get_hist_net_worth_data, get_hist_inv_positions_data, get_pnl_report_data, get_income_expense_data, get_portfolio_signals
-from data.downloaders import download_historical_fx, download_historical_prices_from_eodhd, download_historical_prices_from_yahoo, download_bond_prices_from_solidus, download_securities_info_from_yahoo
+from data.downloaders import download_historical_fx, download_historical_prices_from_tradingview, download_historical_prices_from_yahoo, download_bond_prices_from_solidus, download_securities_info_from_yahoo
 from ui.components import color_negative_red, color_value, custom_metric, get_color
 from datetime import datetime, timedelta
 
@@ -249,8 +249,8 @@ def render_reports():
                     download_historical_fx("2d")
                 with st.spinner("Running :green[download_historical_prices_from_yahoo('2d')]"):
                     download_historical_prices_from_yahoo("2d")
-                with st.spinner("Running :green[download_historical_prices_from_eodhd('2d')]"):
-                    download_historical_prices_from_eodhd("2d")
+                with st.spinner("Running :green[download_historical_prices_from_tradingview('2d')]"):
+                    download_historical_prices_from_tradingview("2d")
                 with st.spinner("Running :green[download_bond_prices_from_solidus()]"):
                     download_bond_prices_from_solidus()
                 with st.spinner("Running :green[update_holdings()]"):

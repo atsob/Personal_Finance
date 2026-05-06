@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 from database.crud import save_changes_no_serial, save_changes_mid
-from data.downloaders import download_historical_fx, download_historical_prices_from_tradingview, download_historical_prices_from_yahoo, download_bond_prices_from_solidus
+from data.downloaders import download_historical_fx, download_historical_prices_from_eodhd, download_historical_prices_from_yahoo, download_bond_prices_from_solidus
 
 def render_market_data(conn):
     """Render the Market Data page."""
@@ -245,12 +245,12 @@ def render_market_data(conn):
                 download_historical_prices_from_yahoo(ts_period_price, inv_sec_id)
                 st.rerun()
 
-            if st.button("🚀 Download All from TradingView", key="download_all_tradingview", width="stretch"):
-                download_historical_prices_from_tradingview(ts_period_price)
+            if st.button("🚀 Download All from EODHD", key="download_all_eodhd", width="stretch"):
+                download_historical_prices_from_eodhd(ts_period_price)
                 st.rerun()
 
-            if st.button(f"🚀 Update {selected_inv_sec['securities_name']} from TradingView", key="download_one_tradingview", width="stretch"):
-                download_historical_prices_from_tradingview(ts_period_price, inv_sec_id)
+            if st.button(f"🚀 Update {selected_inv_sec['securities_name']} from EODHD", key="download_one_eodhd", width="stretch"):
+                download_historical_prices_from_eodhd(ts_period_price, inv_sec_id)
                 st.rerun()
 
             if st.button("🚀 Download Bond Prices from Solidus", key="download_solidus", width="stretch"):

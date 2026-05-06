@@ -357,7 +357,7 @@ def render_settings():
     
     with t4:
         with get_db() as conn:
-            df = pd.read_sql("SELECT Securities_Id, Ticker, Securities_Name, Securities_Type, Currencies_Id, Sector, Industry, Analyst_Rating, Analyst_Target_Price, Is_Active, Yahoo_Ticker, TV_Symbol, TV_Exchange, embedding, COALESCE((SELECT COUNT(*) FROM Investments WHERE Investments.Securities_Id = Securities.Securities_Id), 0) as investment_count FROM Securities ORDER BY Securities_Name", conn)
+            df = pd.read_sql("SELECT Securities_Id, Ticker, Securities_Name, Securities_Type, Currencies_Id, Sector, Industry, Analyst_Rating, Analyst_Target_Price, Is_Active, Yahoo_Ticker, EODHD_Symbol, embedding, COALESCE((SELECT COUNT(*) FROM Investments WHERE Investments.Securities_Id = Securities.Securities_Id), 0) as investment_count FROM Securities ORDER BY Securities_Name", conn)
 
         _sec_sort_labels = {
             "ticker":    "Ticker",
@@ -429,12 +429,8 @@ def render_settings():
                     "Yahoo Ticker",
                     width="small"
                 ),
-                "tv_symbol": st.column_config.TextColumn(
-                    "TV Symbol",
-                    width="small"
-                ),
-                "tv_exchange": st.column_config.TextColumn(
-                    "TV Exchange",
+                "eodhd_symbol": st.column_config.TextColumn(
+                    "EODHD Symbol",
                     width="small"
                 ),
                 "investment_count": st.column_config.NumberColumn(
@@ -653,46 +649,54 @@ def render_settings():
         with get_db() as conn:
             df = pd.read_sql("SELECT * FROM Accounts ORDER BY Accounts_Name ASC", conn)
 
-        column_order = [
-            "accounts_id", 
-            "accounts_name", 
-            "accounts_type", 
-            "currencies_id", 
-            "institutions_id", 
-            "is_active",
-            "iban", 
-            "credit_limit", 
-            "accounts_id_linked",
-            "accounts_balance",
-            "embedding"
-        ]
-        df = df[column_order]
+        # Cash/bank accounts eligible as linked account targets for investment accounts.
+        # Built from the full df before slicing to column_order.
+        CASH_TYPES = {'Cash', 'Checking', 'Savings', 'Credit Card', 'Other'}
+        cash_acc_options = {
+            int(row['accounts_id']): row['accounts_name']
+            for _, row in df.iterrows()
+            if row['accounts_type'] in CASH_TYPES
+        }
 
-        # Creation of a new column with Status icons
+        column_order = [
+            "accounts_id",
+            "accounts_name",
+            "accounts_type",
+            "currencies_id",
+            "institutions_id",
+            "is_active",
+            "accounts_id_linked",
+            "iban",
+            "credit_limit",
+            "accounts_balance",
+            "embedding",
+        ]
+        df = df[[col for col in column_order if col in df.columns]]
+
+        # Status icon column
         def get_status_icon(q):
             if q == 0:
-                return "🔵" # Blue for zero
+                return "🔵"
             elif q < 0:
-                return "🔴" # Red for negative (short)
-            return "🟢"     # Green for positive
+                return "🔴"
+            return "🟢"
 
-        # Addition of the Status column at the beginning of the DataFrame
         df.insert(0, "Balance", df['accounts_balance'].apply(get_status_icon))
 
         edited_acc = st.data_editor(
-            df, 
-            num_rows="dynamic", 
-            key="set_acc", 
+            df,
+            num_rows="dynamic",
+            key="set_acc",
             width="content",
             column_config={
-                "Balance": st.column_config.TextColumn("Status", width="small", disabled=True), # Locked column for status icons
-                "accounts_id": None, # Hiding the accounts_id since it's not very useful to edit and clutters the UI
+                "Balance": st.column_config.TextColumn("Status", width="small", disabled=True),
+                "accounts_id": None,
                 "accounts_name": st.column_config.TextColumn(
                     "Account Name",
                     width="auto"
                 ),
                 "accounts_type": st.column_config.SelectboxColumn(
-                    "Type", 
+                    "Type",
                     options=['Cash', 'Checking', 'Savings', 'Credit Card', 'Brokerage', 'Pension', 'Other Investment', 'Margin', 'Loan', 'Real Estate', 'Vehicle', 'Asset', 'Liability', 'Other'],
                     width="auto"
                 ),
@@ -708,30 +712,34 @@ def render_settings():
                     "Active",
                     width="auto"
                 ),
+                "accounts_id_linked": st.column_config.SelectboxColumn(
+                    "Linked Cash Account",
+                    options=list(cash_acc_options.keys()),
+                    format_func=lambda x: cash_acc_options.get(int(x), "—") if x is not None else "— none —",
+                    width="medium",
+                    help="For investment accounts: the default cash/bank account used for BuyX / SellX / DivX transfers."
+                ),
                 "iban": st.column_config.TextColumn(
                     "IBAN",
-                    width="snall"
+                    width="small"
                 ),
                 "credit_limit": st.column_config.NumberColumn(
                     "Limit",
                     width="auto",
                     format="%,.2f"
                 ),
-                "accounts_id_linked": st.column_config.SelectboxColumn(
-                    "Linked Account", options={None: "None", **acc_options}, format_func=lambda x: acc_options.get(x, "Unknown") if x is not None else "None",
-                    width="auto"
-                ),
                 "accounts_balance": st.column_config.NumberColumn(
                     "Balance",
                     width="auto",
-                    format="%,.2f"
+                    format="%,.2f",
+                    disabled=True
                 ),
-                "embedding": None
+                "embedding": None,
             }
         )
-    #    if not edited_acc.equals(df):
-    #         save_changes(df, edited_acc, "Accounts", "accounts_id")
 
         if not edited_acc.equals(df):
             save_df = edited_acc.drop(columns=["Balance"])
             save_changes(df.drop(columns=["Balance"]), save_df, "Accounts", "accounts_id")
+
+        
