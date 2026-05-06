@@ -15,6 +15,7 @@ def render_settings():
         df_curr_list = pd.read_sql("SELECT Currencies_Id, Currencies_ShortName FROM Currencies ORDER BY Currencies_ShortName ASC", conn)
         df_inst_list = pd.read_sql("SELECT Institutions_Id, Institutions_Name FROM Institutions ORDER BY Institutions_Name ASC", conn)
         df_sec_list = pd.read_sql("SELECT Securities_Id, Securities_Name FROM Securities ORDER BY Securities_Name ASC", conn)
+        df_acc_list = pd.read_sql("SELECT Accounts_Id, Accounts_Name FROM Accounts ORDER BY Accounts_Name ASC", conn)
 
         # Category hierarchy
         query_cat_hierarchy = """
@@ -40,6 +41,8 @@ def render_settings():
     inst_options = df_inst_list.set_index('institutions_id')['institutions_name'].to_dict()
     sec_options = df_sec_list.set_index('securities_id')['securities_name'].to_dict()
     cat_options = df_cat_list.set_index('categories_id')['full_path'].to_dict()
+    acc_options = df_acc_list.set_index('accounts_id')['accounts_name'].to_dict()
+    
    
     moodys_options = dict(zip(df_moodys_list['moodys'], df_moodys_list['moodys']))
     s_p_options = dict(zip(df_s_p_list['s_p'], df_s_p_list['s_p']))
@@ -655,6 +658,7 @@ def render_settings():
             "is_active",
             "iban", 
             "credit_limit", 
+            "accounts_id_linked",
             "accounts_balance",
             "embedding"
         ]
@@ -708,6 +712,10 @@ def render_settings():
                     "Limit",
                     width="auto",
                     format="%,.2f"
+                ),
+                "accounts_id_linked": st.column_config.SelectboxColumn(
+                    "Linked Account", options={None: "None", **acc_options}, format_func=lambda x: acc_options.get(x, "Unknown") if x is not None else "None",
+                    width="auto"
                 ),
                 "accounts_balance": st.column_config.NumberColumn(
                     "Balance",

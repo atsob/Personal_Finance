@@ -3,6 +3,15 @@ import streamlit as st
 from psycopg2.extras import execute_values
 from database.connection import get_connection
 
+def _safe_val(val):
+    """Convert a DataFrame cell value to a Python-native type safe for psycopg2."""
+    if pd.isna(val):
+        return None
+    if hasattr(val, 'item'):
+        return val.item()
+    return val
+
+
 def execute_db_save(df_original, df_edited, table_name, id_col, current_acc_id=None, conn=None):
     """Save changes from data editor to database."""
     if conn is None:
@@ -12,90 +21,122 @@ def execute_db_save(df_original, df_edited, table_name, id_col, current_acc_id=N
         original_ids = set(df_original[id_col].dropna().unique())
         edited_ids = set(df_edited[id_col].dropna().unique())
         ids_to_delete = [int(x) for x in (original_ids - edited_ids) if pd.notna(x)]
-        
-        # If deleting Transactions, also handle mirrored transfers
+
+        # ── DELETE cascades ───────────────────────────────────────────────────
         if ids_to_delete and table_name == "Transactions":
             for deleted_id in ids_to_delete:
                 deleted_row = df_original[df_original[id_col] == deleted_id].iloc[0]
-                if pd.notna(deleted_row.get('transfers_id')) and deleted_row['transfers_id']:
-                    # It's a transfer, find and delete the mirrored transaction using Transfers_Id
-                    transfers_id = deleted_row['transfers_id']
-                    # Find the other transaction in this transfer pair
+                transfers_id = deleted_row.get('transfers_id')
+                if pd.notna(transfers_id) and transfers_id:
                     cur.execute("""
-                        SELECT transactions_id FROM Transactions 
+                        SELECT transactions_id FROM Transactions
                         WHERE transfers_id = %s AND transactions_id != %s
                     """, (int(transfers_id), int(deleted_id)))
-                    mirrored_row = cur.fetchone()
-                    if mirrored_row:
-                        mirrored_id = mirrored_row[0]
-                        cur.execute("DELETE FROM Splits WHERE transactions_id = %s", (mirrored_id,))
-                        cur.execute("DELETE FROM Transactions WHERE transactions_id = %s", (mirrored_id,))
-            
-            if ids_to_delete:
-                cur.execute("DELETE FROM Splits WHERE transactions_id IN %s", (tuple(ids_to_delete),))
-                cur.execute(f"DELETE FROM {table_name} WHERE {id_col} IN %s", (tuple(ids_to_delete),))
+                    mirrored = cur.fetchone()
+                    if mirrored:
+                        cur.execute("DELETE FROM Splits WHERE transactions_id = %s", (mirrored[0],))
+                        cur.execute("DELETE FROM Transactions WHERE transactions_id = %s", (mirrored[0],))
+            cur.execute("DELETE FROM Splits WHERE transactions_id IN %s", (tuple(ids_to_delete),))
+            cur.execute(f"DELETE FROM {table_name} WHERE {id_col} IN %s", (tuple(ids_to_delete),))
+
+        elif ids_to_delete and table_name == "Investments":
+            for deleted_id in ids_to_delete:
+                deleted_row = df_original[df_original[id_col] == deleted_id].iloc[0]
+                linked_tx_id = deleted_row.get('linked_transactions_id')
+                if pd.notna(linked_tx_id) and linked_tx_id:
+                    cur.execute("DELETE FROM Splits WHERE transactions_id = %s", (int(linked_tx_id),))
+                    cur.execute("DELETE FROM Transactions WHERE transactions_id = %s", (int(linked_tx_id),))
+            cur.execute(f"DELETE FROM {table_name} WHERE {id_col} IN %s", (tuple(ids_to_delete),))
+
         elif ids_to_delete:
             if table_name == "Transactions":
                 cur.execute("DELETE FROM Splits WHERE transactions_id IN %s", (tuple(ids_to_delete),))
             cur.execute(f"DELETE FROM {table_name} WHERE {id_col} IN %s", (tuple(ids_to_delete),))
-        
+
         df_new = df_edited[df_edited[id_col].isna() | df_edited[id_col].isnull()].copy()
         df_updates = df_edited[df_edited[id_col].notna()].copy()
-        
+
+        # ── UPDATE rows ───────────────────────────────────────────────────────
         if not df_updates.empty:
             cols = [c for c in df_updates.columns.tolist() if c != id_col]
             for _, row in df_updates.iterrows():
                 set_clause = ", ".join([f"{c} = %s" for c in cols])
                 sql_upd = f"UPDATE {table_name} SET {set_clause} WHERE {id_col} = %s"
-
-            #    vals = [None if pd.isna(row[c]) else row[c] for c in cols]
-
-                # Instead of vals = [None if pd.isna(row[c]) else row[c] for c in cols]
-                vals = []
-                for c in cols:
-                    val = row[c]
-                    if pd.isna(val):
-                        vals.append(None)
-                    elif hasattr(val, 'item'): # Μετατρέπει numpy types σε python types
-                        vals.append(val.item())
-                    else:
-                        vals.append(val)
-
-
+                vals = [_safe_val(row[c]) for c in cols]
                 vals.append(int(row[id_col]))
                 cur.execute(sql_upd, tuple(vals))
-        
+
+            # ── UPDATE cascades ────────────────────────────────────────────────
+            if table_name == "Investments":
+                # Sync date and total_amount to the linked cash transaction when changed
+                for _, row in df_updates.iterrows():
+                    linked_tx_id = _safe_val(row.get('linked_transactions_id'))
+                    if not linked_tx_id:
+                        continue
+                    inv_id = int(row[id_col])
+                    orig_rows = df_original[df_original[id_col] == inv_id]
+                    if orig_rows.empty:
+                        continue
+                    orig = orig_rows.iloc[0]
+                    new_date = _safe_val(row.get('date'))
+                    new_total = _safe_val(row.get('total_amount'))
+                    orig_date = _safe_val(orig.get('date'))
+                    orig_total = _safe_val(orig.get('total_amount'))
+                    # Determine cash-flow sign from current action
+                    action = str(row.get('action', '') or '')
+                    cash_out = action in {'Buy', 'MiscExp'}
+                    if new_date != orig_date or new_total != orig_total:
+                        # Preserve sign: cash-out actions make the linked tx negative
+                        if new_total is not None:
+                            signed_total = -abs(float(new_total)) if cash_out else abs(float(new_total))
+                        else:
+                            signed_total = None
+                        cur.execute(
+                            """UPDATE Transactions
+                                  SET date = COALESCE(%s, date),
+                                      total_amount = COALESCE(%s, total_amount)
+                               WHERE transactions_id = %s""",
+                            (new_date, signed_total, int(linked_tx_id)),
+                        )
+
+            elif table_name == "Transactions":
+                # Sync date to the mirrored transfer transaction when changed
+                for _, row in df_updates.iterrows():
+                    transfers_id = _safe_val(row.get('transfers_id'))
+                    if not transfers_id:
+                        continue
+                    tx_id = int(row[id_col])
+                    orig_rows = df_original[df_original[id_col] == tx_id]
+                    if orig_rows.empty:
+                        continue
+                    orig = orig_rows.iloc[0]
+                    new_date = _safe_val(row.get('date'))
+                    orig_date = _safe_val(orig.get('date'))
+                    if new_date != orig_date:
+                        cur.execute(
+                            """UPDATE Transactions SET date = %s
+                               WHERE transfers_id = %s AND transactions_id != %s""",
+                            (new_date, int(transfers_id), tx_id),
+                        )
+
+        # ── INSERT new rows ───────────────────────────────────────────────────
         if not df_new.empty:
             cols_new = [c for c in df_new.columns.tolist() if c != id_col]
             for _, row in df_new.iterrows():
                 placeholders = ", ".join(["%s"] * len(cols_new))
                 sql_ins = f"INSERT INTO {table_name} ({', '.join(cols_new)}) VALUES ({placeholders})"
-
-            #    vals = [None if pd.isna(row[c]) else row[c] for c in cols_new]
-
-                # Instead of: vals = [None if pd.isna(row[c]) else row[c] for c in cols_new]
-                vals = []
-                for c in cols_new:
-                    val = row[c]
-                    if pd.isna(val):
-                        vals.append(None)
-                    elif hasattr(val, 'item'):
-                        vals.append(val.item())
-                    else:
-                        vals.append(val)
-
-
+                vals = [_safe_val(row[c]) for c in cols_new]
                 cur.execute(sql_ins, tuple(vals))
-        
+
         conn.commit()
-        
+
         if table_name == "Transactions" and current_acc_id:
             update_accounts_balances(current_acc_id)
             st.session_state.balance_update_counter = st.session_state.get('balance_update_counter', 0) + 1
-        
+
         st.success(f"Saved: {len(df_updates)} updates, {len(df_new)} new, {len(ids_to_delete)} deletions")
         st.rerun()
-        
+
     except Exception as e:
         conn.rollback()
         st.error(f"Error: {e}")

@@ -487,291 +487,6 @@ def reset_transaction_form_state():
     st.session_state.reset_counter += 1
 
 
-def _render_new_investment_form(acc_id, acc_type, df_accs, df_securities, get_db_fn,
-                                update_holdings_fn, update_investment_balances_fn):
-    """Form for entering a new investment transaction with optional linked-account transfer.
-
-    Mirrors the qif_importer X-type logic:
-      - Investments row always goes into the Investments table.
-      - For actions that move cash to/from a linked bank/cash account (Buy→cash out,
-        Sell/Dividend/IntInc/RtrnCap→cash in, MiscExp→cash out) a Transactions row is
-        inserted in the linked account and its ID stored in Transactions_Id.
-      - Brokerage accounts never get a mirror Transactions row — the Investments entry
-        is the authoritative record on the investment side.
-      - Securities are filtered to match the investment account currency.
-      - The default linked account comes from Accounts.Accounts_Id_Linked.
-      - When currencies differ, target amount is auto-calculated from Historical_FX.
-    """
-
-    # ── Action metadata ────────────────────────────────────────────────────────
-    ALL_ACTIONS = [
-        'Buy', 'Sell', 'Dividend', 'Reinvest', 'IntInc', 'RtrnCap',
-        'MiscExp', 'ShrIn', 'ShrOut', 'CashIn', 'CashOut',
-        'Split', 'Vest', 'Grant', 'Exercise', 'Expire',
-    ]
-    CASH_OUT_ACTIONS = {'Buy', 'MiscExp'}
-    CASH_IN_ACTIONS  = {'Sell', 'Dividend', 'IntInc', 'RtrnCap'}
-    LINKED_CAPABLE   = CASH_OUT_ACTIONS | CASH_IN_ACTIONS
-    NO_SECURITY_ACTIONS = {'CashIn', 'CashOut'}
-    QTY_REQUIRED_ACTIONS = {'Buy', 'Sell', 'ShrIn', 'ShrOut', 'Reinvest', 'Split', 'Vest', 'Grant', 'Exercise', 'Expire'}
-
-    # ── Account metadata ───────────────────────────────────────────────────────
-    acc_row = df_accs[df_accs['accounts_id'] == acc_id].iloc[0]
-    acc_currencies_id = int(acc_row['currencies_id'])
-    acc_linked_default = acc_row.get('accounts_id_linked')
-    if pd.isna(acc_linked_default):
-        acc_linked_default = None
-    else:
-        acc_linked_default = int(acc_linked_default)
-
-    # ── Securities filtered to account currency ───────────────────────────────
-    INV_TYPES = {'Brokerage', 'Pension', 'Other Investment', 'Margin'}
-    df_sec_filtered = df_securities[df_securities['currencies_id'] == acc_currencies_id]
-    sec_options = {row['securities_id']: row['securities_name']
-                   for _, row in df_sec_filtered.iterrows()}
-
-    # ── Cash/bank accounts eligible as transfer targets ───────────────────────
-    cash_acc_options = {
-        row['accounts_id']: f"{row['accounts_name']} ({row['accounts_balance']:,.2f})"
-        for _, row in df_accs.iterrows()
-        if row['accounts_type'] not in INV_TYPES and row['accounts_id'] != acc_id
-    }
-    cash_acc_ids = list(cash_acc_options.keys())
-
-    st.info(
-        "Fill in the transaction details below. "
-        "For **Buy / Sell / Dividend / IntInc / RtrnCap / MiscExp** you can optionally link "
-        "a cash account — this mirrors the Quicken BuyX/SellX/DivX behaviour."
-    )
-
-    rc = st.session_state.get('inv_form_reset', 0)
-
-    # ── Linked-account selectbox OUTSIDE the form so FX can be pre-calculated ─
-    # (same pattern as the payee selector in the bank transaction form)
-    enable_linked = st.checkbox(
-        "Create linked cash account transfer (BuyX / SellX / DivX)",
-        value=False,
-        key=f"inv_linked_chk_{rc}",
-    )
-    linked_acc_id = None
-    linked_acc_curr = None
-    fx_rate = 1.0
-    if enable_linked:
-        if not cash_acc_ids:
-            st.warning("No eligible cash/bank accounts found.")
-            enable_linked = False
-        else:
-            # Default to the account's configured linked account if available
-            default_idx = 0
-            if acc_linked_default and acc_linked_default in cash_acc_ids:
-                default_idx = cash_acc_ids.index(acc_linked_default)
-            linked_acc_id = st.selectbox(
-                "Linked Cash Account",
-                options=cash_acc_ids,
-                format_func=lambda x: cash_acc_options.get(x, "Unknown"),
-                index=default_idx,
-                key=f"inv_linked_acc_{rc}",
-            )
-            linked_row = df_accs[df_accs['accounts_id'] == linked_acc_id]
-            if not linked_row.empty:
-                linked_acc_curr = int(linked_row.iloc[0]['currencies_id'])
-            # Pre-calculate FX rate with today's date (user can override target amount)
-            if linked_acc_curr and linked_acc_curr != acc_currencies_id:
-                with get_db_fn() as _conn_fx:
-                    _cur_fx = _conn_fx.cursor()
-                    fx_rate = get_latest_fx_rate(_cur_fx, acc_currencies_id, linked_acc_curr)
-
-    with st.form(f"new_inv_tx_{rc}"):
-        col1, col2 = st.columns(2)
-
-        with col1:
-            inv_date = st.date_input("Date", value=date.today(), key=f"inv_date_{rc}")
-
-            inv_action = st.selectbox(
-                "Action", ALL_ACTIONS,
-                key=f"inv_action_{rc}",
-                help="Choose the investment action type."
-            )
-
-            sec_ids = [None] + list(sec_options.keys())
-            inv_security = st.selectbox(
-                "Security",
-                options=sec_ids,
-                format_func=lambda x: sec_options.get(x, "— none —"),
-                key=f"inv_sec_{rc}",
-                help="Only securities in the account currency are shown.",
-            )
-
-        with col2:
-            inv_qty = st.number_input(
-                "Quantity", min_value=0.0, value=0.0, step=0.0001, format="%.8f",
-                key=f"inv_qty_{rc}",
-            )
-            inv_price = st.number_input(
-                "Price Per Share", min_value=0.0, value=0.0, step=0.0001, format="%.4f",
-                key=f"inv_price_{rc}",
-            )
-            inv_comm = st.number_input(
-                "Commission", min_value=0.0, value=0.0, step=0.01, format="%.4f",
-                key=f"inv_comm_{rc}",
-            )
-            inv_total_override = st.number_input(
-                "Total Amount (leave 0 to auto-calculate)",
-                value=0.0, step=0.01, format="%.4f",
-                key=f"inv_total_{rc}",
-                help="Buy = qty×price + commission | Sell = qty×price − commission | others = qty×price",
-            )
-            inv_memo = st.text_input("Memo / Description", key=f"inv_memo_{rc}")
-
-        # ── Linked account cross-currency target amount ────────────────────────
-        linked_target_amount = None
-        if enable_linked and linked_acc_id and linked_acc_curr and linked_acc_curr != acc_currencies_id:
-            st.divider()
-            st.caption(
-                f"Linked account is in a different currency. "
-                f"Target amount pre-calculated using FX rate **{fx_rate:.6f}** (editable)."
-            )
-            linked_target_amount = st.number_input(
-                "Target Amount in Linked Account Currency",
-                value=0.0,
-                step=0.01, format="%.4f",
-                key=f"inv_linked_target_{rc}",
-                help="Auto-filled after you set the total amount; override if needed.",
-            )
-        elif enable_linked and linked_acc_id:
-            st.caption("Linked account uses the same currency — no conversion needed.")
-
-        if enable_linked and linked_acc_id and inv_action not in LINKED_CAPABLE:
-            st.warning(f"**{inv_action}** does not support a linked cash transfer.")
-
-        submitted = st.form_submit_button("💾 Save Investment Transaction")
-
-    # ── Validation & save ──────────────────────────────────────────────────────
-    if submitted:
-        errors = []
-        if inv_action not in NO_SECURITY_ACTIONS and not inv_security:
-            errors.append("Please select a Security (required for this action).")
-        if inv_action in QTY_REQUIRED_ACTIONS and inv_qty <= 0:
-            errors.append(f"Quantity must be > 0 for action '{inv_action}'.")
-        if enable_linked and not linked_acc_id:
-            errors.append("Please select a linked cash account.")
-
-        if errors:
-            for e in errors:
-                st.error(e)
-        else:
-            # ── Auto-calculate total amount ────────────────────────────────────
-            if inv_total_override != 0:
-                calc_total = inv_total_override
-            elif inv_qty > 0 and inv_price > 0:
-                if inv_action == 'Buy':
-                    calc_total = inv_qty * inv_price + inv_comm
-                elif inv_action == 'Sell':
-                    calc_total = inv_qty * inv_price - inv_comm
-                else:
-                    calc_total = inv_qty * inv_price
-            else:
-                calc_total = inv_total_override  # may be zero (e.g. ShrIn at no cost)
-
-            try:
-                with get_db_fn() as conn:
-                    cur = conn.cursor()
-
-                    # 1. Insert the Investments row (Transactions_Id filled below)
-                    cur.execute(
-                        """
-                        INSERT INTO Investments
-                            (Accounts_Id, Securities_Id, Date, Action,
-                             Quantity, Price_Per_Share, Commission, Total_Amount, Description)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        RETURNING Investments_Id
-                        """,
-                        (
-                            acc_id,
-                            inv_security,
-                            inv_date,
-                            inv_action,
-                            inv_qty   if inv_qty   > 0 else None,
-                            inv_price if inv_price > 0 else None,
-                            inv_comm  if inv_comm  > 0 else None,
-                            calc_total if calc_total != 0 else None,
-                            inv_memo or None,
-                        ),
-                    )
-                    investments_id = cur.fetchone()[0]
-
-                    # 2. Linked cash account transfer (mirrors qif_importer X-type logic)
-                    if enable_linked and linked_acc_id and inv_action in LINKED_CAPABLE:
-                        if inv_action in CASH_OUT_ACTIONS:
-                            cash_tx_amount = -abs(calc_total)
-                        else:
-                            cash_tx_amount = abs(calc_total)
-
-                        # Security name becomes the payee and description on the cash side
-                        sec_name = sec_options.get(inv_security) if inv_security else None
-                        payee_id = get_or_create_payee_id(cur, sec_name) if sec_name else None
-                        cash_description = sec_name or inv_memo or inv_action
-
-                        # Determine target amount when currencies differ
-                        if linked_acc_curr and linked_acc_curr != acc_currencies_id:
-                            # Use user-entered override or fx-converted amount
-                            if linked_target_amount and linked_target_amount != 0:
-                                target_amt = abs(linked_target_amount)
-                            else:
-                                target_amt = abs(calc_total) * fx_rate
-                            # Re-fetch FX rate for the actual transaction date
-                            actual_fx = get_latest_fx_rate(cur, acc_currencies_id, linked_acc_curr, inv_date)
-                            if linked_target_amount == 0:
-                                target_amt = abs(calc_total) * actual_fx
-                            cash_tx_amount_linked = -abs(target_amt) if inv_action in CASH_OUT_ACTIONS else abs(target_amt)
-                        else:
-                            cash_tx_amount_linked = cash_tx_amount
-                            target_amt = None
-
-                        cur.execute(
-                            """
-                            INSERT INTO Transactions
-                                (Accounts_Id, Date, Payees_Id, Description,
-                                 Total_Amount, Cleared,
-                                 Accounts_Id_Target, Total_Amount_Target, Transfers_Id)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                            RETURNING Transactions_Id
-                            """,
-                            (
-                                linked_acc_id,
-                                inv_date,
-                                payee_id,
-                                cash_description,
-                                cash_tx_amount_linked,
-                                True,
-                                None,   # brokerage side has no Transactions row
-                                None,
-                                None,
-                            ),
-                        )
-                        linked_tx_id = cur.fetchone()[0]
-
-                        # Back-fill Transactions_Id on the Investments row
-                        cur.execute(
-                            "UPDATE Investments SET Transactions_Id = %s WHERE Investments_Id = %s",
-                            (linked_tx_id, investments_id),
-                        )
-
-                st.success("✅ Investment transaction saved!")
-                update_holdings_fn()
-                if acc_type in ('Brokerage', 'Margin', 'Other Investment'):
-                    update_investment_balances_fn()
-                else:
-                    from database.crud import update_pension_balances
-                    update_pension_balances()
-
-                st.session_state['inv_form_reset'] = rc + 1
-                st.rerun()
-
-            except Exception as exc:
-                st.error(f"Error saving investment transaction: {exc}")
-
-
 def render_register():
     """Render the Register page."""
     st.title("📝 Account Transactions Register")
@@ -826,7 +541,7 @@ def render_register():
 
             if 'df_securities' not in st.session_state:
                 st.session_state.df_securities = pd.read_sql(
-                    "SELECT Securities_Id, Securities_Name, Currencies_Id FROM Securities", conn)
+                    "SELECT Securities_Id, Securities_Name FROM Securities", conn)
 
             if 'df_cat_list' not in st.session_state:
                 query_cat_hierarchy = """
@@ -1392,93 +1107,87 @@ def render_register():
         with t_view:
             _render_transaction_table(acc_id, payee_options, acc_options, cat_options, "bank")
     else:
-        cash_view, tab_inv_view, tab_inv_new, tab_view_hold, tab_edit_hold = st.tabs([
-            "👁️ Cash Transaction Register", "📓 Investment Register",
-            "➕ New Investment Transaction", "📊 Current Holdings", "✏️ Edit Holdings"
-        ])
+        cash_view, tab_reg, tab_view_hold, tab_edit_hold = st.tabs(["👁️ Cash Transaction Register", "📓 Investment Register", "📊 Current Holdings", "✏️ Edit Holdings"])
         with cash_view:
             _render_transaction_table(acc_id, payee_options, acc_options, cat_options, "cash")
 
-        # ── New investment transaction form ────────────────────────────────────
-        with tab_inv_new:
-            _render_new_investment_form(
-                acc_id, acc_type, df_accs, df_securities, get_db,
-                update_holdings, update_investment_balances
-            )
-
-        with tab_inv_view:
+        with tab_reg:
 
             with get_db() as conn:
                 df_inv = pd.read_sql(f"SELECT * FROM Investments WHERE Accounts_Id = {acc_id} ORDER BY Date DESC", conn)
 
             column_order = [
-                "investments_id",
-                "accounts_id",
-                "date",
-                "securities_id",
-                "action",
-                "quantity",
-                "price_per_share",
-                "commission",
-                "total_amount",
+                "investments_id", 
+                "accounts_id",        
+                "date",               
+                "securities_id",      
+                "action", 
+                "quantity", 
+                "price_per_share", 
+                "commission", 
+                "total_amount", 
                 "description",
-                "Transactions_Id",
-                "embedding",
+                "embedding"
             ]
             df_inv = df_inv[[col for col in column_order if col in df_inv.columns]]
 
-            # Build full sec_options from df_securities for the editor (all securities, not currency-filtered)
-            _full_sec_options = df_securities.set_index('securities_id')['securities_name'].to_dict()
-
             edited_df = st.data_editor(
-                df_inv,
-                num_rows="dynamic",
+                df_inv, 
+                num_rows="dynamic", 
                 key="inv_reg",
-                width="stretch",
+                width="stretch", 
                 column_config={
                     "investments_id": st.column_config.NumberColumn(
-                        "Transaction ID",
+                        "Transaction ID", 
                         disabled=True
-                    ),
-                    "accounts_id": None,
+                    ),                
+                #    "accounts_id": st.column_config.SelectboxColumn(
+                #        "Account", 
+                #        options=list(acc_options.keys()), 
+                #        format_func=lambda x: acc_options.get(x, "Unknown"),
+                #        disabled=True
+                #    ),               
+                    "accounts_id": None,  # Hiding the duplicate accounts_id column
+                #    "securities_id": st.column_config.NumberColumn("Security ID"),
                     "date": st.column_config.DateColumn(
-                        "Date",
+                        "Date", 
                         format="DD/MM/YYYY"
                     ),
                     "securities_id": st.column_config.SelectboxColumn(
-                        "Security",
-                        options=list(_full_sec_options.keys()),
-                        format_func=lambda x: _full_sec_options.get(x, "Unknown"),
+                        "Security", 
+                        options=list(sec_options.keys()), 
+                        format_func=lambda x: sec_options.get(x, "Unknown"),
                         width="large"
-                    ),
+                    ),                
+                #    "action": st.column_config.TextColumn("Action"),
                     "action": st.column_config.SelectboxColumn(
-                        "Action",
+                        "Action", 
                         options=['Buy', 'Sell', 'Dividend', 'Reinvest', 'Split', 'ShrIn', 'ShrOut', 'IntInc', 'CashIn', 'CashOut', 'Vest', 'Expire', 'Grant', 'Exercise', 'MiscExp', 'RtrnCap'],
                         required=True
-                    ),
+                    ),                
                     "quantity": st.column_config.NumberColumn(
-                        "Quantity",
-                        format="%,.8f",
+                        "Quantity", 
+                        format="%,.8f",  # More decimals for cryptos
                     ),
                     "price_per_share": st.column_config.NumberColumn(
-                        "Price",
-                        format="%,.4f",
+                        "Price", 
+                        format="%,.4f", # Διαχωριστικό χιλιάδων και σύμβολο νομίσματος
                     ),
                     "commission": st.column_config.NumberColumn(
-                        "Commission",
+                        "Commission", 
                         format="%,.4f"
                     ),
                     "total_amount": st.column_config.NumberColumn(
-                        "Total Amount",
+                        "Total Amount", 
                         format="%,.4f"
                     ),
                     "description": st.column_config.TextColumn(
                         "Memo",
                         width="large"
                     ),
-                    "Transactions_Id": None,  # hidden — used for cascade delete/update
-                    "embedding": None,
+                    "embedding": None # Hiding the column embedding since it's huge and not needed for editing
                 },
+            #    hide_index=True # Optional: hides the numbering 0, 1, 2... at the left, but then not able to select a record to delete
             )
 
             if not edited_df.equals(df_inv):

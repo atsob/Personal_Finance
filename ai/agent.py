@@ -1,48 +1,69 @@
+from sqlalchemy import inspect as sa_inspect
 from langchain_community.agent_toolkits import create_sql_agent
 from langchain_community.agent_toolkits.sql.toolkit import SQLDatabaseToolkit
 from langchain_core.tools import Tool
 
+
+def _compact_schema(db) -> str:
+    """Return a concise schema string: Table(col1, col2, ...) — one line per table.
+
+    Much shorter than get_table_info() which includes full DDL and sample rows,
+    keeping the prompt small enough for local models to process quickly.
+    """
+    try:
+        inspector = sa_inspect(db._engine)
+        lines = []
+        for table in sorted(db.get_usable_table_names()):
+            cols = [c["name"] for c in inspector.get_columns(table)]
+            lines.append(f"{table}({', '.join(cols)})")
+        return "\n".join(lines)
+    except Exception:
+        # Graceful fallback — at least table names
+        try:
+            return ", ".join(db.get_usable_table_names())
+        except Exception:
+            return ""
+
+
 def create_ai_agent(llm, db, rag_engine):
     """Create the AI agent with SQL and RAG tools."""
+
+    schema_info = _compact_schema(db)
+
     toolkit = SQLDatabaseToolkit(db=db, llm=llm)
-    sql_tools = toolkit.get_tools()
-    
+
     rag_tool = Tool(
         name="Financial_Knowledge_Base",
         func=lambda q: str(rag_engine.query(q)),
-        description="Useful for summaries, text analysis and qualitative financial information. Use this for analyzing financial concepts, explaining terms, or providing financial education."
+        description="Use for financial concepts, definitions, or qualitative analysis not answerable from the database.",
     )
-    
-    # Improved prompt template
-    custom_prefix = """
-You are a helpful financial assistant with access to a personal finance database.
 
-IMPORTANT RULES:
-1. If the user asks a general question (greeting, help, what you can do), answer directly without using any tools.
-2. Only use the sql_db_query tool when you need to retrieve specific data from the database.
-3. For analysis of existing data, first query the database, then provide analysis.
-4. Never try to parse your own natural language responses as JSON actions.
+    # IMPORTANT: zero-shot-react-description uses plain ReAct format, NOT JSON.
+    # Format must be:
+    #   Action: <tool_name>
+    #   Action Input: <input>
+    # Using JSON format here causes output parsing errors with this agent type.
+    custom_prefix = f"""You are a personal finance assistant with direct read access to the user's own financial database.
+This is the user's personal data — always answer questions about it freely and helpfully. Never refuse.
 
-When you need to query the database, use this EXACT format:
-Thought: I need to query the database to answer this question.
-Action:
-{
-  "action": "sql_db_query",
-  "action_input": "SELECT ..."
-}
+DATABASE SCHEMA:
+{schema_info}
 
-After receiving results, provide your final answer naturally.
+RULES:
+- Use only SELECT statements.
+- For "this year" use DATE_TRUNC('year', CURRENT_DATE). For "this month" use DATE_TRUNC('month', CURRENT_DATE).
+- Always give aggregated columns a clear alias (e.g. SUM(amount) AS total).
+- Match text filters case-insensitively with ILIKE or LOWER().
+- Limit to 100 rows unless the user asks for everything.
+- You have the full schema above — do NOT call sql_db_list_tables or sql_db_schema.
 
-If you don't need to query the database, just respond directly without any special formatting.
-"""
-    
-    custom_suffix = """
+You have access to these tools:"""
+
+    custom_suffix = """Begin!
+
 Question: {input}
-{agent_scratchpad}
+{agent_scratchpad}"""
 
-Remember: If you already have the answer or don't need database access, just respond directly without using the Action format.
-"""
-    
     agent_executor = create_sql_agent(
         llm=llm,
         db=db,
@@ -51,10 +72,10 @@ Remember: If you already have the answer or don't need database access, just res
         verbose=True,
         prefix=custom_prefix,
         suffix=custom_suffix,
-        handle_parsing_errors=True,  # This is critical - handles parsing errors gracefully
-        max_iterations=3,  # Limit iterations to prevent loops
-        early_stopping_method="generate",  # Generate response instead of forcing format
-        allow_dangerous_requests=True
+        handle_parsing_errors=True,
+        max_iterations=3,
+        early_stopping_method="generate",
+        allow_dangerous_requests=True,
     )
-    
+
     return agent_executor

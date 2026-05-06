@@ -1,7 +1,5 @@
 import streamlit as st
 from langchain_community.chat_message_histories import StreamlitChatMessageHistory
-from langchain_community.agent_toolkits.sql.toolkit import SQLDatabaseToolkit
-from langchain_community.agent_toolkits import create_sql_agent
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.chat_history import BaseChatMessageHistory
 
@@ -64,34 +62,21 @@ def main():
     except Exception as e:
         pass
     
-    # Initialize agent if RAG is available
-    if rag_engine:
-        agent_executor = create_ai_agent(llm, db, rag_engine)
-        agent_with_history = RunnableWithMessageHistory(
-            agent_executor,
-            get_session_history,
-            input_messages_key="input",
-            history_messages_key="chat_history",
-        )
-    else:
-        # Create agent without RAG with better error handling
-        toolkit = SQLDatabaseToolkit(db=db, llm=llm)
-        agent_executor = create_sql_agent(
-            llm=llm,
-            db=db,
-            agent_type="zero-shot-react-description",
-            verbose=True,
-            handle_parsing_errors=True,  # Critical
-            max_iterations=3,
-            early_stopping_method="generate",
-            allow_dangerous_requests=True
-        )        
-        agent_with_history = RunnableWithMessageHistory(
-            agent_executor,
-            get_session_history,
-            input_messages_key="input",
-            history_messages_key="chat_history",
-        )
+    # Always use create_ai_agent (schema-injected, correct ReAct format).
+    # When RAG is unavailable pass a no-op so the tool is present but inert.
+    if not rag_engine:
+        class _NoOpRag:
+            def query(self, q):
+                return "RAG index not available."
+        rag_engine = _NoOpRag()
+
+    agent_executor = create_ai_agent(llm, db, rag_engine)
+    agent_with_history = RunnableWithMessageHistory(
+        agent_executor,
+        get_session_history,
+        input_messages_key="input",
+        history_messages_key="chat_history",
+    )
     
     # Sidebar navigation
     st.sidebar.title("💰 Personal Finance")
@@ -127,7 +112,7 @@ def main():
         elif menu == "🌍 Market Data":
             render_market_data(conn)
         elif menu == "🧠 AI Assistant":
-            render_ai_assistant(llm, agent_with_history, rag_engine)
+            render_ai_assistant(llm, agent_with_history, rag_engine, db=db)
         elif menu == "🛠️ Tools":
             render_tools(conn)
         elif menu == "🔧 Settings":

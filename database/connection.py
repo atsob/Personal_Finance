@@ -79,5 +79,5 @@ def get_sql_database() -> SQLDatabase:
             'historical_fx', 'historical_prices', 'holdings',
             'investments', 'payees', 'securities'
         ],
-        sample_rows_in_table_info=30
+        sample_rows_in_table_info=0
     )

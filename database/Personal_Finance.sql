@@ -86,12 +86,14 @@ CREATE TABLE Accounts (
     IBAN VARCHAR(34),
     Currencies_Id INTEGER NOT NULL REFERENCES Currencies(Currencies_Id),
 	Credit_Limit NUMERIC(18, 2) DEFAULT 0,
-    Accounts_Balance NUMERIC(28, 18) DEFAULT 0, -- Υψηλή ακρίβεια για Crypto/Satoshi
     Is_Active BOOLEAN DEFAULT TRUE,
+    Accounts_Id_Linked INTEGER REFERENCES Accounts(Accounts_Id), -- for investment accounts: default linked cash/bank account
+    Accounts_Balance NUMERIC(28, 18) DEFAULT 0, -- Υψηλή ακρίβεια για Crypto/Satoshi
     embedding vector(768)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_id ON Accounts(Accounts_Id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_name ON Accounts(Accounts_Name);
+-- Migrate existing databases: ALTER TABLE Accounts ADD COLUMN IF NOT EXISTS Accounts_Id_Linked INTEGER REFERENCES Accounts(Accounts_Id);
 
 CREATE TABLE Holdings (
     Holdings_Id SERIAL PRIMARY KEY,
@@ -215,9 +217,14 @@ CREATE TABLE Investments (
     Commission NUMERIC(20, 8) DEFAULT 0,
     Total_Amount NUMERIC(28, 18),      -- Συνολικό ποσό μετρητών που κινήθηκε
     Description TEXT,
+    Transactions_Id INTEGER REFERENCES Transactions(Transactions_Id), -- cash-side Transactions row for BuyX/SellX/DivX etc.
     embedding vector(768)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_investments_id ON Investments(Investments_Id);
+CREATE INDEX IF NOT EXISTS idx_investments_linked_tx ON Investments(Transactions_Id) WHERE Transactions_Id IS NOT NULL;
+-- Migrate existing databases:
+-- ALTER TABLE Investments ADD COLUMN IF NOT EXISTS Transactions_Id INTEGER REFERENCES Transactions(Transactions_Id);
+-- CREATE INDEX IF NOT EXISTS idx_investments_linked_tx ON Investments(Transactions_Id) WHERE Transactions_Id IS NOT NULL;
 
 -- FUNCTION: public.update_holdings_from_investments()
 
