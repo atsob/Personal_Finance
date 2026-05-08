@@ -3,7 +3,7 @@ CREATE EXTENSION IF NOT EXISTS vector;
 CREATE TYPE Institutions_Type AS ENUM ('Bank', 'Credit Union', 'Insurance', 'Pension Fund', 'Broker', 'Crypto Exchange', 'Internal', 'Other');
 CREATE TYPE Accounts_Type AS ENUM ('Cash', 'Checking', 'Savings', 'Credit Card', 'Brokerage', 'Pension', 'Other Investment', 'Margin', 'Loan', 'Real Estate', 'Vehicle', 'Asset', 'Liability', 'Other');
 CREATE TYPE Securities_Type AS ENUM ('Stock', 'ETF', 'Bond', 'Mutual Fund', 'Crypto', 'Option', 'Commodity', 'PF_Unit');
-CREATE TYPE Categories_Type AS ENUM ('Income', 'Expense', 'Transfer', 'Investment_Buy', 'Investment_Sell', 'Dividend', 'Interest', 'Tax', 'Fee');
+CREATE TYPE Categories_Type AS ENUM ('Income', 'Expense', 'Transfer', 'Trading', 'Investment', 'Dividend', 'Interest', 'Tax', 'Fee');
 CREATE TYPE Investments_Action AS ENUM ('Buy', 'Sell', 'Dividend', 'Reinvest', 'Split', 'ShrIn', 'ShrOut', 'IntInc', 'CashIn', 'CashOut', 'Vest', 'Expire', 'Grant', 'Exercise', 'MiscExp', 'RtrnCap');
 CREATE SEQUENCE IF NOT EXISTS transfers_id_seq START 1 INCREMENT 1;
 
@@ -72,12 +72,24 @@ CREATE TABLE Securities (
     Yahoo_Ticker VARCHAR(30),
     TV_Symbol VARCHAR(30),
     TV_Exchange VARCHAR(30),
+    ISIN VARCHAR(12) UNIQUE,
+    Maturity_Date DATE,
+    Coupon_Rate NUMERIC(6,4),
+    Face_Value NUMERIC(20,8),
+    Coupon_Frequency VARCHAR(20) DEFAULT 'Annual',
     embedding vector(768)
 );
+
+ALTER TABLE Securities ADD COLUMN IF NOT EXISTS Maturity_Date      DATE;
+ALTER TABLE Securities ADD COLUMN IF NOT EXISTS Coupon_Rate        NUMERIC(6,4);
+ALTER TABLE Securities ADD COLUMN IF NOT EXISTS Face_Value         NUMERIC(20,8);
+ALTER TABLE Securities ADD COLUMN IF NOT EXISTS Coupon_Frequency   VARCHAR(20) DEFAULT 'Annual';
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_securities_id ON Securities(Securities_Id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_securities_name ON Securities(Securities_Name);
 CREATE INDEX IF NOT EXISTS idx_securities_yahoo_ticker ON Securities(Yahoo_Ticker) WHERE Yahoo_Ticker IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_securities_tv_symbol ON Securities(TV_Symbol) WHERE TV_Symbol IS NOT NULL;
+
 
 CREATE TABLE Accounts (
     Accounts_Id SERIAL PRIMARY KEY,
@@ -223,13 +235,7 @@ CREATE TABLE Investments (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_investments_id ON Investments(Investments_Id);
 CREATE INDEX IF NOT EXISTS idx_investments_linked_tx ON Investments(Transactions_Id) WHERE Transactions_Id IS NOT NULL;
--- Migrate existing databases:
--- ALTER TABLE Investments ADD COLUMN IF NOT EXISTS Transactions_Id INTEGER REFERENCES Transactions(Transactions_Id);
--- CREATE INDEX IF NOT EXISTS idx_investments_linked_tx ON Investments(Transactions_Id) WHERE Transactions_Id IS NOT NULL;
 
--- FUNCTION: public.update_holdings_from_investments()
-
--- DROP FUNCTION IF EXISTS public.update_holdings_from_investments();
 
 CREATE OR REPLACE FUNCTION public.update_holdings_from_investments()
     RETURNS trigger
@@ -361,8 +367,92 @@ ALTER DATABASE "Finance" REFRESH COLLATION VERSION;
 -- Transactions: the historical balance reconstruction queries heavily
 CREATE INDEX idx_transactions_accounts_date ON Transactions(Accounts_Id, Date DESC);
 
--- Investments: used in correlated subqueries for historical quantity reconstruction  
+-- Investments: used in correlated subqueries for historical quantity reconstruction
 CREATE INDEX idx_investments_accsec_date ON Investments(Accounts_Id, Securities_Id, Date DESC);
+
+
+-- ======================================================
+-- ALLOCATION TARGETS
+-- ======================================================
+CREATE TABLE IF NOT EXISTS Allocation_Targets (
+    Securities_Type VARCHAR(50) PRIMARY KEY,
+    Target_Pct NUMERIC(5,2) NOT NULL DEFAULT 0,
+    Notes TEXT
+);
+-- Seed with zeros; user can fill in via Settings or direct SQL
+INSERT INTO Allocation_Targets (Securities_Type, Target_Pct) VALUES
+    ('Stock',      0),
+    ('ETF',        0),
+    ('Bond',       0),
+    ('Mutual Fund',0),
+    ('Crypto',     0),
+    ('Option',     0),
+    ('Commodity',  0),
+    ('PF_Unit',    0)
+ON CONFLICT (Securities_Type) DO NOTHING;
+
+-- ======================================================
+-- MATERIALIZED VIEWS  (refresh with: SELECT refresh_mv_prices_fx();)
+-- ======================================================
+
+-- Fast latest-price lookup (replaces DISTINCT ON correlated subqueries)
+CREATE MATERIALIZED VIEW IF NOT EXISTS mv_latest_prices AS
+    SELECT DISTINCT ON (Securities_Id)
+        Securities_Id,
+        Date  AS price_date,
+        Close AS latest_close
+    FROM Historical_Prices
+    ORDER BY Securities_Id, Date DESC
+WITH DATA;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_latest_prices ON mv_latest_prices(Securities_Id);
+
+-- Fast latest-FX lookup
+CREATE MATERIALIZED VIEW IF NOT EXISTS mv_latest_fx AS
+    SELECT DISTINCT ON (Currencies_Id_1)
+        Currencies_Id_1,
+        Date     AS fx_date,
+        FX_Rate  AS latest_rate
+    FROM Historical_FX
+    ORDER BY Currencies_Id_1, Date DESC
+WITH DATA;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_latest_fx ON mv_latest_fx(Currencies_Id_1);
+
+-- Helper function to refresh both views in one call
+CREATE OR REPLACE FUNCTION refresh_mv_prices_fx()
+RETURNS VOID LANGUAGE plpgsql AS $$
+BEGIN
+    REFRESH MATERIALIZED VIEW CONCURRENTLY mv_latest_prices;
+    REFRESH MATERIALIZED VIEW CONCURRENTLY mv_latest_fx;
+END;
+$$;
+
+
+-- ======================================================
+-- HISTORICAL_PRICES PARTITIONING  (migration guide)
+-- ======================================================
+-- If Historical_Prices becomes very large, partition by year:
+--
+-- 1. Rename original:
+--    ALTER TABLE Historical_Prices RENAME TO Historical_Prices_old;
+--
+-- 2. Create partitioned table:
+--    CREATE TABLE Historical_Prices (
+--        Securities_Id INTEGER NOT NULL REFERENCES Securities(Securities_Id) ON DELETE CASCADE,
+--        Date DATE NOT NULL,
+--        Close NUMERIC(20, 8) NOT NULL,
+--        High NUMERIC(20, 8), Low NUMERIC(20, 8), Volume BIGINT,
+--        embedding vector(768),
+--        PRIMARY KEY (Securities_Id, Date)
+--    ) PARTITION BY RANGE (Date);
+--
+-- 3. Create year partitions:
+--    CREATE TABLE Historical_Prices_2020 PARTITION OF Historical_Prices
+--        FOR VALUES FROM ('2020-01-01') TO ('2021-01-01');
+--    -- repeat for each year…
+--
+-- 4. Copy data and drop old table:
+--    INSERT INTO Historical_Prices SELECT * FROM Historical_Prices_old;
+--    DROP TABLE Historical_Prices_old;
 
 -- Historical_FX: scanned per-transaction in correlated subqueries
 CREATE INDEX idx_fx_currency_date ON Historical_FX(Currencies_Id_1, Date DESC);

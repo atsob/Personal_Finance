@@ -213,6 +213,25 @@ def download_historical_prices_from_yahoo(tsperiod=None, target_sec_id=None):
         cur.close()
         conn.close()
 
+    refresh_materialized_views()
+
+
+# ======================================================
+# MATERIALIZED VIEW REFRESH
+# ======================================================
+
+def refresh_materialized_views():
+    """Refresh mv_latest_prices and mv_latest_fx after price/FX downloads."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT refresh_mv_prices_fx();")
+        conn.commit()
+        logging.info("Materialized views refreshed.")
+    except Exception as e:
+        logging.warning(f"MV refresh skipped (views may not exist yet): {e}")
+    finally:
+        conn.close()
 
 
 # ======================================================
@@ -414,6 +433,8 @@ def download_historical_prices_from_tradingview(tsperiod="1m", target_sec_id=Non
         cur.close()
         conn.close()
 
+    refresh_materialized_views()
+
 
 def download_bond_prices_from_solidus():
     pdf_url = "https://www.solidus.gr/AppFol/appDetails/RadControls/fol1/Bonds/SOLIDUS_BOND_LIST.pdf"
@@ -505,3 +526,4 @@ def download_bond_prices_from_solidus():
         finally:
             cur.close()
             conn.close()
+

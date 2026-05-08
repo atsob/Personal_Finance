@@ -20,3 +20,4 @@ pgvector>=0.3.0
 pdfplumber
 requests
 tradingview-datafeed
+schedule>=1.2.0

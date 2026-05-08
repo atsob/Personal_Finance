@@ -181,7 +181,7 @@ def render_settings():
                     "Category Name",
                     width="medium"
                 ),
-                "categories_type": st.column_config.SelectboxColumn("Type", options=['Income', 'Expense', 'Transfer', 'Investment_Buy', 'Investment_Sell', 'Dividend', 'Interest', 'Tax', 'Fee']),
+                "categories_type": st.column_config.SelectboxColumn("Type", options=['Income', 'Expense', 'Transfer', 'Trading', 'Investment', 'Dividend', 'Interest', 'Tax', 'Fee']),
                 "categories_id_parent": st.column_config.SelectboxColumn(
                     "Parent Category", options=list(cat_options.keys()), 
                     format_func=lambda x: cat_options.get(x, "Unknown"), width="large"
@@ -357,7 +357,7 @@ def render_settings():
     
     with t4:
         with get_db() as conn:
-            df = pd.read_sql("SELECT Securities_Id, Ticker, Securities_Name, Securities_Type, Currencies_Id, Sector, Industry, Analyst_Rating, Analyst_Target_Price, Is_Active, Yahoo_Ticker, TV_Symbol, TV_Exchange, embedding, COALESCE((SELECT COUNT(*) FROM Investments WHERE Investments.Securities_Id = Securities.Securities_Id), 0) as investment_count FROM Securities ORDER BY Securities_Name", conn)
+            df = pd.read_sql("SELECT Securities_Id, Ticker, Securities_Name, Securities_Type, Currencies_Id, Sector, Industry, Analyst_Rating, Analyst_Target_Price, Is_Active, Yahoo_Ticker, TV_Symbol, TV_Exchange, ISIN, Maturity_Date, Coupon_Rate, Face_Value, Coupon_Frequency, embedding, COALESCE((SELECT COUNT(*) FROM Investments WHERE Investments.Securities_Id = Securities.Securities_Id), 0) as investment_count FROM Securities ORDER BY Securities_Name", conn)
 
         _sec_sort_labels = {
             "ticker":    "Ticker",
@@ -389,11 +389,13 @@ def render_settings():
                 "securities_id": None, # Hiding the securities_id since it's not very useful to edit and clutters the UI
                 "ticker": st.column_config.TextColumn(
                     "Ticker Symbol",
-                    width="medium"
+                    width="medium",
+                    pinned=True
                 ),
                 "securities_name": st.column_config.TextColumn(
                     "Security Name",
-                    width="medium"
+                    width="medium",
+                    pinned=True
                 ),
                 "securities_type": st.column_config.SelectboxColumn(
                     "Type", 
@@ -435,6 +437,29 @@ def render_settings():
                 ),
                 "tv_exchange": st.column_config.TextColumn(
                     "TV Exchange",
+                    width="small"
+                ),
+                "isin": st.column_config.TextColumn(
+                    "ISIN",
+                    width="small"
+                ),
+                "maturity_date": st.column_config.DateColumn(
+                    "Maturity Date",
+                    width="small"
+                ),
+                "coupon_rate": st.column_config.NumberColumn(
+                    "Coupon Rate (%)",
+                    width="small",
+                    format="%.4f"
+                ),
+                "face_value": st.column_config.NumberColumn(
+                    "Face Value",
+                    width="small",
+                    format="%,.2f"
+                ),
+                "coupon_frequency": st.column_config.SelectboxColumn(
+                    "Coupon Frequency",
+                    options=["Annual", "Semi-Annual", "Quarterly", "Monthly", "At Maturity"],
                     width="small"
                 ),
                 "investment_count": st.column_config.NumberColumn(
@@ -735,3 +760,5 @@ def render_settings():
         if not edited_acc.equals(df):
             save_df = edited_acc.drop(columns=["Balance"])
             save_changes(df.drop(columns=["Balance"]), save_df, "Accounts", "accounts_id")
+
+        

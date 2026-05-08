@@ -4,6 +4,7 @@ from database.connection import get_connection
 
 from datetime import datetime, timedelta
 
+@st.cache_data(ttl=3600)
 def get_category_hierarchy():
     """Get category hierarchy with full paths"""
     conn = get_connection()
@@ -1126,5 +1127,484 @@ def get_income_expense_data(start_date, end_date, category_id=None, cash_account
         df['month_date'] = pd.to_datetime(df['month_date'], errors='coerce')
         if hasattr(df['month_date'].dt, 'tz') and df['month_date'].dt.tz is not None:
             df['month_date'] = df['month_date'].dt.tz_localize(None)
-    
+
+    return df
+
+
+# ======================================================
+# CASH FLOW FORECAST
+# ======================================================
+
+@st.cache_data(ttl=300)
+def get_cash_flow_forecast():
+    """
+    Returns two DataFrames:
+      - df_future: explicitly scheduled future transactions (Date > today)
+      - df_recurring: detected recurring payees with projected next amount & date
+    All amounts in EUR.
+    """
+    conn = get_connection()
+
+    # 1. Explicitly entered future transactions
+    df_future = pd.read_sql("""
+        WITH LatestFX AS (
+            SELECT DISTINCT ON (Currencies_Id_1) Currencies_Id_1, FX_Rate
+            FROM Historical_FX ORDER BY Currencies_Id_1, Date DESC
+        )
+        SELECT
+            t.Date,
+            p.Payees_Name,
+            a.Accounts_Name,
+            c.Currencies_ShortName AS currency,
+            s.Amount,
+            CASE WHEN c.Currencies_ShortName = 'EUR' THEN s.Amount
+                 ELSE s.Amount * COALESCE(fx.FX_Rate, 1) END AS amount_eur,
+            cat.Categories_Name AS category
+        FROM Transactions t
+        JOIN Accounts a ON t.Accounts_Id = a.Accounts_Id
+        JOIN Currencies c ON a.Currencies_Id = c.Currencies_Id
+        LEFT JOIN Payees p ON t.Payees_Id = p.Payees_Id
+        LEFT JOIN Splits s ON t.Transactions_Id = s.Transactions_Id
+        LEFT JOIN Categories cat ON s.Categories_Id = cat.Categories_Id
+        LEFT JOIN LatestFX fx ON fx.Currencies_Id_1 = c.Currencies_Id
+        WHERE t.Date > CURRENT_DATE
+        ORDER BY t.Date ASC
+    """, conn)
+
+    # 2. Recurring pattern detection: payees with >= 2 transactions in last 90 days
+    df_recurring = pd.read_sql("""
+        WITH recent AS (
+            -- Payee-based: transactions with a known payee
+            SELECT
+                'p_' || t.Payees_Id::text  AS group_key,
+                p.Payees_Name              AS group_label,
+                t.Date,
+                SUM(s.Amount)              AS amount,
+                a.Currencies_Id
+            FROM Transactions t
+            JOIN Accounts a   ON t.Accounts_Id   = a.Accounts_Id
+            LEFT JOIN Payees p ON t.Payees_Id    = p.Payees_Id
+            LEFT JOIN Splits s ON t.Transactions_Id = s.Transactions_Id
+            WHERE t.Date >= CURRENT_DATE - INTERVAL '120 days'
+              AND t.Payees_Id IS NOT NULL
+            GROUP BY t.Payees_Id, p.Payees_Name, t.Date, a.Currencies_Id
+            UNION ALL
+            -- Category-based: transactions without a payee, grouped by category
+            SELECT
+                'c_' || MIN(s2.Categories_Id)::text  AS group_key,
+                MIN(cat.Categories_Name)             AS group_label,
+                t.Date,
+                SUM(s2.Amount)                       AS amount,
+                a.Currencies_Id
+            FROM Transactions t
+            JOIN Accounts a   ON t.Accounts_Id      = a.Accounts_Id
+            LEFT JOIN Splits s2  ON t.Transactions_Id = s2.Transactions_Id
+            LEFT JOIN Categories cat ON s2.Categories_Id = cat.Categories_Id
+            WHERE t.Date >= CURRENT_DATE - INTERVAL '120 days'
+              AND t.Payees_Id IS NULL
+              AND s2.Categories_Id IS NOT NULL
+            GROUP BY t.Transactions_Id, t.Date, a.Currencies_Id
+        ),
+        with_lag AS (
+            SELECT *,
+                (Date - LAG(Date) OVER (PARTITION BY group_key ORDER BY Date))::float AS days_since_prev
+            FROM recent
+        ),
+        stats AS (
+            SELECT
+                group_key,
+                group_label                         AS Payees_Name,
+                COUNT(*)                            AS tx_count,
+                AVG(amount)                         AS avg_amount,
+                STDDEV(amount)                      AS std_amount,
+                AVG(days_since_prev)                AS avg_days_between,
+                MAX(Date)                           AS last_date,
+                Currencies_Id
+            FROM with_lag
+            GROUP BY group_key, group_label, Currencies_Id
+            HAVING COUNT(*) >= 2
+        ),
+        fx AS (
+            SELECT DISTINCT ON (Currencies_Id_1) Currencies_Id_1, FX_Rate
+            FROM Historical_FX ORDER BY Currencies_Id_1, Date DESC
+        )
+        SELECT
+            s.Payees_Name,
+            s.tx_count,
+            ROUND(s.avg_amount::numeric, 2)         AS avg_amount,
+            ROUND(s.std_amount::numeric, 2)         AS std_amount,
+            ROUND(s.avg_days_between::numeric, 0)   AS avg_days_between,
+            s.last_date,
+            (s.last_date + ROUND(s.avg_days_between)::int)::date AS next_expected_date,
+            c.Currencies_ShortName                  AS currency,
+            ROUND((s.avg_amount * COALESCE(fx.FX_Rate, 1))::numeric, 2) AS avg_amount_eur
+        FROM stats s
+        JOIN Currencies c ON s.Currencies_Id = c.Currencies_Id
+        LEFT JOIN fx      ON fx.Currencies_Id_1 = s.Currencies_Id
+        ORDER BY next_expected_date ASC
+    """, conn)
+
+    conn.close()
+    if not df_future.empty:
+        df_future['date'] = pd.to_datetime(df_future['date'])
+    if not df_recurring.empty:
+        df_recurring['last_date'] = pd.to_datetime(df_recurring['last_date'])
+        df_recurring['next_expected_date'] = pd.to_datetime(df_recurring['next_expected_date'])
+    return df_future, df_recurring
+
+
+# ======================================================
+# DIVIDEND INCOME TRACKER
+# ======================================================
+
+@st.cache_data(ttl=3600)
+def get_dividend_tracker_data():
+    """Monthly dividend and interest income, YOC per security, and 12-month projection."""
+    conn = get_connection()
+
+    df = pd.read_sql("""
+        WITH fx AS (
+            SELECT DISTINCT ON (Currencies_Id_1) Currencies_Id_1, FX_Rate
+            FROM Historical_FX ORDER BY Currencies_Id_1, Date DESC
+        ),
+        income AS (
+            SELECT
+                DATE_TRUNC('month', i.Date)::date      AS month,
+                i.Securities_Id,
+                s.Securities_Name,
+                s.Securities_Type,
+                a.Accounts_Name,
+                a.Currencies_Id,
+                SUM(i.Total_Amount)                    AS income_native,
+                SUM(i.Total_Amount * COALESCE(fx.FX_Rate, 1)) AS income_eur,
+                i.Action
+            FROM Investments i
+            JOIN Securities s ON i.Securities_Id = s.Securities_Id
+            JOIN Accounts a   ON i.Accounts_Id   = a.Accounts_Id
+            LEFT JOIN fx      ON fx.Currencies_Id_1 = a.Currencies_Id
+            WHERE i.Action IN ('Dividend', 'IntInc', 'Reinvest')
+            GROUP BY month, i.Securities_Id, s.Securities_Name, s.Securities_Type,
+                     a.Accounts_Name, a.Currencies_Id, i.Action
+        ),
+        cost_basis AS (
+            SELECT
+                i.Securities_Id,
+                i.Accounts_Id,
+                SUM(ABS(i.Total_Amount) * COALESCE(fx.FX_Rate, 1)) AS cost_eur
+            FROM Investments i
+            JOIN Accounts a ON i.Accounts_Id = a.Accounts_Id
+            LEFT JOIN fx    ON fx.Currencies_Id_1 = a.Currencies_Id
+            WHERE i.Action = 'Buy'
+            GROUP BY i.Securities_Id, i.Accounts_Id
+        )
+        SELECT
+            i.month,
+            i.Securities_Name,
+            i.Securities_Type,
+            i.Accounts_Name,
+            i.Action,
+            ROUND(i.income_eur::numeric, 2) AS income_eur,
+            ROUND((SUM(i.income_eur) OVER (
+                PARTITION BY i.Securities_Id
+                ORDER BY i.month
+                ROWS BETWEEN 11 PRECEDING AND CURRENT ROW
+            ))::numeric, 2) AS trailing_12m_eur,
+            ROUND(cb.cost_eur::numeric, 2)  AS cost_basis_eur
+        FROM income i
+        LEFT JOIN cost_basis cb
+               ON cb.Securities_Id = i.Securities_Id
+        ORDER BY i.month DESC, i.income_eur DESC
+    """, conn)
+
+    conn.close()
+    if not df.empty:
+        df['month'] = pd.to_datetime(df['month'])
+    return df
+
+
+# ======================================================
+# ASSET ALLOCATION VS TARGET
+# ======================================================
+
+@st.cache_data(ttl=300)
+def get_asset_allocation_data():
+    """Current allocation by Securities_Type in EUR vs. targets from Allocation_Targets."""
+    conn = get_connection()
+
+    df = pd.read_sql("""
+        WITH fx AS (
+            SELECT DISTINCT ON (Currencies_Id_1) Currencies_Id_1, FX_Rate
+            FROM Historical_FX ORDER BY Currencies_Id_1, Date DESC
+        ),
+        prices AS (
+            SELECT DISTINCT ON (Securities_Id) Securities_Id, Close
+            FROM Historical_Prices ORDER BY Securities_Id, Date DESC
+        ),
+        holdings_value AS (
+            SELECT
+                s.Securities_Type::text AS securities_type,
+                SUM(h.Quantity * COALESCE(p.Close, 0) * COALESCE(fx.FX_Rate, 1)) AS value_eur
+            FROM Holdings h
+            JOIN Securities s ON h.Securities_Id = s.Securities_Id
+            JOIN Accounts   a ON h.Accounts_Id   = a.Accounts_Id
+            LEFT JOIN prices p  ON p.Securities_Id = h.Securities_Id
+            LEFT JOIN fx        ON fx.Currencies_Id_1 = s.Currencies_Id
+            WHERE h.Quantity > 0
+            GROUP BY s.Securities_Type
+        ),
+        total AS (SELECT SUM(value_eur) AS grand_total FROM holdings_value)
+        SELECT
+            hv.securities_type,
+            ROUND(hv.value_eur::numeric, 2)                              AS value_eur,
+            ROUND((hv.value_eur / NULLIF(t.grand_total, 0) * 100)::numeric, 2) AS actual_pct,
+            COALESCE(at.Target_Pct, 0)                                   AS target_pct,
+            ROUND((hv.value_eur / NULLIF(t.grand_total, 0) * 100 - COALESCE(at.Target_Pct, 0))::numeric, 2) AS delta_pct
+        FROM holdings_value hv
+        CROSS JOIN total t
+        LEFT JOIN Allocation_Targets at ON at.Securities_Type = hv.securities_type
+        ORDER BY value_eur DESC
+    """, conn)
+
+    conn.close()
+    return df
+
+
+# ======================================================
+# FX EXPOSURE
+# ======================================================
+
+@st.cache_data(ttl=300)
+def get_fx_exposure_data():
+    """Net exposure per currency in EUR and sensitivity to a ±5 % FX move."""
+    conn = get_connection()
+
+    df = pd.read_sql("""
+        WITH fx AS (
+            SELECT DISTINCT ON (Currencies_Id_1) Currencies_Id_1, FX_Rate
+            FROM Historical_FX ORDER BY Currencies_Id_1, Date DESC
+        ),
+        prices AS (
+            SELECT DISTINCT ON (Securities_Id) Securities_Id, Close
+            FROM Historical_Prices ORDER BY Securities_Id, Date DESC
+        ),
+        cash_exp AS (
+            -- Mirrors dashboard logic: all account balances except Brokerage/Margin
+            -- (whose value is captured entirely through Holdings)
+            SELECT
+                a.Currencies_Id,
+                SUM(a.Accounts_Balance) AS balance
+            FROM Accounts a
+            WHERE a.Is_Active = TRUE
+              AND a.Accounts_Type NOT IN ('Brokerage', 'Margin')
+            GROUP BY a.Currencies_Id
+        ),
+        inv_exp AS (
+            SELECT
+                s.Currencies_Id,
+                SUM(h.Quantity * COALESCE(p.Close, 0)) AS value_native
+            FROM Holdings h
+            JOIN Securities s ON h.Securities_Id = s.Securities_Id
+            LEFT JOIN prices p ON p.Securities_Id = h.Securities_Id
+            WHERE h.Quantity > 0
+            GROUP BY s.Currencies_Id
+        ),
+        combined AS (
+            SELECT Currencies_Id, SUM(balance) AS native_exposure FROM cash_exp GROUP BY Currencies_Id
+            UNION ALL
+            SELECT Currencies_Id, SUM(value_native) FROM inv_exp GROUP BY Currencies_Id
+        ),
+        aggregated AS (
+            SELECT Currencies_Id, SUM(native_exposure) AS native_exposure FROM combined GROUP BY Currencies_Id
+        )
+        SELECT
+            c.Currencies_ShortName                                          AS currency,
+            ROUND(a.native_exposure::numeric, 2)                            AS native_exposure,
+            ROUND((a.native_exposure * COALESCE(fx.FX_Rate, 1))::numeric, 2) AS eur_exposure,
+            ROUND((a.native_exposure * COALESCE(fx.FX_Rate, 1) * 0.05)::numeric, 2) AS sensitivity_5pct_eur
+        FROM aggregated a
+        JOIN Currencies c ON c.Currencies_Id = a.Currencies_Id
+        LEFT JOIN fx      ON fx.Currencies_Id_1 = a.Currencies_Id
+        ORDER BY ABS(a.native_exposure * COALESCE(fx.FX_Rate, 1)) DESC
+    """, conn)
+
+    conn.close()
+    return df
+
+
+# ======================================================
+# BOND SCHEDULE
+# ======================================================
+
+@st.cache_data(ttl=3600)
+def get_bond_schedule_data():
+    """Upcoming maturities and coupon cash flows for bond holdings."""
+    conn = get_connection()
+
+    df = pd.read_sql("""
+        WITH fx AS (
+            SELECT DISTINCT ON (Currencies_Id_1) Currencies_Id_1, FX_Rate
+            FROM Historical_FX ORDER BY Currencies_Id_1, Date DESC
+        ),
+        bond_holdings AS (
+            SELECT
+                h.Securities_Id,
+                s.Securities_Name,
+                s.Securities_Type,
+                h.Quantity,
+                s.Maturity_Date,
+                s.Coupon_Rate,
+                s.Face_Value,
+                s.Coupon_Frequency,
+                s.Currencies_Id,
+                c.Currencies_ShortName AS currency
+            FROM Holdings h
+            JOIN Securities s ON h.Securities_Id = s.Securities_Id
+            JOIN Currencies c ON s.Currencies_Id = c.Currencies_Id
+            WHERE h.Quantity > 0
+              AND s.Securities_Type IN ('Bond')
+        )
+        SELECT
+            bh.Securities_Name,
+            bh.Quantity,
+            bh.Face_Value,
+            ROUND((bh.Quantity * COALESCE(bh.Face_Value, 0))::numeric, 2)   AS total_face_eur_native,
+            ROUND((bh.Quantity * COALESCE(bh.Face_Value, 0) * COALESCE(fx.FX_Rate, 1))::numeric, 2) AS total_face_eur,
+            bh.Coupon_Rate,
+            bh.Coupon_Frequency,
+            ROUND((bh.Quantity * COALESCE(bh.Face_Value, 0) * COALESCE(bh.Coupon_Rate, 0) / 100 *
+                CASE bh.Coupon_Frequency
+                    WHEN 'At Maturity'  THEN 0
+                    WHEN 'Semi-Annual'  THEN 0.5
+                    WHEN 'Quarterly'    THEN 0.25
+                    WHEN 'Monthly'      THEN 1.0/12
+                    ELSE 1.0
+                END * COALESCE(fx.FX_Rate, 1))::numeric, 2) AS next_coupon_eur,
+            ROUND((bh.Quantity * COALESCE(bh.Face_Value, 0) * COALESCE(bh.Coupon_Rate, 0) / 100 *
+                CASE bh.Coupon_Frequency
+                    WHEN 'At Maturity'  THEN 0
+                    ELSE 1.0
+                END * COALESCE(fx.FX_Rate, 1))::numeric, 2) AS annual_coupon_eur,
+            bh.Maturity_Date,
+            (bh.Maturity_Date - CURRENT_DATE)            AS days_to_maturity,
+            bh.currency
+        FROM bond_holdings bh
+        LEFT JOIN fx ON fx.Currencies_Id_1 = bh.Currencies_Id
+        ORDER BY bh.Maturity_Date ASC NULLS LAST
+    """, conn)
+
+    conn.close()
+    if not df.empty and 'maturity_date' in df.columns:
+        df['maturity_date'] = pd.to_datetime(df['maturity_date'])
+    return df
+
+
+# ======================================================
+# ANOMALY DETECTION
+# ======================================================
+
+@st.cache_data(ttl=300)
+def get_transaction_anomalies(z_threshold: float = 2.5, lookback_days: int = 365):
+    """
+    Returns recent transactions whose split amount is >= z_threshold standard
+    deviations from the mean for that payee+category combination.
+    Amounts in EUR.
+    """
+    conn = get_connection()
+
+    df = pd.read_sql("""
+        WITH fx AS (
+            SELECT DISTINCT ON (Currencies_Id_1) Currencies_Id_1, FX_Rate
+            FROM Historical_FX ORDER BY Currencies_Id_1, Date DESC
+        ),
+        splits_eur AS (
+            SELECT
+                t.Transactions_Id,
+                t.Date,
+                p.Payees_Name,
+                cat.Categories_Name AS category,
+                a.Accounts_Name,
+                s.Amount,
+                ROUND((s.Amount * COALESCE(fx.FX_Rate, 1))::numeric, 2) AS amount_eur
+            FROM Transactions t
+            JOIN Accounts a  ON t.Accounts_Id = a.Accounts_Id
+            JOIN Currencies c ON a.Currencies_Id = c.Currencies_Id
+            LEFT JOIN Payees p   ON t.Payees_Id = p.Payees_Id
+            LEFT JOIN Splits s   ON s.Transactions_Id = t.Transactions_Id
+            LEFT JOIN Categories cat ON s.Categories_Id = cat.Categories_Id
+            LEFT JOIN fx ON fx.Currencies_Id_1 = a.Currencies_Id
+            WHERE t.Date >= CURRENT_DATE - %(lookback)s * INTERVAL '1 day'
+              AND p.Payees_Name IS NOT NULL
+              AND s.Amount IS NOT NULL
+              AND t.Transfers_Id IS NULL -- Exclude internal transfers
+        ),
+        stats AS (
+            SELECT
+                Payees_Name,
+                category,
+                AVG(amount_eur)    AS mean_eur,
+                STDDEV(amount_eur) AS std_eur,
+                COUNT(*)           AS sample_size
+            FROM splits_eur
+            GROUP BY Payees_Name, category
+            HAVING COUNT(*) >= 3
+        )
+        SELECT
+            se.Date,
+            se.Payees_Name,
+            se.category,
+            se.Accounts_Name,
+            se.amount_eur,
+            st.mean_eur,
+            st.std_eur,
+            ROUND(((se.amount_eur - st.mean_eur) / NULLIF(st.std_eur, 0))::numeric, 2) AS z_score
+        FROM splits_eur se
+        JOIN stats st
+          ON st.Payees_Name = se.Payees_Name
+         AND (st.category = se.category OR (st.category IS NULL AND se.category IS NULL))
+        WHERE ABS((se.amount_eur - st.mean_eur) / NULLIF(st.std_eur, 0)) >= %(z)s
+          AND se.Date >= CURRENT_DATE - 30
+        ORDER BY ABS((se.amount_eur - st.mean_eur) / NULLIF(st.std_eur, 0)) DESC
+        LIMIT 20
+    """, conn, params={"lookback": lookback_days, "z": z_threshold})
+
+    conn.close()
+    if not df.empty:
+        df['date'] = pd.to_datetime(df['date'])
+    return df
+
+
+# ======================================================
+# AI WEEKLY SUMMARIES
+# ======================================================
+
+@st.cache_data(ttl=3600)
+def get_weekly_summaries(limit: int = 12) -> "pd.DataFrame":
+    """Return the most recent AI weekly summaries, newest first."""
+    conn = get_connection()
+    df = pd.read_sql("""
+        SELECT Week_Start, Generated_At, Summary_Text
+        FROM AI_Weekly_Summaries
+        ORDER BY Week_Start DESC
+        LIMIT %s
+    """, conn, params=(limit,))
+    conn.close()
+    if not df.empty:
+        df['week_start']    = pd.to_datetime(df['week_start'])
+        df['generated_at']  = pd.to_datetime(df['generated_at'])
+    return df
+
+@st.cache_data(ttl=3600)
+def get_monthly_summaries(limit: int = 12) -> "pd.DataFrame":
+    """Return the most recent AI monthly summaries, newest first."""
+    conn = get_connection()
+    df = pd.read_sql("""
+        SELECT Month_Start, Generated_At, Summary_Text
+        FROM AI_Monthly_Summaries
+        ORDER BY Month_Start DESC
+        LIMIT %s
+    """, conn, params=(limit,))
+    conn.close()
+    if not df.empty:
+        df['month_start']    = pd.to_datetime(df['month_start'])
+        df['generated_at']  = pd.to_datetime(df['generated_at'])
     return df

@@ -5,7 +5,12 @@ import plotly.graph_objects as go
 import numpy as np
 from database.connection import get_db
 from database.crud import update_holdings
-from database.queries import get_category_hierarchy, get_hist_net_worth_data, get_hist_inv_positions_data, get_pnl_report_data, get_income_expense_data, get_portfolio_signals
+from database.queries import (
+    get_category_hierarchy, get_hist_net_worth_data, get_hist_inv_positions_data,
+    get_pnl_report_data, get_income_expense_data, get_portfolio_signals,
+    get_cash_flow_forecast, get_dividend_tracker_data, get_asset_allocation_data,
+    get_fx_exposure_data, get_bond_schedule_data,
+)
 from data.downloaders import download_historical_fx, download_historical_prices_from_tradingview, download_historical_prices_from_yahoo, download_bond_prices_from_solidus, download_securities_info_from_yahoo
 from ui.components import color_negative_red, color_value, custom_metric, get_color
 from datetime import datetime, timedelta
@@ -16,7 +21,18 @@ def render_reports():
     
     hist_sub_menu = st.sidebar.radio(
         "Select Report:",
-        ["Historical Net Worth", "Historical Investment Positions", "P&L Reports", "Securities & Portfolio Analysis", "Income & Expense"],
+        [
+            "Historical Net Worth",
+            "Historical Investment Positions",
+            "P&L Reports",
+            "Securities & Portfolio Analysis",
+            "Income & Expense",
+            "Dividend Tracker",
+            "Cash Flow Forecast",
+            "Asset Allocation",
+            "FX Exposure",
+            "Bond Schedule",
+        ],
         key="hist_sub_nav"
     )
     
@@ -177,9 +193,25 @@ def render_reports():
         with tab_graph:
             fig = px.line(df_pivot, x="date", y=[c for c in df_pivot.columns if c != 'date'],
                          title="<b>Investment Value per Account</b>", template="plotly_dark")
-            # Highlight Total line
             fig.for_each_trace(lambda t: t.update(line=dict(color="white", width=4) if t.name == "TOTAL" else dict(width=2)))
             st.plotly_chart(fig, width='stretch')
+
+            # Drawdown chart
+            st.markdown("#### 📉 Portfolio Drawdown")
+            df_dd = df_total.copy().sort_values('date')
+            df_dd['peak'] = df_dd['value_in_eur'].cummax()
+            df_dd['drawdown_pct'] = (df_dd['value_in_eur'] - df_dd['peak']) / df_dd['peak'].replace(0, float('nan')) * 100
+            max_dd = df_dd['drawdown_pct'].min()
+            st.caption(f"Max drawdown over the selected period: **{max_dd:.2f}%**")
+            fig_dd = px.area(
+                df_dd, x='date', y='drawdown_pct',
+                title="<b>Drawdown from Peak (%)</b>",
+                template="plotly_dark",
+                color_discrete_sequence=["#E74C3C"],
+                labels={'drawdown_pct': 'Drawdown (%)', 'date': 'Date'}
+            )
+            fig_dd.update_layout(yaxis_tickformat='.1f', margin=dict(l=0, r=0, t=50, b=0))
+            st.plotly_chart(fig_dd, width='stretch')
             
 
         with tab_data:
@@ -350,39 +382,6 @@ def render_reports():
                         pnl_value=total_ytd_pnl
                     )
 
-            #    row3_col1, row3_col2, row3_col3, row3_col4 = st.columns(4)
-
-            #    with row3_col1:
-            #        total_dtd_market_pnl = df_pnl['pnl_dtd_market_eur'].sum()
-            #        custom_metric(
-            #            label="Total Daily Market P&L", 
-            #            value=f"{total_dtd_market_pnl:,.2f} €", 
-            #            pnl_value=total_dtd_market_pnl
-            #        )
-
-            #    with row3_col2:
-            #        total_dtd_fx_pnl = df_pnl['pnl_dtd_fx_eur'].sum()
-            #        custom_metric(
-            #            label="Total Daily FX P&L", 
-            #            value=f"{total_dtd_fx_pnl:,.2f} €", 
-            #            pnl_value=total_dtd_fx_pnl
-            #        )
-
-            #    with row3_col3:
-            #        total_ytd_market_pnl = df_pnl['pnl_ytd_market_eur'].sum()
-            #        custom_metric(
-            #            label="Total YTD Market P&L", 
-            #            value=f"{total_ytd_market_pnl:,.2f} €", 
-            #            pnl_value=total_ytd_market_pnl
-            #        )
-
-            #    with row3_col4:
-            #        total_ytd_fx_pnl = df_pnl['pnl_ytd_fx_eur'].sum()
-            #        custom_metric(
-            #            label="Total YTD FX P&L", 
-            #            value=f"{total_ytd_fx_pnl:,.2f} €", 
-            #            pnl_value=total_ytd_fx_pnl
-            #        )
 
             #    st.write("---") # Διαχωριστική γραμμή
                 m_col1, m_col2, m_col3, m_col4, m_col5, m_col6 = st.columns(6)
@@ -403,7 +402,7 @@ def render_reports():
                 with m_col5:
                     st.markdown(f"""
                         <div style="line-height: 1.5;text-align: center;">
-                            <p style="color: grey; font-size: 14px; margin: 0; font-family: sans-serif;">YTD Realized / Unrealized P&L Split</p>
+                            <p style="color: grey; font-size: 14px; margin: 0; font-family: sans-serif;">YTD Realized / Unrealized</p>
                             <p style="margin: 0; font-weight: bold;">
                                 <span style="color: {get_color(summary['Total YTD Realized P&L'])};">{summary['Total YTD Realized P&L']:+,.2f} €</span> / 
                                 <span style="color: {get_color(summary['Total YTD Unrealized P&L'])};">{summary['Total YTD Unrealized P&L']:+,.2f} €</span>
@@ -414,19 +413,13 @@ def render_reports():
                 with m_col6:
                     st.markdown(f"""
                         <div style="line-height: 1.5;text-align: center;">
-                            <p style="color: grey; font-size: 14px; margin: 0; font-family: sans-serif;">YTD Market / FX P&L Split</p>
+                            <p style="color: grey; font-size: 14px; margin: 0; font-family: sans-serif;">YTD Market / FX</p>
                             <p style="margin: 0; font-weight: bold;">
                                 <span style="color: {get_color(summary['Total YTD Market P&L'])};">{summary['Total YTD Market P&L']:+,.2f} €</span> / 
                                 <span style="color: {get_color(summary['Total YTD FX P&L'])};">{summary['Total YTD FX P&L']:+,.2f} €</span>
                             </p>
                         </div>
                     """, unsafe_allow_html=True)
-
-
-
-
-
-                st.divider() # Optional separation line for better visual effect
 
 
                 # 1. Καθαρισμός από τυχόν προϋπάρχοντα σύνολα της SQL για αποφυγή double-counting
@@ -476,6 +469,21 @@ def render_reports():
                 # 6. Καθαρισμός βοηθητικών στηλών πριν το display
             #    df_acc = df_acc.drop(columns=['annual_div_cash_eur', 'current_cost_basis_eur'])
                 df_acc = df_acc.drop(columns=['pnl_all_time_eur','annual_div_cash_eur', 'current_cost_basis_eur'])
+
+                st.divider() # Optional separation line for better visual effect
+
+                # 1. Δημιουργία στηλών για τα φίλτρα και το Selectbox
+                col1, col2, col3 = st.columns([1, 1, 2])
+
+                with col1:
+                    show_market_fx_split = st.checkbox("Show Market/FX Split", value=False)
+                with col2:
+                    show_realized_unrealized_split = st.checkbox("Show Realized/Unrealized Split", value=False)
+
+                if not show_market_fx_split:
+                    df_acc = df_acc.drop(columns=['pnl_dtd_market_eur','pnl_dtd_fx_eur', 'pnl_ytd_market_eur', 'pnl_ytd_fx_eur'])
+                if not show_realized_unrealized_split:
+                    df_acc = df_acc.drop(columns=['realized_pnl_ytd_eur', 'unrealized_pnl_ytd_eur', 'realized_pnl_eur', 'unrealized_pnl_eur'])
 
                 df_acc = df_acc.rename(columns={
                     'current_value_eur': 'Current Value',
@@ -638,13 +646,25 @@ def render_reports():
                     # 1. Set 'Security' as the index so Streamlit treats it as the frozen lead column
                     df_to_show = df_display.set_index('Security')
 
+                    if not show_market_fx_split:
+                        df_to_show = df_to_show.drop(columns=['Daily Market P&L','Daily FX P&L', 'YTD Market P&L', 'YTD FX P&L'])
+                    #    pnl_cols = ['Daily P&L', 'Weekly P&L', 'Monthly P&L', 'Quarterly P&L', 'YTD Realized P&L', 'YTD Unrealized P&L', 'YTD P&L', 'Realized P&L', 'Unrealized P&L', 'Total Net P&L', 'Annual YOC %']
+
+                    if not show_realized_unrealized_split:
+                        df_to_show = df_to_show.drop(columns=['YTD Realized P&L', 'YTD Unrealized P&L', 'Realized P&L', 'Unrealized P&L'])
+                    #    pnl_cols = ['Daily Market P&L', 'Daily FX P&L', 'Daily P&L', 'Weekly P&L', 'Monthly P&L', 'Quarterly P&L', 'YTD Market P&L', 'YTD FX P&L', 'YTD P&L', 'Total Net P&L', 'Annual YOC %']
+
+                    existing_pnl_cols = [col for col in pnl_cols if col in df_to_show.columns]
+
                     st.dataframe(
                     #    df_display.style
                         df_to_show.style
-                        .map(color_negative_red, subset=pnl_cols)
+                    #    .map(color_negative_red, subset=pnl_cols)
+                        .map(color_negative_red, subset=existing_pnl_cols)
                         .format({
                             # P&L columns
-                            **{col: "{:,.2f} €" for col in pnl_cols},
+                    #        **{col: "{:,.2f} €" for col in pnl_cols},
+                            **{col: "{:,.2f} €" for col in existing_pnl_cols},
                             # Value column
                             'Value (€)': "{:,.2f} €",
                             # Price and Quantity columns
@@ -1468,6 +1488,21 @@ def render_reports():
     elif hist_sub_menu == "Income & Expense":
         render_income_expense_reports()
 
+    elif hist_sub_menu == "Dividend Tracker":
+        render_dividend_tracker()
+
+    elif hist_sub_menu == "Cash Flow Forecast":
+        render_cash_flow_forecast()
+
+    elif hist_sub_menu == "Asset Allocation":
+        render_asset_allocation()
+
+    elif hist_sub_menu == "FX Exposure":
+        render_fx_exposure()
+
+    elif hist_sub_menu == "Bond Schedule":
+        render_bond_schedule()
+
 
 
 def render_income_expense_reports():
@@ -1483,6 +1518,9 @@ def render_income_expense_reports():
     
     income_cats = df_categories[df_categories['categories_type'] == 'Income']
     expense_cats = df_categories[df_categories['categories_type'] == 'Expense']
+    tax_cats = df_categories[df_categories['categories_type'] == 'Tax']
+    div_cats = df_categories[df_categories['categories_type'] == 'Dividend']
+    int_cats = df_categories[df_categories['categories_type'] == 'Interest']
     
     # Create category options dict for selectbox
     cat_options = {}
@@ -1495,7 +1533,7 @@ def render_income_expense_reports():
     with col1:
         report_type = st.selectbox(
             "Report Type",
-            ["Income & Expense Summary", "Income Analysis", "Expense Analysis"],
+            ["Total Summary", "Income Analysis", "Expense Analysis", "Tax Analysis", "Dividend Analysis", "Interest Analysis"],
             key="ie_report_type"
         )
     
@@ -1528,13 +1566,20 @@ def render_income_expense_reports():
     
     # Category filter (only for detailed views)
     filter_category = None
-    if report_type != "Income & Expense Summary":
+    if report_type != "Total Summary":
         with st.expander("🔍 Filter by Category", expanded=False):
             # Δημιουργούμε ένα dictionary: {id: "Name"}
             if report_type == "Income Analysis":
                 current_cats = income_cats
-            else:
-                current_cats = expense_cats
+            elif report_type == "Expense Analysis":
+                 current_cats = expense_cats
+            elif report_type == "Tax Analysis":
+                current_cats = tax_cats 
+            elif report_type == "Dividend Analysis":
+                current_cats = div_cats
+            elif report_type == "Interest Analysis":
+                current_cats = int_cats
+
                 
             # Κατασκευή του mapping: ID -> Name
             cat_map = {row['categories_id']: cat_options.get(row['categories_id'], "Unknown") 
@@ -1646,6 +1691,12 @@ def render_income_expense_reports():
                 df = df[df['categories_type'] == 'Income']
             elif report_type == "Expense Analysis":
                 df = df[df['categories_type'] == 'Expense']
+            elif report_type == "Tax Analysis":
+                df = df[df['categories_type'] == 'Tax']
+            elif report_type == "Dividend Analysis":
+                df = df[df['categories_type'] == 'Dividend']
+            elif report_type == "Interest Analysis":
+                df = df[df['categories_type'] == 'Interest']
             
             if df.empty:
                 st.warning(f"No {report_type} transactions found for the selected period.")
@@ -1654,25 +1705,101 @@ def render_income_expense_reports():
             # Display summary metrics
             st.markdown("### 📈 Summary")
             
-            total_income = df[df['categories_type'] == 'Income']['split_amount'].sum() if 'Income' in df['categories_type'].values else 0
-            total_expense = df[df['categories_type'] == 'Expense']['split_amount'].sum() if 'Expense' in df['categories_type'].values else 0
-            net_savings = total_income - abs(total_expense)
+            # total_bank_income = df[df['source_type'] == 'Bank'][df['categories_type'] == 'Income']['split_amount'].sum() if 'Bank' in df['source_type'].values and 'Income' in df['categories_type'].values else 0
+            # Πιο σωστή και αποδοτική σύνταξη με χρήση του .loc
+            condition = (df['source_type'] == 'Bank') & (df['categories_type'] == 'Income')
+            total_bank_income = df.loc[condition, 'split_amount'].sum()
+
+            condition = (df['source_type'] == 'Bank') & (df['categories_type'] == 'Interest')
+            total_bank_interest = df.loc[condition, 'split_amount'].sum()
+            total_income_non_investment = total_bank_income + total_bank_interest
+
+            condition = (df['source_type'] == 'Investment') & (df['categories_type'] == 'Income')
+            total_investment_income = df.loc[condition, 'split_amount'].sum()
+
+            condition = (df['source_type'] == 'Investment') & (df['categories_type'] == 'Dividend')
+            total_investment_dividend = df.loc[condition, 'split_amount'].sum()
+
+            condition = (df['source_type'] == 'Investment') & (df['categories_type'] == 'Interest')
+            total_investment_interest = df.loc[condition, 'split_amount'].sum()
+            total_income_investment = total_investment_income + total_investment_dividend + total_investment_interest
+ 
+            overall_income = total_income_non_investment + total_income_investment
+
+            condition = (df['source_type'] == 'Bank') & (df['categories_type'] == 'Expense')
+            total_bank_expense = df.loc[condition, 'split_amount'].sum()
+
+            condition = (df['categories_type'] == 'Tax')
+            total_tax = df.loc[condition, 'split_amount'].sum()
+            overall_expense_non_investment = total_bank_expense + total_tax
+
+            condition = (df['source_type'] == 'Investment') & (df['categories_type'] == 'Expense')
+            total_investment_expense = df.loc[condition, 'split_amount'].sum()
+            overall_expense = overall_expense_non_investment + total_investment_expense
+
+            net_savings = overall_income + overall_expense
             
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Total Income", f"€ {total_income:,.2f}")
-            with col2:
-                expense_delta = f"{abs(total_expense)/total_income*100:.1f}%" if total_income > 0 else None
-                st.metric("Total Expenses", f"€ {abs(total_expense):,.2f}", delta=expense_delta)
-            with col3:
-                if report_type == "Income & Expense Summary":
-                    st.metric("Net Savings", f"€ {net_savings:,.2f}", 
-                            delta="Positive" if net_savings > 0 else "Negative",
-                            delta_color="normal" if net_savings > 0 else "inverse")
-            with col4:
-                if report_type == "Income & Expense Summary":
-                    savings_rate = (net_savings / total_income * 100) if total_income > 0 else 0
-                    st.metric("Savings Rate", f"{savings_rate:.1f}%")
+            overall_col1, overall_col2, overall_col3, overall_col4, overall_col5 = st.columns(5)
+            with overall_col1:
+            #    st.metric("Overall Income", f"€ {overall_income:,.2f}") 
+                custom_metric(
+                    label="Overall Income", 
+                    value=f"€ {overall_income:,.2f}", 
+                    pnl_value=overall_income    
+                )                
+            with overall_col3:
+            #    st.metric("Overall Expenses", f"€ {overall_expense:,.2f}")
+                custom_metric(
+                    label="Overall Expenses", 
+                    value=f"€ {overall_expense:,.2f}", 
+                    pnl_value=overall_expense    
+                )                     
+            with overall_col4:
+                if report_type == "Total Summary":
+                #    st.metric("Net Savings", f"€ {net_savings:,.2f}", 
+                #            delta="Positive" if net_savings > 0 else "Negative",
+                #            delta_color="normal" if net_savings > 0 else "inverse")
+                    custom_metric(
+                        label="Net Savings", 
+                        value=f"€ {net_savings:,.2f}", 
+                        pnl_value=net_savings    
+                    )                        
+            with overall_col5:
+                if report_type == "Total Summary":
+                    savings_rate = (net_savings / overall_income * 100) if overall_income > 0 else 0
+                #    st.metric("Savings Rate", f"{savings_rate:.1f}%")
+                    custom_metric(
+                        label="Savings Rate", 
+                        value=f"{round(savings_rate, 2):.2f}%", 
+                        pnl_value=savings_rate    
+                    )       
+
+            m_col1, m_col2, m_col3, m_col4, m_col5 = st.columns(5)
+
+            with m_col1:
+                # Χρήση f-string και πρόσβαση στο dictionary με []
+                st.markdown(f"""
+                    <div style="line-height: 1.5;text-align: center;">
+                        <p style="color: grey; font-size: 16px; margin: 0; font-family: sans-serif;">Earned & Reimbursed / Investments</p>
+                        <p style="margin: 0; font-weight: bold;">
+                            <span style="color: {get_color(total_income_non_investment)};">€ {total_income_non_investment:+,.2f}</span> / 
+                            <span style="color: {get_color(total_income_investment)};">€ {total_income_investment:+,.2f}</span>
+                        </p>
+                    </div>
+                """, unsafe_allow_html=True)
+
+            with m_col3:
+                st.markdown(f"""
+                    <div style="line-height: 1.5;text-align: center;">
+                        <p style="color: grey; font-size: 16px; margin: 0; font-family: sans-serif;">Expenses / Taxes / Investments</p>
+                        <p style="margin: 0; font-weight: bold;">
+                            <span style="color: {get_color(total_bank_expense)};">€ {total_bank_expense:+,.2f}</span> / 
+                            <span style="color: {get_color(total_tax)};">€ {total_tax:+,.2f}</span> / 
+                            <span style="color: {get_color(total_investment_expense)};">€ {total_investment_expense:+,.2f}</span>
+                        </p>
+                    </div>
+                """, unsafe_allow_html=True)
+
 
             st.divider()
 
@@ -1795,7 +1922,7 @@ def render_income_expense_reports():
                         color='categories_type',
                         barmode='group',
                         # ΕΠΙΒΟΛΗ ΣΕΙΡΑΣ: Income πρώτα, μετά Expense
-                        category_orders={"categories_type": ["Income", "Expense"]}, 
+                        category_orders={"categories_type": ["Income", "Dividend", "Interest", "Expense", "Tax"]}, 
                         color_discrete_map={'Income': '#FFA500', 'Expense': '#808000'},
                         labels={'Amount': 'Amount (€)', 'categories_type': 'Type'},
                         height=450
@@ -1970,3 +2097,356 @@ def render_income_expense_reports():
                             st.info(f"**Total for {selected_drill_cat}:** € {total:,.2f}")
             else:
                 st.info("No period data available for the selected criteria.")
+
+
+# ======================================================
+# DIVIDEND TRACKER
+# ======================================================
+
+def render_dividend_tracker():
+    st.subheader("💸 Dividend & Interest Income Tracker")
+
+    if st.sidebar.button("🔄 Refresh", key="div_refresh"):
+        get_dividend_tracker_data.clear()
+        st.rerun()
+
+    df = get_dividend_tracker_data()
+
+    if df.empty:
+        st.info("No dividend or interest transactions found.")
+        return
+
+    df['month'] = pd.to_datetime(df['month'])
+
+    # Monthly bar chart
+    df_monthly = df.groupby('month')['income_eur'].sum().reset_index()
+    fig_bar = px.bar(
+        df_monthly, x='month', y='income_eur',
+        title="<b>Monthly Dividend & Interest Income (€)</b>",
+        labels={'income_eur': 'Income (€)', 'month': 'Month'},
+        template='plotly_dark',
+        color_discrete_sequence=['#2ECC71'],
+    )
+    fig_bar.update_layout(margin=dict(l=0, r=0, t=50, b=0))
+    st.plotly_chart(fig_bar, width='stretch')
+
+    # Trailing 12m by security
+    st.markdown("#### Trailing 12-Month Income by Security")
+    df_t12 = (
+        df.groupby(['securities_name', 'securities_type'])
+        .agg(trailing_12m_eur=('income_eur', 'sum'), cost_basis_eur=('cost_basis_eur', 'first'))
+        .reset_index()
+        .sort_values('trailing_12m_eur', ascending=False)
+    )
+    df_t12['yoc_pct'] = (df_t12['trailing_12m_eur'] / df_t12['cost_basis_eur'].replace(0, float('nan')) * 100).fillna(0)
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Total (12m)", f"€ {df_t12['trailing_12m_eur'].sum():,.2f}")
+    m2.metric("Securities paying", str(len(df_t12)))
+    _avg_yoc = df_t12[df_t12['yoc_pct'] > 0]['yoc_pct'].mean()
+    m3.metric("Avg YOC (12m)", f"{_avg_yoc:.2f}%" if not pd.isna(_avg_yoc) else "N/A")
+
+    st.dataframe(
+        df_t12.style.format({
+            'trailing_12m_eur': '{:,.2f} €',
+            'cost_basis_eur':   '{:,.2f} €',
+            'yoc_pct':          '{:.2f}%',
+        }),
+        hide_index=True, width='stretch',
+        column_config={
+            'securities_name':  'Security',
+            'securities_type':  'Type',
+            'trailing_12m_eur': st.column_config.NumberColumn('Income 12m (€)', format='%,.2f €'),
+            'cost_basis_eur':   st.column_config.NumberColumn('Cost Basis (€)', format='%,.2f €'),
+            'yoc_pct':          st.column_config.NumberColumn('YOC %', format='%.2f%%'),
+        }
+    )
+
+    # Full detail table
+    with st.expander("Full transaction detail"):
+        st.dataframe(
+            df[['month', 'securities_name', 'accounts_name', 'action', 'income_eur']].style.format({'income_eur': '{:,.2f} €'}),
+            hide_index=True, width='stretch',
+            column_config={
+                'month':          'Month',
+                'securities_name':'Security',
+                'accounts_name':  'Account',
+                'action':         'Action',
+                'income_eur':     st.column_config.NumberColumn('Income (€)', format='%,.2f €'),
+            }
+        )
+
+
+# ======================================================
+# CASH FLOW FORECAST
+# ======================================================
+
+def render_cash_flow_forecast():
+    st.subheader("🔮 Cash Flow Forecast")
+
+    horizon = st.sidebar.radio("Forecast horizon:", ["30 days", "60 days", "90 days"], index=1, key="cf_horizon")
+    days = int(horizon.split()[0])
+
+    if st.sidebar.button("🔄 Refresh", key="cf_refresh"):
+        get_cash_flow_forecast.clear()
+        st.rerun()
+
+    df_future, df_recurring = get_cash_flow_forecast()
+
+    st.markdown("#### Explicitly Scheduled Future Transactions")
+    if df_future.empty:
+        st.info("No future-dated transactions found.")
+    else:
+        cutoff = pd.Timestamp.now() + pd.Timedelta(days=days)
+        df_f = df_future[df_future['date'] <= cutoff].copy()
+        if df_f.empty:
+            st.info(f"No transactions scheduled within {days} days.")
+        else:
+            total_in  = df_f[df_f['amount_eur'] > 0]['amount_eur'].sum()
+            total_out = df_f[df_f['amount_eur'] < 0]['amount_eur'].sum()
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Expected In",  f"€ {total_in:,.2f}")
+            c2.metric("Expected Out", f"€ {total_out:,.2f}")
+            c3.metric("Net",          f"€ {(total_in + total_out):,.2f}")
+
+            fig = px.bar(
+                df_f.sort_values('date'), x='date', y='amount_eur',
+                color=df_f['amount_eur'].apply(lambda x: 'Income' if x >= 0 else 'Expense'),
+                color_discrete_map={'Income': '#2ECC71', 'Expense': '#E74C3C'},
+                title=f"<b>Scheduled cash flows — next {days} days</b>",
+                labels={'amount_eur': 'Amount (€)', 'date': 'Date'},
+                hover_data=['payees_name', 'category'],
+                template='plotly_dark',
+            )
+            fig.update_layout(margin=dict(l=0, r=0, t=50, b=0), showlegend=False)
+            st.plotly_chart(fig, width='stretch')
+
+            st.dataframe(
+                df_f[['date', 'payees_name', 'accounts_name', 'category', 'amount_eur', 'currency']]
+                .style.format({'amount_eur': '{:,.2f} €'}),
+                hide_index=True, width='stretch',
+            )
+
+    st.markdown("#### Detected Recurring Payments")
+    st.caption("Payees with ≥ 2 transactions in the last 120 days, showing projected next occurrence.")
+    if df_recurring.empty:
+        st.info("No recurring patterns detected.")
+    else:
+        cutoff2 = pd.Timestamp.now() + pd.Timedelta(days=days)
+        df_r = df_recurring[df_recurring['next_expected_date'] <= cutoff2].copy()
+        if df_r.empty:
+            st.info(f"No recurring payments expected within {days} days.")
+        else:
+            st.dataframe(
+                df_r[['next_expected_date', 'payees_name', 'avg_amount_eur', 'avg_days_between', 'tx_count', 'currency']]
+                .style.format({'avg_amount_eur': '{:,.2f} €', 'avg_days_between': '{:.0f} days'}),
+                hide_index=True, width='stretch',
+                column_config={
+                    'next_expected_date': 'Next Expected',
+                    'payees_name':        'Payee',
+                    'avg_amount_eur':     st.column_config.NumberColumn('Avg Amount (€)', format='%,.2f €'),
+                    'avg_days_between':   'Avg Frequency',
+                    'tx_count':           'Occurrences',
+                    'currency':           'Currency',
+                }
+            )
+
+
+# ======================================================
+# ASSET ALLOCATION
+# ======================================================
+
+def render_asset_allocation():
+    st.subheader("🥧 Asset Allocation vs. Target")
+
+    if st.sidebar.button("🔄 Refresh", key="alloc_refresh"):
+        get_asset_allocation_data.clear()
+        st.rerun()
+
+    df = get_asset_allocation_data()
+
+    if df.empty:
+        st.info("No holdings found.")
+        return
+
+    total_eur = df['value_eur'].sum()
+    st.metric("Total Portfolio Value", f"€ {total_eur:,.2f}")
+
+    col_pie, col_table = st.columns([1, 1])
+
+    with col_pie:
+        fig = px.pie(
+            df, names='securities_type', values='value_eur',
+            title="<b>Current Allocation</b>",
+            template='plotly_dark',
+            hole=0.4,
+        )
+        fig.update_traces(textinfo='percent+label')
+        fig.update_layout(margin=dict(l=0, r=0, t=50, b=0), showlegend=False)
+        st.plotly_chart(fig, width='stretch')
+
+    with col_table:
+        fig2 = px.bar(
+            df, x='securities_type', y=['actual_pct', 'target_pct'],
+            barmode='group',
+            title="<b>Actual vs. Target (%)</b>",
+            labels={'value': '%', 'securities_type': 'Type', 'variable': ''},
+            template='plotly_dark',
+            color_discrete_map={'actual_pct': '#457B9D', 'target_pct': '#F1A208'},
+        )
+        fig2.update_layout(margin=dict(l=0, r=0, t=50, b=0))
+        st.plotly_chart(fig2, width='stretch')
+
+    st.markdown("#### Rebalancing Delta")
+    df_display = df.copy()
+    df_display['delta_pct'] = df_display['actual_pct'] - df_display['target_pct']
+    df_display['rebalance_eur'] = df_display['delta_pct'] / 100 * total_eur
+
+    st.dataframe(
+        df_display.style.format({
+            'value_eur':   '{:,.2f} €',
+            'actual_pct':  '{:.2f}%',
+            'target_pct':  '{:.2f}%',
+            'delta_pct':   '{:+.2f}%',
+            'rebalance_eur': '{:+,.2f} €',
+        }).map(color_negative_red, subset=['delta_pct', 'rebalance_eur']),
+        hide_index=True, width='stretch',
+        column_config={
+            'securities_type': 'Asset Type',
+            'value_eur':       st.column_config.NumberColumn('Value (€)',   format='%,.2f €'),
+            'actual_pct':      st.column_config.NumberColumn('Actual %',    format='%.2f%%'),
+            'target_pct':      st.column_config.NumberColumn('Target %',    format='%.2f%%'),
+            'delta_pct':       st.column_config.NumberColumn('Delta %',     format='%+.2f%%'),
+            'rebalance_eur':   st.column_config.NumberColumn('Rebalance €', format='%+,.2f €'),
+        }
+    )
+
+    st.caption("Set target allocations via SQL: `UPDATE Allocation_Targets SET Target_Pct = 40 WHERE Securities_Type = 'ETF';`")
+
+
+# ======================================================
+# FX EXPOSURE
+# ======================================================
+
+def render_fx_exposure():
+    st.subheader("🌍 FX Exposure Report")
+
+    if st.sidebar.button("🔄 Refresh", key="fx_exp_refresh"):
+        get_fx_exposure_data.clear()
+        st.rerun()
+
+    df = get_fx_exposure_data()
+
+    if df.empty:
+        st.info("No FX exposure data found.")
+        return
+
+    total_eur = df['eur_exposure'].sum()
+    st.metric("Total Net Worth (EUR)", f"€ {total_eur:,.2f}")
+
+    fig = px.bar(
+        df, x='currency', y='eur_exposure',
+        title="<b>Net Exposure by Currency (€)</b>",
+        template='plotly_dark',
+        color='eur_exposure',
+        color_continuous_scale='RdYlGn',
+        labels={'eur_exposure': 'Net Exposure (€)', 'currency': 'Currency'},
+        text=df['eur_exposure'].apply(lambda x: f"€ {x:,.0f}"),
+    )
+    fig.update_traces(textposition='outside')
+    fig.update_layout(coloraxis_showscale=False, margin=dict(l=0, r=0, t=50, b=0))
+    st.plotly_chart(fig, width='stretch')
+
+    st.markdown("#### Sensitivity to ±5% FX Move")
+    df_display = df.copy()
+    df_display['impact_up_5pct']   =  df_display['sensitivity_5pct_eur']
+    df_display['impact_down_5pct'] = -df_display['sensitivity_5pct_eur']
+
+    st.dataframe(
+        df_display[['currency', 'native_exposure', 'eur_exposure', 'impact_up_5pct', 'impact_down_5pct']]
+        .style.format({
+            'native_exposure':   '{:,.2f}',
+            'eur_exposure':      '{:,.2f} €',
+            'impact_up_5pct':    '{:+,.2f} €',
+            'impact_down_5pct':  '{:+,.2f} €',
+        }).map(color_negative_red, subset=['impact_down_5pct']),
+        hide_index=True, width='stretch',
+        column_config={
+            'currency':          'Currency',
+            'native_exposure':   st.column_config.NumberColumn('Native Exposure', format='%,.2f'),
+            'eur_exposure':      st.column_config.NumberColumn('EUR Exposure',    format='%,.2f €'),
+            'impact_up_5pct':    st.column_config.NumberColumn('+5% FX Impact',   format='%+,.2f €'),
+            'impact_down_5pct':  st.column_config.NumberColumn('-5% FX Impact',   format='%+,.2f €'),
+        }
+    )
+
+
+# ======================================================
+# BOND SCHEDULE
+# ======================================================
+
+def render_bond_schedule():
+    st.subheader("📅 Bond Maturity & Coupon Schedule")
+
+    if st.sidebar.button("🔄 Refresh", key="bond_refresh"):
+        get_bond_schedule_data.clear()
+        st.rerun()
+
+    df = get_bond_schedule_data()
+
+    if df.empty:
+        st.info("No bond holdings found. Make sure Securities of type 'Bond' have Maturity_Date, Coupon_Rate, and Face_Value filled in.")
+        return
+
+    # Summary metrics
+    total_face  = df['total_face_eur'].sum()
+    total_ann   = df['annual_coupon_eur'].sum()
+    next_12m    = df[df['days_to_maturity'] <= 365]['total_face_eur'].sum()
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Total Face Value (€)", f"€ {total_face:,.2f}")
+    m2.metric("Annual Coupon Income (€)", f"€ {total_ann:,.2f}")
+    m3.metric("Maturing in 12m (€)", f"€ {next_12m:,.2f}")
+
+    # Maturity timeline
+    df_mat = df.dropna(subset=['maturity_date']).copy()
+    if not df_mat.empty:
+        fig = px.bar(
+            df_mat.sort_values('maturity_date'),
+            x='maturity_date', y='total_face_eur',
+            color='securities_name',
+            title="<b>Bond Maturities Timeline</b>",
+            labels={'total_face_eur': 'Face Value (€)', 'maturity_date': 'Maturity Date'},
+            template='plotly_dark',
+            text=df_mat['securities_name'],
+        )
+        fig.update_traces(textposition='outside')
+        fig.update_layout(showlegend=False, margin=dict(l=0, r=0, t=50, b=0))
+        st.plotly_chart(fig, width='stretch')
+
+    st.markdown("#### Bond Holdings Detail")
+    st.dataframe(
+        df.style.format({
+            'quantity':           '{:,.4f}',
+            'face_value':         '{:,.2f}',
+            'total_face_eur':     '{:,.2f} €',
+            'coupon_rate':        '{:.4f}%',
+            'next_coupon_eur':    '{:,.2f} €',
+            'annual_coupon_eur':  '{:,.2f} €',
+            'days_to_maturity':   '{:,.0f}',
+        }, na_rep="—"),
+        hide_index=True, width='stretch',
+        column_config={
+            'securities_name':   'Bond',
+            'quantity':          st.column_config.NumberColumn('Quantity',       format='%,.4f'),
+            'face_value':        st.column_config.NumberColumn('Face Value',     format='%,.2f'),
+            'total_face_eur':    st.column_config.NumberColumn('Total Face (€)', format='%,.2f €'),
+            'coupon_rate':       st.column_config.NumberColumn('Coupon %',       format='%.4f%%'),
+            'coupon_frequency':  'Frequency',
+            'next_coupon_eur':   st.column_config.NumberColumn('Next Coupon (€)',format='%,.2f €'),
+            'annual_coupon_eur': st.column_config.NumberColumn('Annual Income (€)', format='%,.2f €'),
+            'maturity_date':     'Maturity Date',
+            'days_to_maturity':  st.column_config.NumberColumn('Days to Maturity', format='%,d'),
+            'currency':          'Currency',
+        }
+    )
