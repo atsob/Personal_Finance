@@ -234,6 +234,11 @@ def _gather_context(conn) -> str:
                             (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share)
                                 WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share)
                                 ELSE 0 END) ELSE 0 END) AS cf_wtd,
+                        -- WTD CF EUR
+                        SUM(CASE WHEN i.Date > (SELECT wtd_start FROM periods) THEN
+                            (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
+                                WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
+                                ELSE 0 END) ELSE 0 END) AS cf_wtd_eur,
                         -- Συνολικό CF (για Realized P&L)
                         SUM(CASE WHEN i.Action IN ('Buy', 'MiscExp', 'Reinvest', 'Exercise', 'ShrIn') THEN COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share)
                                 WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'RtrnCap', 'ShrOut') THEN -COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share)
@@ -246,7 +251,11 @@ def _gather_context(conn) -> str:
                     GROUP BY i.Accounts_Id, i.Securities_Id
                 )
                 SELECT
-                    SUM(((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)) - (pf.qty_wtd * pf.price_wtd * COALESCE(pf.fx_wtd, 1)) - COALESCE(cf.cf_wtd, 0))) as pnl_wtd_eur
+                    SUM(
+                        ((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)) - 
+                        (pf.qty_wtd * pf.price_wtd * COALESCE(pf.fx_wtd, 1)) - 
+                        COALESCE(cf.cf_wtd_eur, 0))
+                    ) as pnl_wtd_eur
                 FROM prices_fx pf
                 LEFT JOIN cash_flows cf
                     ON pf.Accounts_Id = cf.Accounts_Id AND pf.Securities_Id = cf.Securities_Id

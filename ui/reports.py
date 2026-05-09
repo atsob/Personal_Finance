@@ -7,6 +7,7 @@ from database.connection import get_db
 from database.crud import update_holdings
 from database.queries import (
     get_category_hierarchy, get_hist_net_worth_data, get_hist_inv_positions_data,
+    get_net_worth_report_data,
     get_pnl_report_data, get_income_expense_data, get_portfolio_signals,
     get_cash_flow_forecast, get_dividend_tracker_data, get_asset_allocation_data,
     get_fx_exposure_data, get_bond_schedule_data,
@@ -23,6 +24,7 @@ def render_reports():
         "Select Report:",
         [
             "Historical Net Worth",
+            "Net Worth Report",
             "Historical Investment Positions",
             "P&L Reports",
             "Securities & Portfolio Analysis",
@@ -36,7 +38,10 @@ def render_reports():
         key="hist_sub_nav"
     )
     
-    if hist_sub_menu == "Historical Net Worth":
+    if hist_sub_menu == "Net Worth Report":
+        render_net_worth_report()
+
+    elif hist_sub_menu == "Historical Net Worth":
         st.subheader("📈 Net Worth Progress (Monthly) to Date")
         
         last_day_prev_month = pd.Timestamp.now().replace(day=1) - pd.Timedelta(days=1)
@@ -61,7 +66,7 @@ def render_reports():
             df_hist['date'] = pd.to_datetime(df_hist['date'])
             df_hist = df_hist.sort_values('date')
             
-            tab1, tab2 = st.tabs(["📊 Graph", "📋 Summary per Type"])
+            tab1, tab2, tab3 = st.tabs(["📊 Graph", "📋 Summary per Type", "🔍 Detail Analysis"])
             
             with tab1:
                 df_hist['net_change'] = df_hist['total_net_worth'].diff()
@@ -153,6 +158,72 @@ def render_reports():
                     width="stretch",
                     hide_index=True
                 )
+
+            with tab3:
+                st.markdown("### 🔍 Net Worth Snapshot by Date")
+
+                available_dates = sorted(df_hist['Date'].unique(), reverse=True)
+                selected_date = st.selectbox(
+                    "Select Snapshot Date:",
+                    available_dates,
+                    format_func=lambda x: pd.to_datetime(x).strftime('%B %Y'),
+                    key="nw_snapshot_date"
+                )
+
+                row = df_hist[df_hist['Date'] == selected_date].iloc[0]
+
+                m1, m2, m3, m4, m5 = st.columns(5)
+                m1.metric("Net Worth",   f"€ {row['Total Net Worth']:,.2f}",
+                          delta=f"€ {row['net_change']:,.2f}" if pd.notna(row['net_change']) else None)
+                m2.metric("Cash",        f"€ {row['Total Cash']:,.2f}")
+                m3.metric("Investments", f"€ {row['Total Invested']:,.2f}")
+                m4.metric("Pension",     f"€ {row['Total Pension']:,.2f}")
+                m5.metric("Assets",      f"€ {row['Total Assets']:,.2f}")
+
+                df_components = pd.DataFrame([
+                    {'Category': 'Cash',        'Value (€)': row['Total Cash']},
+                    {'Category': 'Investments', 'Value (€)': row['Total Invested']},
+                    {'Category': 'Pension',     'Value (€)': row['Total Pension']},
+                    {'Category': 'Assets',      'Value (€)': row['Total Assets']},
+                ])
+                df_components = df_components[df_components['Value (€)'] != 0].copy()
+
+                if not df_components.empty:
+                    df_components['% of Net Worth'] = (
+                        df_components['Value (€)'] / row['Total Net Worth'] * 100
+                    ).round(2)
+
+                    col_pie, col_table = st.columns([1, 1])
+
+                    with col_pie:
+                        fig_pie = px.pie(
+                            df_components,
+                            values='Value (€)',
+                            names='Category',
+                            title=f"<b>Net Worth Breakdown — {pd.to_datetime(selected_date).strftime('%B %Y')}</b>",
+                            template='plotly_dark',
+                            hole=0.4,
+                            color_discrete_sequence=["#FFD700", "#457B9D", "#A8DADC", "#5D6D7E"],
+                        )
+                        fig_pie.update_traces(textinfo='percent+label')
+                        fig_pie.update_layout(showlegend=False, margin=dict(l=0, r=0, t=50, b=0))
+                        st.plotly_chart(fig_pie, width='stretch')
+
+                    with col_table:
+                        st.dataframe(
+                            df_components.style.format({
+                                'Value (€)':      '€ {:,.2f}',
+                                '% of Net Worth': '{:.2f}%',
+                            }),
+                            hide_index=True,
+                            width='stretch',
+                            column_config={
+                                'Category':       'Category',
+                                'Value (€)':      st.column_config.NumberColumn('Value (€)',  format='€ %,.2f'),
+                                '% of Net Worth': st.column_config.NumberColumn('% of NW',   format='%.2f%%'),
+                            }
+                        )
+
         except Exception as e:
             st.error(f"Error: {e}")
     
@@ -170,6 +241,10 @@ def render_reports():
         )
         st.session_state.inv_date_val = min_inv_date
 
+        if st.sidebar.button("🔄 Refresh Positions"):
+            get_hist_inv_positions_data.clear()
+            st.cache_data.clear()
+            st.rerun()
 
         df_raw = get_hist_inv_positions_data(min_inv_date)
         
@@ -273,8 +348,16 @@ def render_reports():
         
         with tab_report:
             st.subheader("📈 Investments Profit & Loss")
+         
             df_pnl = get_pnl_report_data()
-            
+            if df_pnl is not None:
+                if df_pnl.empty:
+                    st.warning("No P&L data found. Please refresh the report.")
+                    return
+            else:
+                st.error("Error fetching P&L data. Please try refreshing.")
+                return
+
             if st.sidebar.button("🔄 Refresh P&L", key="refresh_pnl_btn"):
                 get_pnl_report_data.clear()
                 with st.spinner("Running :green[download_historical_fx('2d')]"):
@@ -2450,3 +2533,191 @@ def render_bond_schedule():
             'currency':          'Currency',
         }
     )
+
+
+# ======================================================
+# NET WORTH REPORT  (Quicken-style)
+# ======================================================
+
+def render_net_worth_report():
+    st.subheader("📋 Net Worth Report")
+
+    # ── Sidebar controls ──────────────────────────────────────────────────
+    last_day_prev_month = pd.Timestamp.now().replace(day=1) - pd.Timedelta(days=1)
+    start_date = st.sidebar.date_input(
+        "📅 Start Date",
+        value=st.session_state.nwr_date_val,
+        max_value=last_day_prev_month,
+        key="nwr_date",
+    )
+    st.session_state.nwr_date_val = start_date
+
+    interval  = st.sidebar.radio("Interval:", ["Year", "Quarter", "Month"], key="nwr_interval")
+    show_zero = st.sidebar.checkbox("Show zero-balance accounts", value=False, key="nwr_show_zero")
+
+    if st.sidebar.button("🔄 Refresh", key="nwr_refresh"):
+        get_net_worth_report_data.clear()
+        st.cache_data.clear()
+        st.rerun()
+
+    # ── Data ──────────────────────────────────────────────────────────────
+    with st.spinner("Loading net worth data…"):
+        df = get_net_worth_report_data(start_date.isoformat(), interval)
+
+    if df.empty:
+        st.info("No data found for the selected period.")
+        return
+
+    df['period_end'] = pd.to_datetime(df['period_end'])
+    period_cols = sorted(df['period_end'].unique())
+
+    def fmt_period(dt):
+        dt = pd.Timestamp(dt)
+        if interval == 'Year':    return dt.strftime('%Y')
+        if interval == 'Quarter': return f"{dt.year} Q{(dt.month - 1) // 3 + 1}"
+        return dt.strftime('%b %Y')
+
+    period_labels = [fmt_period(p) for p in period_cols]
+    label_map     = dict(zip(period_cols, period_labels))
+
+    # ── Chart ─────────────────────────────────────────────────────────────
+    chart_rows = []
+    for p in period_cols:
+        p_df   = df[df['period_end'] == p]
+        assets = p_df[p_df['section'] == 'Assets']['balance_eur'].sum()
+        liabs  = p_df[p_df['section'] == 'Liabilities']['balance_eur'].sum()
+        chart_rows.append({
+            'Period':      label_map[p],
+            'Assets':      max(assets, 0),
+            'Liabilities': abs(min(liabs, 0)),
+            'Net Worth':   assets + liabs,
+        })
+    df_chart = pd.DataFrame(chart_rows)
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        name='Assets', x=df_chart['Period'], y=df_chart['Assets'],
+        marker_color='#2ECC71',
+    ))
+    fig.add_trace(go.Bar(
+        name='Liabilities', x=df_chart['Period'], y=df_chart['Liabilities'],
+        marker_color='#E74C3C',
+    ))
+    fig.add_trace(go.Scatter(
+        name='Net Worth', x=df_chart['Period'], y=df_chart['Net Worth'],
+        mode='lines+markers',
+        line=dict(color='white', width=2),
+        marker=dict(color='#E74C3C', size=8),
+    ))
+    fig.update_layout(
+        barmode='group', template='plotly_dark',
+        title='<b>Net Worth — Assets vs Liabilities</b>',
+        yaxis_tickformat=',.0f', hovermode='x unified',
+        margin=dict(l=0, r=0, t=50, b=0),
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+    )
+    st.plotly_chart(fig, width='stretch')
+
+    # ── Hierarchical table ────────────────────────────────────────────────
+    ASSET_GROUPS     = ['Investments', 'Pension', 'Cash & Bank', 'Other Assets', 'Other']
+    LIABILITY_GROUPS = ['Credit Cards', 'Loans', 'Other Liabilities', 'Other']
+    SECTIONS = [('Assets', ASSET_GROUPS), ('Liabilities', LIABILITY_GROUPS)]
+
+    display_rows  = []
+    section_totals = {}
+
+    def _row(label, row_type, vals_by_period):
+        return {'Account': label, 'row_type': row_type,
+                **{label_map[p]: vals_by_period.get(p, 0) for p in period_cols}}
+
+    def _empty_row():
+        return {'Account': '', 'row_type': 'separator',
+                **{lbl: None for lbl in period_labels}}
+
+    for section, group_list in SECTIONS:
+        display_rows.append({'Account': section.upper(), 'row_type': 'section_header',
+                             **{lbl: None for lbl in period_labels}})
+        sec_total = {p: 0.0 for p in period_cols}
+
+        for group in group_list:
+            grp_df = df[(df['section'] == section) & (df['group_name'] == group)]
+            if grp_df.empty:
+                continue
+
+            grp_pivot = grp_df.pivot_table(
+                index=['accounts_id', 'accounts_name'],
+                columns='period_end',
+                values='balance_eur',
+                fill_value=0,
+                aggfunc='sum',
+            )
+
+            grp_total = {p: 0.0 for p in period_cols}
+            added = 0
+
+            for (acc_id, acc_name), row in grp_pivot.iterrows():
+                vals = {p: float(row.get(p, 0)) for p in period_cols}
+                if not show_zero and all(abs(v) < 0.005 for v in vals.values()):
+                    continue
+                display_rows.append(_row(f'    {acc_name}', 'account', vals))
+                added += 1
+                for p in period_cols:
+                    grp_total[p] += vals[p]
+
+            if added == 0 and not show_zero:
+                continue
+
+            display_rows.append(_row(f'  TOTAL {group}', 'group_subtotal', grp_total))
+            for p in period_cols:
+                sec_total[p] += grp_total[p]
+
+        display_rows.append(_row(f'TOTAL {section.upper()}', 'section_total', sec_total))
+        section_totals[section] = sec_total
+        display_rows.append(_empty_row())
+
+    nw_vals = {p: section_totals.get('Assets', {}).get(p, 0)
+                  + section_totals.get('Liabilities', {}).get(p, 0)
+               for p in period_cols}
+    display_rows.append(_row('NET WORTH', 'net_worth', nw_vals))
+
+    df_display = pd.DataFrame(display_rows)
+
+    # ── Styling ───────────────────────────────────────────────────────────
+    def row_styler(row):
+        rt = row.get('row_type', 'account')
+        if rt == 'net_worth':
+            s = 'font-weight: bold; border-top: 2px solid rgba(255,255,255,0.6)'
+        elif rt == 'section_total':
+            s = 'font-weight: bold; border-top: 1px solid rgba(255,255,255,0.4)'
+        elif rt == 'group_subtotal':
+            s = 'font-weight: bold'
+        elif rt == 'section_header':
+            s = 'color: rgba(200,200,200,0.8); font-weight: bold'
+        else:
+            s = ''
+        return [s] * len(row)
+
+    def fmt_val(v):
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return ''
+        if abs(v) < 0.005:
+            return '—'
+        return f'€ {v:,.0f}'
+
+    def color_neg(v):
+        if isinstance(v, (int, float)) and not pd.isna(v) and v < -0.005:
+            return 'color: #E74C3C'
+        return ''
+
+    format_dict = {lbl: fmt_val for lbl in period_labels}
+
+    styled = (
+        df_display.style
+        .apply(row_styler, axis=1)
+        .format(format_dict, na_rep='')
+        .map(color_neg, subset=period_labels)
+        .hide(axis='index')
+        .hide(['row_type'], axis='columns')
+    )
+
+    st.dataframe(styled, width='stretch', hide_index=True)
