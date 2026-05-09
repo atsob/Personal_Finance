@@ -300,7 +300,20 @@ class QIFImporter:
         for security in qif.securities.values():
             name = security.name
             ticker = security.symbol if security.symbol else name[:50]
-            sectype = security.type if hasattr(security, 'type') else 'Stock'
+            _VALID_SEC_TYPES = {
+                'Stock', 'ETF', 'Bond', 'Mutual Fund', 'Crypto', 'Option',
+                'Commodity', 'PF_Unit', 'CD', 'Emp. Stock Opt.', 'FX Spot',
+                'Market Index', 'Other',
+            }
+            _QIF_TYPE_MAP = {
+                'mf': 'Mutual Fund', 'mutual fund': 'Mutual Fund',
+                'etf': 'ETF', 'bond': 'Bond', 'stock': 'Stock',
+            }
+            raw_type = str(security.type).strip() if hasattr(security, 'type') and security.type else ''
+            sectype = (
+                raw_type if raw_type in _VALID_SEC_TYPES
+                else _QIF_TYPE_MAP.get(raw_type.lower(), 'Stock')
+            )
             
             # Check if security already exists
             existing_id = self.get_id("Securities", "securities_id", "ticker", ticker)
@@ -521,6 +534,124 @@ class QIFImporter:
                         if is_transfer and not current_transfer_id:
                             self.cur.execute("SELECT nextval('transfers_id_seq')")
                             current_transfer_id = self.cur.fetchone()[0]
+
+                        # 4b. Decompose split transactions that mix transfers and categories.
+                        #     The DB handles transfers at transaction level only, so we break
+                        #     a split like [-304.66 → Loan, -35.95 Loan:Car Interest] into:
+                        #       • one proper transfer transaction per transfer-split
+                        #       • one regular transaction per category-split
+                        #     The original parent amount is never inserted.
+                        if (not is_transfer
+                                and hasattr(tx, 'splits') and tx.splits
+                                and any(getattr(s, 'to_account', None)
+                                        for s in tx.splits if s.amount != 0)):
+                            _tr_splits  = [s for s in tx.splits
+                                           if getattr(s, 'to_account', None) and s.amount != 0]
+                            _cat_splits = [s for s in tx.splits
+                                           if not getattr(s, 'to_account', None) and s.amount != 0]
+
+                            for split in _tr_splits:
+                                s_target_name = split.to_account.strip().strip('[]')
+                                s_target_id = self.clean_id(self.get_or_create_id(
+                                    "Accounts", "Accounts_Id", "Accounts_Name", s_target_name,
+                                    {"Accounts_Type": "Checking", "Currencies_Id": account_currency_id}
+                                ))
+                                if s_target_id == c_acc_id:
+                                    continue
+
+                                # Duplicate guard for this split-derived transfer
+                                _s_key = (tx.date, s_target_id)
+                                _tx_occurrence_count[_s_key] = _tx_occurrence_count.get(_s_key, 0) + 1
+                                _s_nth = _tx_occurrence_count[_s_key]
+
+                                self.cur.execute("""
+                                    SELECT COUNT(*) FROM Transactions
+                                    WHERE Date = %s AND Accounts_Id = %s
+                                      AND Accounts_Id_Target = %s AND Transfers_Id IS NOT NULL
+                                """, (tx.date, s_target_id, c_acc_id))
+                                _s_mir = (self.cur.fetchone() or (0,))[0]
+
+                                self.cur.execute("""
+                                    SELECT COUNT(*) FROM Transactions
+                                    WHERE Date = %s AND Accounts_Id = %s
+                                      AND Accounts_Id_Target = %s AND Transfers_Id IS NOT NULL
+                                """, (tx.date, c_acc_id, s_target_id))
+                                _s_own = (self.cur.fetchone() or (0,))[0]
+
+                                if _s_own >= _s_nth:
+                                    continue  # full duplicate
+                                if _s_mir >= _s_nth:
+                                    continue  # mirror already exists; target account will update
+
+                                self.cur.execute("SELECT nextval('transfers_id_seq')")
+                                s_xfer_id = self.cur.fetchone()[0]
+
+                                self.cur.execute("""
+                                    INSERT INTO Transactions (
+                                        Accounts_Id, Date, Payees_Id, Description,
+                                        Total_Amount, Cleared, Accounts_Id_Target,
+                                        Total_Amount_Target, Transfers_Id
+                                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                                """, (
+                                    c_acc_id, tx.date, c_payee_id,
+                                    split.memo or tx.memo or tx.payee,
+                                    split.amount, is_cleared,
+                                    s_target_id, -split.amount, s_xfer_id
+                                ))
+                                bank_tx_count += 1
+
+                                # Mirror in target (skip if brokerage)
+                                self.cur.execute(
+                                    "SELECT Accounts_Type FROM Accounts WHERE Accounts_Id = %s",
+                                    (s_target_id,)
+                                )
+                                _s_tgt = self.cur.fetchone()
+                                if not (_s_tgt and _s_tgt[0] in ('Brokerage',)):
+                                    self.cur.execute("""
+                                        INSERT INTO Transactions (
+                                            Accounts_Id, Date, Payees_Id, Description,
+                                            Total_Amount, Cleared, Accounts_Id_Target,
+                                            Total_Amount_Target, Transfers_Id
+                                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                                    """, (
+                                        s_target_id, tx.date, c_payee_id,
+                                        split.memo or tx.memo or tx.payee,
+                                        -split.amount, is_cleared,
+                                        c_acc_id, split.amount, s_xfer_id
+                                    ))
+                                    bank_tx_count += 1
+
+                            for split in _cat_splits:
+                                cat_id = None
+                                if split.category:
+                                    if hasattr(split.category, 'hierarchy') and split.category.hierarchy:
+                                        _cname = split.category.hierarchy
+                                    elif hasattr(split.category, 'name'):
+                                        _cname = split.category.name
+                                    else:
+                                        _cname = str(split.category)
+                                    cat_id = self.get_or_create_category_recursive(_cname, cat_type='Expense')
+
+                                self.cur.execute("""
+                                    INSERT INTO Transactions (
+                                        Accounts_Id, Date, Payees_Id, Description,
+                                        Total_Amount, Cleared
+                                    ) VALUES (%s,%s,%s,%s,%s,%s)
+                                    RETURNING Transactions_Id
+                                """, (
+                                    c_acc_id, tx.date, c_payee_id,
+                                    split.memo or tx.memo or tx.payee,
+                                    split.amount, is_cleared
+                                ))
+                                _s_bt_id = self.cur.fetchone()[0]
+                                bank_tx_count += 1
+
+                                self.cur.execute("""
+                                    INSERT INTO Splits (Transactions_Id, Categories_Id, Amount, Memo)
+                                    VALUES (%s,%s,%s,%s)
+                                """, (_s_bt_id, self.clean_id(cat_id), split.amount, split.memo))
+
+                            continue  # skip the normal parent INSERT (steps 5-7)
 
                         # 5. Insert or update
                         # If this is the mirror side of a cross-account transfer: update the
@@ -787,11 +918,30 @@ class QIFImporter:
                                     )
                                 )
 
-                                # Skip if the L field resolved to the SAME account that is
-                                # currently being processed — that would create a self-referential
-                                # duplicate row (the "within same account" issue).
+                                # When L resolves to the SAME account, the buy/sell is
+                                # internally funded (no external cash account involved).
+                                # update_investment_balances() already debits Buy / credits Sell
+                                # from the Investments table. We create an offsetting Transactions
+                                # row so the net balance effect is zero:
+                                #   BuyX  → credit +abs(cash_amt)  offsets the Investments debit
+                                #   SellX → debit  -abs(cash_amt)  offsets the Investments credit
                                 if cash_acc_id == c_acc_id:
-                                    pass  # self-transfer: investment account manages its own cash
+                                    CASH_OUT_ACTIONS = {'BuyX', 'MiscExpX', 'WithdrwX', 'XIn'}
+                                    self_amount = (
+                                        abs(cash_amt) if raw_action in CASH_OUT_ACTIONS
+                                        else -abs(cash_amt)
+                                    )
+                                    self.cur.execute("""
+                                        INSERT INTO Transactions (
+                                            Accounts_Id, Date, Payees_Id, Description,
+                                            Total_Amount, Cleared
+                                        ) VALUES (%s, %s, %s, %s, %s, %s)
+                                    """, (
+                                        c_acc_id, tx.date, None,
+                                        tx.memo if hasattr(tx, 'memo') and tx.memo else raw_action,
+                                        self_amount, True
+                                    ))
+                                    bank_tx_count += 1
                                 else:
                                     # Determine cash flow direction from the linked account's perspective:
                                     # BuyX / MiscExpX / WithdrwX  → cash leaves the linked account (debit, negative)

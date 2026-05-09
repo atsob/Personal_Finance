@@ -11,7 +11,6 @@ def init_session_state():
         'selected_acc_index': 0,
         'account_id_internal': None,
         'show_splits_pane': False,
-        'nw_date_val':  pd.Timestamp(dt_lib.date.today().year - 1, 12, 31),
         'inv_date_val': pd.Timestamp(dt_lib.date.today().year - 1, 12, 31),
         'nwr_date_val': pd.Timestamp(2000, 1, 1),
     }

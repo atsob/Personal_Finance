@@ -4,10 +4,11 @@ import plotly.express as px
 import plotly.graph_objects as go
 import numpy as np
 from database.connection import get_db
-from database.crud import update_holdings
+from database.crud import update_holdings, save_nwr_account_selection
 from database.queries import (
-    get_category_hierarchy, get_hist_net_worth_data, get_hist_inv_positions_data,
-    get_net_worth_report_data,
+    get_category_hierarchy, get_hist_inv_positions_data,
+    get_net_worth_report_data, get_all_accounts_for_nwr, get_nwr_account_selection,
+    get_nwr_security_detail,
     get_pnl_report_data, get_income_expense_data, get_portfolio_signals,
     get_cash_flow_forecast, get_dividend_tracker_data, get_asset_allocation_data,
     get_fx_exposure_data, get_bond_schedule_data,
@@ -23,7 +24,6 @@ def render_reports():
     hist_sub_menu = st.sidebar.radio(
         "Select Report:",
         [
-            "Historical Net Worth",
             "Net Worth Report",
             "Historical Investment Positions",
             "P&L Reports",
@@ -41,192 +41,6 @@ def render_reports():
     if hist_sub_menu == "Net Worth Report":
         render_net_worth_report()
 
-    elif hist_sub_menu == "Historical Net Worth":
-        st.subheader("📈 Net Worth Progress (Monthly) to Date")
-        
-        last_day_prev_month = pd.Timestamp.now().replace(day=1) - pd.Timedelta(days=1)
-        
-        min_nwt_date = st.sidebar.date_input(
-            "📅 Start Date", 
-            value=st.session_state.nw_date_val,
-            max_value=last_day_prev_month,
-            key="nw_date"
-        )
-        st.session_state.nw_date_val = min_nwt_date
-        
-        df_hist = get_hist_net_worth_data(min_nwt_date)
-        
-        if st.sidebar.button("🔄 Refresh Net Worth"):
-            get_hist_net_worth_data.clear()
-            st.cache_data.clear()
-            st.rerun()
-        
-        try:
-            df_hist.columns = [c.lower() for c in df_hist.columns]
-            df_hist['date'] = pd.to_datetime(df_hist['date'])
-            df_hist = df_hist.sort_values('date')
-            
-            tab1, tab2, tab3 = st.tabs(["📊 Graph", "📋 Summary per Type", "🔍 Detail Analysis"])
-            
-            with tab1:
-                df_hist['net_change'] = df_hist['total_net_worth'].diff()
-                max_gain_idx = df_hist['net_change'].idxmax()
-                max_loss_idx = df_hist['net_change'].idxmin()
-                
-                fig = px.line(
-                    df_hist, 
-                    x="date", 
-                    y=["total_cash", "total_invested", "total_pension", "total_assets"],
-                    color_discrete_sequence=["#FFD700", "#457B9D", "#A8DADC", "#5D6D7E"],
-                    template="plotly_dark"
-                )
-                fig.update_traces(line=dict(width=2))
-                
-                fig.add_trace(
-                    go.Scatter(
-                        x=df_hist["date"], 
-                        y=df_hist["total_net_worth"],
-                        name="<b>TOTAL NET WORTH</b>",
-                        line=dict(color="white", width=5),
-                        hovertemplate="<b>%{y:,.0f} €</b>"
-                    )
-                )
-                
-                fig.add_annotation(
-                    x=df_hist.loc[max_gain_idx, 'date'],
-                    y=df_hist.loc[max_gain_idx, 'total_net_worth'],
-                    text="🚀 Max Gain",
-                    showarrow=True,
-                    arrowhead=2,
-                    arrowcolor="#2ECC71",
-                    ax=0, ay=-40,
-                    font=dict(color="#2ECC71", size=12)
-                )
-                
-                fig.add_annotation(
-                    x=df_hist.loc[max_loss_idx, 'date'],
-                    y=df_hist.loc[max_loss_idx, 'total_net_worth'],
-                    text="🔻 Max Loss",
-                    showarrow=True,
-                    arrowhead=2,
-                    arrowcolor="#E74C3C",
-                    ax=0, ay=40,
-                    font=dict(color="#E74C3C", size=12)
-                )
-                
-                fig.update_layout(
-                    yaxis_tickformat=',.0f', 
-                    legend=dict(orientation="h", yanchor="bottom", y=1.05, xanchor="right", x=1),
-                    title="<b>Net Worth & Changes Analysis</b>",
-                    xaxis=dict(
-                        range=[df_hist['date'].min(), df_hist['date'].max()],
-                        type='date',
-                        tickformat="%b %Y",
-                        dtick="M12"
-                    ),
-                    hovermode="x unified",
-                    margin=dict(l=0, r=0, t=100, b=0)
-                )
-                st.plotly_chart(fig, width="stretch")
-            
-            with tab2:
-                df_hist.rename(
-                    columns={
-                        'date': 'Date',
-                        'total_cash': 'Total Cash',
-                        'total_invested': 'Total Invested',
-                        'total_pension': 'Total Pension',
-                        'total_assets': 'Total Assets',
-                        'total_net_worth': 'Total Net Worth'
-                    }, 
-                    inplace=True
-                )
-                
-                st.dataframe(
-                    df_hist.sort_values('Date', ascending=False)
-                    .style
-                    .map(color_negative_red, subset=['net_change'])
-                    .format({
-                        "Date": lambda x: pd.to_datetime(x).strftime('%Y-%m-%d'),
-                        "total_assets": "€ {:,.2f}",
-                        "total_cash": "€ {:,.2f}",
-                        "total_pension": "€ {:,.2f}",
-                        "total_invested": "€ {:,.2f}",
-                        "total_net_worth": "€ {:,.2f}",
-                        "net_change": "€ {:,.2f}"
-                    }),
-                    width="stretch",
-                    hide_index=True
-                )
-
-            with tab3:
-                st.markdown("### 🔍 Net Worth Snapshot by Date")
-
-                available_dates = sorted(df_hist['Date'].unique(), reverse=True)
-                selected_date = st.selectbox(
-                    "Select Snapshot Date:",
-                    available_dates,
-                    format_func=lambda x: pd.to_datetime(x).strftime('%B %Y'),
-                    key="nw_snapshot_date"
-                )
-
-                row = df_hist[df_hist['Date'] == selected_date].iloc[0]
-
-                m1, m2, m3, m4, m5 = st.columns(5)
-                m1.metric("Net Worth",   f"€ {row['Total Net Worth']:,.2f}",
-                          delta=f"€ {row['net_change']:,.2f}" if pd.notna(row['net_change']) else None)
-                m2.metric("Cash",        f"€ {row['Total Cash']:,.2f}")
-                m3.metric("Investments", f"€ {row['Total Invested']:,.2f}")
-                m4.metric("Pension",     f"€ {row['Total Pension']:,.2f}")
-                m5.metric("Assets",      f"€ {row['Total Assets']:,.2f}")
-
-                df_components = pd.DataFrame([
-                    {'Category': 'Cash',        'Value (€)': row['Total Cash']},
-                    {'Category': 'Investments', 'Value (€)': row['Total Invested']},
-                    {'Category': 'Pension',     'Value (€)': row['Total Pension']},
-                    {'Category': 'Assets',      'Value (€)': row['Total Assets']},
-                ])
-                df_components = df_components[df_components['Value (€)'] != 0].copy()
-
-                if not df_components.empty:
-                    df_components['% of Net Worth'] = (
-                        df_components['Value (€)'] / row['Total Net Worth'] * 100
-                    ).round(2)
-
-                    col_pie, col_table = st.columns([1, 1])
-
-                    with col_pie:
-                        fig_pie = px.pie(
-                            df_components,
-                            values='Value (€)',
-                            names='Category',
-                            title=f"<b>Net Worth Breakdown — {pd.to_datetime(selected_date).strftime('%B %Y')}</b>",
-                            template='plotly_dark',
-                            hole=0.4,
-                            color_discrete_sequence=["#FFD700", "#457B9D", "#A8DADC", "#5D6D7E"],
-                        )
-                        fig_pie.update_traces(textinfo='percent+label')
-                        fig_pie.update_layout(showlegend=False, margin=dict(l=0, r=0, t=50, b=0))
-                        st.plotly_chart(fig_pie, width='stretch')
-
-                    with col_table:
-                        st.dataframe(
-                            df_components.style.format({
-                                'Value (€)':      '€ {:,.2f}',
-                                '% of Net Worth': '{:.2f}%',
-                            }),
-                            hide_index=True,
-                            width='stretch',
-                            column_config={
-                                'Category':       'Category',
-                                'Value (€)':      st.column_config.NumberColumn('Value (€)',  format='€ %,.2f'),
-                                '% of Net Worth': st.column_config.NumberColumn('% of NW',   format='%.2f%%'),
-                            }
-                        )
-
-        except Exception as e:
-            st.error(f"Error: {e}")
-    
     elif hist_sub_menu == "Historical Investment Positions":
         st.subheader("📈 Investments Position Progress (Monthly)")
         
@@ -234,8 +48,9 @@ def render_reports():
         last_day_prev_month = pd.Timestamp.now().replace(day=1) - pd.Timedelta(days=1)
         
         min_inv_date = st.sidebar.date_input(
-            "📅 Start Date", 
+            "📅 Start Date",
             value=st.session_state.inv_date_val,
+            min_value=datetime(1900, 1, 1),
             max_value=last_day_prev_month,
             key="inv_date"
         )
@@ -2547,22 +2362,53 @@ def render_net_worth_report():
     start_date = st.sidebar.date_input(
         "📅 Start Date",
         value=st.session_state.nwr_date_val,
+        min_value=datetime(1900, 1, 1),
         max_value=last_day_prev_month,
         key="nwr_date",
     )
     st.session_state.nwr_date_val = start_date
-
     interval  = st.sidebar.radio("Interval:", ["Year", "Quarter", "Month"], key="nwr_interval")
     show_zero = st.sidebar.checkbox("Show zero-balance accounts", value=False, key="nwr_show_zero")
-
     if st.sidebar.button("🔄 Refresh", key="nwr_refresh"):
         get_net_worth_report_data.clear()
+        get_nwr_security_detail.clear()
         st.cache_data.clear()
         st.rerun()
 
+    # ── Account selection (main area, full-width) ─────────────────────────
+    df_accounts = get_all_accounts_for_nwr()
+    all_ids     = df_accounts['accounts_id'].tolist()
+    id_to_name  = dict(zip(df_accounts['accounts_id'], df_accounts['accounts_name']))
+    id_to_type  = dict(zip(df_accounts['accounts_id'], df_accounts['accounts_type']))
+
+    saved_ids = get_nwr_account_selection()
+    init_sel  = set(saved_ids) if saved_ids is not None else set(all_ids)
+
+    df_sel = df_accounts.copy()
+    df_sel.insert(0, 'Include', df_sel['accounts_id'].isin(init_sel))
+
+    with st.expander("⚙️ Account Selection", expanded=False):
+        edited_df = st.data_editor(
+            df_sel.rename(columns={'accounts_name': 'Account', 'accounts_type': 'Type'}),
+            column_config={
+                'Include':     st.column_config.CheckboxColumn('Include', default=True),
+                'accounts_id': None,
+            },
+            hide_index=True,
+            width="stretch",
+            disabled=['Account', 'Type'],
+            key="nwr_account_editor",
+        )
+        selected_ids = edited_df[edited_df['Include']]['accounts_id'].tolist()
+        col_save, _ = st.columns([1, 4])
+        if col_save.button("💾 Save Selection", key="nwr_save"):
+            save_nwr_account_selection(selected_ids)
+            st.success("Account selection saved!")
+
     # ── Data ──────────────────────────────────────────────────────────────
+    account_ids_tuple = tuple(sorted(selected_ids)) if selected_ids else None
     with st.spinner("Loading net worth data…"):
-        df = get_net_worth_report_data(start_date.isoformat(), interval)
+        df = get_net_worth_report_data(start_date.isoformat(), interval, account_ids_tuple)
 
     if df.empty:
         st.info("No data found for the selected period.")
@@ -2580,123 +2426,7 @@ def render_net_worth_report():
     period_labels = [fmt_period(p) for p in period_cols]
     label_map     = dict(zip(period_cols, period_labels))
 
-    # ── Chart ─────────────────────────────────────────────────────────────
-    chart_rows = []
-    for p in period_cols:
-        p_df   = df[df['period_end'] == p]
-        assets = p_df[p_df['section'] == 'Assets']['balance_eur'].sum()
-        liabs  = p_df[p_df['section'] == 'Liabilities']['balance_eur'].sum()
-        chart_rows.append({
-            'Period':      label_map[p],
-            'Assets':      max(assets, 0),
-            'Liabilities': abs(min(liabs, 0)),
-            'Net Worth':   assets + liabs,
-        })
-    df_chart = pd.DataFrame(chart_rows)
-
-    fig = go.Figure()
-    fig.add_trace(go.Bar(
-        name='Assets', x=df_chart['Period'], y=df_chart['Assets'],
-        marker_color='#2ECC71',
-    ))
-    fig.add_trace(go.Bar(
-        name='Liabilities', x=df_chart['Period'], y=df_chart['Liabilities'],
-        marker_color='#E74C3C',
-    ))
-    fig.add_trace(go.Scatter(
-        name='Net Worth', x=df_chart['Period'], y=df_chart['Net Worth'],
-        mode='lines+markers',
-        line=dict(color='white', width=2),
-        marker=dict(color='#E74C3C', size=8),
-    ))
-    fig.update_layout(
-        barmode='group', template='plotly_dark',
-        title='<b>Net Worth — Assets vs Liabilities</b>',
-        yaxis_tickformat=',.0f', hovermode='x unified',
-        margin=dict(l=0, r=0, t=50, b=0),
-        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
-    )
-    st.plotly_chart(fig, width='stretch')
-
-    # ── Hierarchical table ────────────────────────────────────────────────
-    ASSET_GROUPS     = ['Investments', 'Pension', 'Cash & Bank', 'Other Assets', 'Other']
-    LIABILITY_GROUPS = ['Credit Cards', 'Loans', 'Other Liabilities', 'Other']
-    SECTIONS = [('Assets', ASSET_GROUPS), ('Liabilities', LIABILITY_GROUPS)]
-
-    display_rows  = []
-    section_totals = {}
-
-    def _row(label, row_type, vals_by_period):
-        return {'Account': label, 'row_type': row_type,
-                **{label_map[p]: vals_by_period.get(p, 0) for p in period_cols}}
-
-    def _empty_row():
-        return {'Account': '', 'row_type': 'separator',
-                **{lbl: None for lbl in period_labels}}
-
-    for section, group_list in SECTIONS:
-        display_rows.append({'Account': section.upper(), 'row_type': 'section_header',
-                             **{lbl: None for lbl in period_labels}})
-        sec_total = {p: 0.0 for p in period_cols}
-
-        for group in group_list:
-            grp_df = df[(df['section'] == section) & (df['group_name'] == group)]
-            if grp_df.empty:
-                continue
-
-            grp_pivot = grp_df.pivot_table(
-                index=['accounts_id', 'accounts_name'],
-                columns='period_end',
-                values='balance_eur',
-                fill_value=0,
-                aggfunc='sum',
-            )
-
-            grp_total = {p: 0.0 for p in period_cols}
-            added = 0
-
-            for (acc_id, acc_name), row in grp_pivot.iterrows():
-                vals = {p: float(row.get(p, 0)) for p in period_cols}
-                if not show_zero and all(abs(v) < 0.005 for v in vals.values()):
-                    continue
-                display_rows.append(_row(f'    {acc_name}', 'account', vals))
-                added += 1
-                for p in period_cols:
-                    grp_total[p] += vals[p]
-
-            if added == 0 and not show_zero:
-                continue
-
-            display_rows.append(_row(f'  TOTAL {group}', 'group_subtotal', grp_total))
-            for p in period_cols:
-                sec_total[p] += grp_total[p]
-
-        display_rows.append(_row(f'TOTAL {section.upper()}', 'section_total', sec_total))
-        section_totals[section] = sec_total
-        display_rows.append(_empty_row())
-
-    nw_vals = {p: section_totals.get('Assets', {}).get(p, 0)
-                  + section_totals.get('Liabilities', {}).get(p, 0)
-               for p in period_cols}
-    display_rows.append(_row('NET WORTH', 'net_worth', nw_vals))
-
-    df_display = pd.DataFrame(display_rows)
-
-    # ── Styling ───────────────────────────────────────────────────────────
-    def row_styler(row):
-        rt = row.get('row_type', 'account')
-        if rt == 'net_worth':
-            s = 'font-weight: bold; border-top: 2px solid rgba(255,255,255,0.6)'
-        elif rt == 'section_total':
-            s = 'font-weight: bold; border-top: 1px solid rgba(255,255,255,0.4)'
-        elif rt == 'group_subtotal':
-            s = 'font-weight: bold'
-        elif rt == 'section_header':
-            s = 'color: rgba(200,200,200,0.8); font-weight: bold'
-        else:
-            s = ''
-        return [s] * len(row)
-
+    # ── Shared helpers ────────────────────────────────────────────────────
     def fmt_val(v):
         if v is None or (isinstance(v, float) and pd.isna(v)):
             return ''
@@ -2709,15 +2439,461 @@ def render_net_worth_report():
             return 'color: #E74C3C'
         return ''
 
-    format_dict = {lbl: fmt_val for lbl in period_labels}
+    # ── Tabs ──────────────────────────────────────────────────────────────
+    tab1, tab2, tab3, tab4 = st.tabs(["📊 Overview", "📋 Summary per Type", "🔍 Detail Analysis", "💰 Account Balances"])
 
-    styled = (
-        df_display.style
-        .apply(row_styler, axis=1)
-        .format(format_dict, na_rep='')
-        .map(color_neg, subset=period_labels)
-        .hide(axis='index')
-        .hide(['row_type'], axis='columns')
-    )
+    # ═══════════════════════════════════════════════════════════════════════
+    with tab1:
+        # ── Chart ─────────────────────────────────────────────────────────
+        chart_rows = []
+        for p in period_cols:
+            p_df   = df[df['period_end'] == p]
+            assets = p_df[p_df['section'] == 'Assets']['balance_eur'].sum()
+            liabs  = p_df[p_df['section'] == 'Liabilities']['balance_eur'].sum()
+            chart_rows.append({
+                'Period':      label_map[p],
+                'Assets':      max(assets, 0),
+                'Liabilities': abs(min(liabs, 0)),
+                'Net Worth':   assets + liabs,
+            })
+        df_chart = pd.DataFrame(chart_rows)
 
-    st.dataframe(styled, width='stretch', hide_index=True)
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            name='Assets', x=df_chart['Period'], y=df_chart['Assets'],
+            marker_color='#2ECC71',
+        ))
+        fig.add_trace(go.Bar(
+            name='Liabilities', x=df_chart['Period'], y=df_chart['Liabilities'],
+            marker_color='#E74C3C',
+        ))
+        fig.add_trace(go.Scatter(
+            name='Net Worth', x=df_chart['Period'], y=df_chart['Net Worth'],
+            mode='lines+markers',
+            line=dict(color='white', width=2),
+            marker=dict(color='#E74C3C', size=8),
+        ))
+        fig.update_layout(
+            barmode='group', template='plotly_dark',
+            title='<b>Net Worth — Assets vs Liabilities</b>',
+            yaxis_tickformat=',.0f', hovermode='x unified',
+            margin=dict(l=0, r=0, t=50, b=0),
+            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+        )
+        st.plotly_chart(fig, width='stretch')
+
+        # ── Hierarchical table ─────────────────────────────────────────────
+        ASSET_GROUPS     = ['Investments', 'Pension', 'Cash & Bank', 'Other Assets', 'Other']
+        LIABILITY_GROUPS = ['Credit Cards', 'Loans', 'Other Liabilities', 'Other']
+        SECTIONS = [('Assets', ASSET_GROUPS), ('Liabilities', LIABILITY_GROUPS)]
+
+        display_rows   = []
+        section_totals = {}
+
+        def _row(label, row_type, vals_by_period):
+            return {'Account': label, 'row_type': row_type,
+                    **{label_map[p]: vals_by_period.get(p, 0) for p in period_cols}}
+
+        def _empty_row():
+            return {'Account': '', 'row_type': 'separator',
+                    **{lbl: None for lbl in period_labels}}
+
+        for section, group_list in SECTIONS:
+            display_rows.append({'Account': section.upper(), 'row_type': 'section_header',
+                                 **{lbl: None for lbl in period_labels}})
+            sec_total = {p: 0.0 for p in period_cols}
+
+            for group in group_list:
+                grp_df = df[(df['section'] == section) & (df['group_name'] == group)]
+                if grp_df.empty:
+                    continue
+
+                grp_pivot = grp_df.pivot_table(
+                    index=['accounts_id', 'accounts_name'],
+                    columns='period_end',
+                    values='balance_eur',
+                    fill_value=0,
+                    aggfunc='sum',
+                )
+
+                grp_total = {p: float(grp_pivot[p].sum()) if p in grp_pivot.columns else 0.0 for p in period_cols}
+
+                if not show_zero:
+                    row_max = grp_pivot.reindex(columns=period_cols, fill_value=0).abs().max(axis=1)
+                    visible_pivot = grp_pivot[row_max >= 0.005]
+                else:
+                    visible_pivot = grp_pivot
+
+                if visible_pivot.empty and not show_zero:
+                    continue
+
+                for (acc_id, acc_name), row in visible_pivot.iterrows():
+                    vals = {p: float(row.get(p, 0)) for p in period_cols}
+                    display_rows.append(_row(f'    {acc_name}', 'account', vals))
+
+                display_rows.append(_row(f'  TOTAL {group}', 'group_subtotal', grp_total))
+                for p in period_cols:
+                    sec_total[p] += grp_total[p]
+
+            display_rows.append(_row(f'TOTAL {section.upper()}', 'section_total', sec_total))
+            section_totals[section] = sec_total
+            display_rows.append(_empty_row())
+
+        nw_vals = {p: section_totals.get('Assets', {}).get(p, 0)
+                      + section_totals.get('Liabilities', {}).get(p, 0)
+                   for p in period_cols}
+        display_rows.append(_row('NET WORTH', 'net_worth', nw_vals))
+
+        df_display = pd.DataFrame(display_rows)
+
+        def row_styler(row):
+            rt = row.get('row_type', 'account')
+            if rt == 'net_worth':
+                s = 'font-weight: bold; border-top: 2px solid rgba(255,255,255,0.6)'
+            elif rt == 'section_total':
+                s = 'font-weight: bold; border-top: 1px solid rgba(255,255,255,0.4)'
+            elif rt == 'group_subtotal':
+                s = 'font-weight: bold'
+            elif rt == 'section_header':
+                s = 'color: rgba(200,200,200,0.8); font-weight: bold'
+            else:
+                s = ''
+            return [s] * len(row)
+
+        format_dict = {lbl: fmt_val for lbl in period_labels}
+
+        styled = (
+            df_display.style
+            .apply(row_styler, axis=1)
+            .format(format_dict, na_rep='')
+            .map(color_neg, subset=period_labels)
+            .hide(axis='index')
+            .hide(['row_type'], axis='columns')
+        )
+
+        st.dataframe(
+            styled, width='stretch', hide_index=True,
+            column_config={'Account': st.column_config.TextColumn("Account", pinned=True)},
+        )
+
+        # ── Investment account drilldown ───────────────────────────────────
+        inv_types    = {'Brokerage', 'Margin'}
+        inv_accounts = df_accounts[
+            df_accounts['accounts_id'].isin(selected_ids) &
+            df_accounts['accounts_type'].isin(inv_types)
+        ]
+
+        if not inv_accounts.empty:
+            st.markdown("---")
+            st.subheader("🔍 Investment Account Detail")
+
+            detail_acc_id = st.selectbox(
+                "Select account:",
+                options=inv_accounts['accounts_id'].tolist(),
+                format_func=lambda x: f"{id_to_name[x]} ({id_to_type[x]})",
+                key="nwr_detail_acc",
+            )
+
+            with st.spinner("Loading security detail…"):
+                df_detail = get_nwr_security_detail(
+                    start_date.isoformat(), interval, int(detail_acc_id)
+                )
+
+            if df_detail.empty:
+                st.info("No investment transactions found for this account.")
+            else:
+                df_detail['period_end'] = pd.to_datetime(df_detail['period_end'])
+
+                detail_pivot = df_detail.pivot_table(
+                    index='security_name',
+                    columns='period_end',
+                    values='value_eur',
+                    fill_value=0,
+                    aggfunc='sum',
+                )
+
+                if not show_zero:
+                    row_max = detail_pivot.reindex(columns=period_cols, fill_value=0).abs().max(axis=1)
+                    detail_pivot = detail_pivot[row_max >= 0.005]
+
+                if detail_pivot.empty:
+                    st.info("All securities have zero value in the selected period.")
+                else:
+                    detail_pivot.columns = [label_map.get(c, str(c)) for c in detail_pivot.columns]
+                    present_labels = [lbl for lbl in period_labels if lbl in detail_pivot.columns]
+                    detail_pivot = detail_pivot[present_labels].reset_index()
+                    detail_pivot.rename(columns={'security_name': 'Security'}, inplace=True)
+
+                    total_row = {'Security': 'TOTAL'}
+                    for lbl in present_labels:
+                        total_row[lbl] = detail_pivot[lbl].sum()
+                    detail_pivot = pd.concat(
+                        [detail_pivot, pd.DataFrame([total_row])], ignore_index=True
+                    )
+
+                    def style_total_row(row):
+                        if row.get('Security') == 'TOTAL':
+                            return ['font-weight: bold; border-top: 1px solid rgba(255,255,255,0.4)'] * len(row)
+                        return [''] * len(row)
+
+                    styled_detail = (
+                        detail_pivot.style
+                        .apply(style_total_row, axis=1)
+                        .format({lbl: fmt_val for lbl in present_labels}, na_rep='')
+                        .map(color_neg, subset=present_labels)
+                        .hide(axis='index')
+                    )
+
+                    st.dataframe(
+                        styled_detail, width='stretch', hide_index=True,
+                        column_config={'Security': st.column_config.TextColumn("Security", pinned=True)},
+                    )
+
+    # ═══════════════════════════════════════════════════════════════════════
+    with tab2:
+        GROUP_ORDER = ['Cash & Bank', 'Investments', 'Pension', 'Other Assets',
+                       'Credit Cards', 'Loans', 'Other Liabilities']
+
+        summary_rows = []
+        for p in period_cols:
+            p_df = df[df['period_end'] == p]
+            row  = {'Period': label_map[p]}
+            for grp in GROUP_ORDER:
+                row[grp] = p_df[p_df['group_name'] == grp]['balance_eur'].sum()
+            row['Total Assets']      = p_df[p_df['section'] == 'Assets']['balance_eur'].sum()
+            row['Total Liabilities'] = p_df[p_df['section'] == 'Liabilities']['balance_eur'].sum()
+            row['Net Worth']         = row['Total Assets'] + row['Total Liabilities']
+            summary_rows.append(row)
+
+        df_summary = pd.DataFrame(summary_rows[::-1])  # latest first
+
+        num_cols = [c for c in df_summary.columns if c != 'Period']
+
+        def style_summary_row(row):
+            if row.get('Period') == df_summary['Period'].iloc[0]:
+                return [''] * len(row)
+            return [''] * len(row)
+
+        def color_summary_neg(v):
+            if isinstance(v, (int, float)) and not pd.isna(v) and v < -0.005:
+                return 'color: #E74C3C'
+            return ''
+
+        styled_summary = (
+            df_summary.style
+            .format({c: fmt_val for c in num_cols}, na_rep='')
+            .map(color_summary_neg, subset=num_cols)
+            .hide(axis='index')
+        )
+
+        st.dataframe(
+            styled_summary, width='stretch', hide_index=True,
+            column_config={'Period': st.column_config.TextColumn('Period', pinned=True)},
+        )
+
+    # ═══════════════════════════════════════════════════════════════════════
+    with tab3:
+        selected_period = st.selectbox(
+            "Select Period:",
+            options=period_cols[::-1],
+            format_func=fmt_period,
+            key="nwr_snapshot_period",
+        )
+
+        p_df   = df[df['period_end'] == selected_period]
+        assets = p_df[p_df['section'] == 'Assets']['balance_eur'].sum()
+        liabs  = p_df[p_df['section'] == 'Liabilities']['balance_eur'].sum()
+        nw     = assets + liabs
+
+        grp_sums = p_df.groupby('group_name')['balance_eur'].sum()
+
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
+        m1.metric("Net Worth",       f"€ {nw:,.0f}")
+        m2.metric("Cash & Bank",     f"€ {grp_sums.get('Cash & Bank', 0):,.0f}")
+        m3.metric("Investments",     f"€ {grp_sums.get('Investments', 0):,.0f}")
+        m4.metric("Pension",         f"€ {grp_sums.get('Pension', 0):,.0f}")
+        m5.metric("Other Assets",    f"€ {grp_sums.get('Other Assets', 0):,.0f}")
+        m6.metric("Liabilities",     f"€ {(liabs):,.0f}")
+
+        df_breakdown = (
+            grp_sums[grp_sums.abs() >= 0.005]
+            .reset_index()
+            .rename(columns={'group_name': 'Category', 'balance_eur': 'Value (€)'})
+        )
+
+        if not df_breakdown.empty and nw != 0:
+            df_breakdown['% of Net Worth'] = (df_breakdown['Value (€)'] / nw * 100).round(2)
+
+            col_pie, col_table = st.columns([1, 1])
+
+            with col_pie:
+                fig_pie = px.pie(
+                    df_breakdown,
+                    values='Value (€)',
+                    names='Category',
+                    title=f"<b>Net Worth Breakdown — {fmt_period(selected_period)}</b>",
+                    template='plotly_dark',
+                    hole=0.4,
+                    color_discrete_sequence=[
+                        '#457B9D', '#2ECC71', '#A8DADC', '#5D6D7E',
+                        '#E74C3C', '#E67E22', '#FFD700',
+                    ],
+                )
+                fig_pie.update_traces(textinfo='percent+label')
+                fig_pie.update_layout(showlegend=False, margin=dict(l=0, r=0, t=50, b=0))
+                st.plotly_chart(fig_pie, width='stretch')
+
+            with col_table:
+                st.dataframe(
+                    df_breakdown.style.format({
+                        'Value (€)':      fmt_val,
+                        '% of Net Worth': '{:.2f}%',
+                    }).map(color_neg, subset=['Value (€)']).hide(axis='index'),
+                    hide_index=True,
+                    width='stretch',
+                    column_config={
+                        'Category':       st.column_config.TextColumn('Category'),
+                        'Value (€)':      st.column_config.NumberColumn('Value (€)',  format='€ %,.0f'),
+                        '% of Net Worth': st.column_config.NumberColumn('% of NW',   format='%.2f%%'),
+                    },
+                )
+
+    # ═══════════════════════════════════════════════════════════════════════
+    with tab4:
+        # ── Stacked bar chart by account group + Balance line ──────────────
+        GROUP_COLORS = {
+            'Cash & Bank':       '#FFD700',
+            'Investments':       '#457B9D',
+            'Pension':           '#A8DADC',
+            'Other Assets':      '#9B59B6',
+            'Other':             '#95A5A6',
+            'Credit Cards':      '#E74C3C',
+            'Loans':             '#E67E22',
+            'Other Liabilities': '#C0392B',
+        }
+        GROUP_ORDER = ['Cash & Bank', 'Investments', 'Pension', 'Other Assets', 'Other',
+                       'Credit Cards', 'Loans', 'Other Liabilities']
+
+        fig_ab = go.Figure()
+        for grp in GROUP_ORDER:
+            if grp not in df['group_name'].values:
+                continue
+            y_vals = [
+                df[(df['period_end'] == p) & (df['group_name'] == grp)]['balance_eur'].sum()
+                for p in period_cols
+            ]
+            fig_ab.add_trace(go.Bar(
+                name=grp,
+                x=period_labels,
+                y=y_vals,
+                marker_color=GROUP_COLORS.get(grp, '#95A5A6'),
+            ))
+
+        nw_line = [df[df['period_end'] == p]['balance_eur'].sum() for p in period_cols]
+        fig_ab.add_trace(go.Scatter(
+            name='Balance',
+            x=period_labels,
+            y=nw_line,
+            mode='lines+markers',
+            line=dict(color='#FF69B4', width=2),
+            marker=dict(color='#FF69B4', size=8),
+        ))
+        fig_ab.update_layout(
+            barmode='stack', template='plotly_dark',
+            title='<b>Account Balances</b>',
+            yaxis_tickformat=',.0f', hovermode='x unified',
+            margin=dict(l=0, r=0, t=50, b=0),
+            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+        )
+        st.plotly_chart(fig_ab, width='stretch')
+
+        # ── Table — period columns labelled with explicit end dates ─────────
+        def fmt_period_date(dt):
+            return pd.Timestamp(dt).strftime('%d/%m/%Y')
+
+        date_labels   = [fmt_period_date(p) for p in period_cols]
+        date_label_map = dict(zip(period_cols, date_labels))
+
+        ACCOUNT_TYPE_GROUPS = [
+            ('Assets',      'Cash & Bank',       'Bank & Cash Accounts'),
+            ('Assets',      'Investments',        'Investment Accounts'),
+            ('Assets',      'Pension',            'Pension Accounts'),
+            ('Assets',      'Other Assets',       'Asset Accounts'),
+            ('Assets',      'Other',              'Other Accounts'),
+            ('Liabilities', 'Credit Cards',       'Credit Card Accounts'),
+            ('Liabilities', 'Loans',              'Loan Accounts'),
+            ('Liabilities', 'Other Liabilities',  'Liability Accounts'),
+        ]
+
+        ab_rows    = []
+        ending_vals = {p: 0.0 for p in period_cols}
+
+        def _ab_row(label, row_type, vals_by_period):
+            return {'Account': label, 'row_type': row_type,
+                    **{date_label_map[p]: vals_by_period.get(p, 0) for p in period_cols}}
+
+        def _ab_empty():
+            return {'Account': '', 'row_type': 'separator',
+                    **{lbl: None for lbl in date_labels}}
+
+        for section, group_name, display_name in ACCOUNT_TYPE_GROUPS:
+            grp_df = df[(df['section'] == section) & (df['group_name'] == group_name)]
+            if grp_df.empty:
+                continue
+
+            ab_rows.append({'Account': display_name, 'row_type': 'group_header',
+                            **{lbl: None for lbl in date_labels}})
+
+            grp_pivot = grp_df.pivot_table(
+                index=['accounts_id', 'accounts_name'],
+                columns='period_end',
+                values='balance_eur',
+                fill_value=0,
+                aggfunc='sum',
+            )
+
+            grp_total = {p: float(grp_pivot[p].sum()) if p in grp_pivot.columns else 0.0
+                         for p in period_cols}
+
+            visible_pivot = grp_pivot
+            if not show_zero:
+                row_max = grp_pivot.reindex(columns=period_cols, fill_value=0).abs().max(axis=1)
+                visible_pivot = grp_pivot[row_max >= 0.005]
+
+            for (acc_id, acc_name), row in visible_pivot.iterrows():
+                vals = {p: float(row.get(p, 0)) for p in period_cols}
+                ab_rows.append(_ab_row(f'    {acc_name}', 'account', vals))
+
+            ab_rows.append(_ab_row(f'TOTAL {display_name}', 'group_total', grp_total))
+            ab_rows.append(_ab_empty())
+
+            for p in period_cols:
+                ending_vals[p] += grp_total[p]
+
+        ab_rows.append(_ab_row('Ending Balance', 'ending_balance', ending_vals))
+
+        df_ab = pd.DataFrame(ab_rows)
+
+        def ab_row_styler(row):
+            rt = row.get('row_type', 'account')
+            if rt == 'ending_balance':
+                return ['font-weight: bold; border-top: 2px solid rgba(255,255,255,0.6)'] * len(row)
+            elif rt == 'group_total':
+                return ['font-weight: bold; border-top: 1px solid rgba(255,255,255,0.4)'] * len(row)
+            elif rt == 'group_header':
+                return ['font-weight: bold; color: rgba(220,220,220,0.9)'] * len(row)
+            return [''] * len(row)
+
+        styled_ab = (
+            df_ab.style
+            .apply(ab_row_styler, axis=1)
+            .format({lbl: fmt_val for lbl in date_labels}, na_rep='')
+            .map(color_neg, subset=date_labels)
+            .hide(axis='index')
+            .hide(['row_type'], axis='columns')
+        )
+
+        st.dataframe(
+            styled_ab, width='stretch', hide_index=True,
+            column_config={'Account': st.column_config.TextColumn("Account", pinned=True)},
+        )

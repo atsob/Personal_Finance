@@ -266,7 +266,7 @@ def get_hist_inv_positions_data(start_date):
 
 
 @st.cache_data(ttl=3600)
-def get_net_worth_report_data(start_date: str, interval: str = 'Year'):
+def get_net_worth_report_data(start_date: str, interval: str = 'Year', account_ids: tuple = None):
     """Per-account historical balances at each period-end for the Quicken-style Net Worth report."""
     conn = get_connection()
 
@@ -275,10 +275,18 @@ def get_net_worth_report_data(start_date: str, interval: str = 'Year'):
     trunc_unit  = trunc_map.get(interval, 'year')
     pg_interval = intv_map.get(interval, '1 year')
 
+    # Build account filter clause (account_ids are internal DB integers — safe to embed)
+    if account_ids:
+        ids_sql = ', '.join(str(int(i)) for i in account_ids)
+        acc_filter = f'AND a.Accounts_Id IN ({ids_sql})'
+        inv_acc_filter = f'AND Accounts_Id IN ({ids_sql})'
+    else:
+        acc_filter = ''
+        inv_acc_filter = ''
+
     query = f"""
     WITH
     period_dates AS (
-        -- Last day of each complete period, plus today
         SELECT (gs - INTERVAL '1 day')::date AS period_end
         FROM generate_series(
             date_trunc('{trunc_unit}', '{start_date}'::date) + '{pg_interval}'::interval,
@@ -305,20 +313,35 @@ def get_net_worth_report_data(start_date: str, interval: str = 'Year'):
             a.Accounts_Id,
             a.Accounts_Name,
             a.Accounts_Type,
-            (a.Accounts_Balance - COALESCE((
-                SELECT SUM(Total_Amount) FROM Transactions
-                WHERE Accounts_Id = a.Accounts_Id AND Date > p.period_end
-            ), 0)) * COALESCE(
+            CASE
+                WHEN a.Accounts_Type IN ('Real Estate', 'Vehicle', 'Asset')
+                -- Physical assets cannot go negative (backwards reconstruction artefact)
+                THEN GREATEST(0, a.Accounts_Balance - COALESCE((
+                    SELECT SUM(Total_Amount) FROM Transactions
+                    WHERE Accounts_Id = a.Accounts_Id AND Date > p.period_end
+                ), 0))
+                ELSE (a.Accounts_Balance - COALESCE((
+                    SELECT SUM(Total_Amount) FROM Transactions
+                    WHERE Accounts_Id = a.Accounts_Id AND Date > p.period_end
+                ), 0))
+            END * COALESCE(
                 (SELECT fx_rate FROM daily_fx
                  WHERE period_end = p.period_end AND Currencies_Id = a.Currencies_Id),
                 1
             ) AS balance_eur
         FROM period_dates p
         CROSS JOIN Accounts a
-        WHERE a.Is_Active = TRUE
-          AND a.Accounts_Type NOT IN ('Brokerage', 'Margin', 'Pension')
+        WHERE a.Accounts_Type NOT IN ('Brokerage', 'Margin', 'Pension')
+          {acc_filter}
     ),
-    -- Brokerage / Margin: value = Σ qty_at_date × price_at_date × fx_at_date
+    -- Brokerage / Margin: forward cumulative qty per security × price × fx
+    -- Uses Investments table directly so fully-sold securities appear in history
+    investment_universe AS (
+        SELECT DISTINCT Securities_Id, Accounts_Id
+        FROM Investments
+        WHERE Action IN ('Buy', 'Reinvest', 'ShrIn', 'Sell', 'ShrOut')
+          {inv_acc_filter}
+    ),
     investment_holdings AS (
         SELECT
             p.period_end,
@@ -326,19 +349,19 @@ def get_net_worth_report_data(start_date: str, interval: str = 'Year'):
             a.Accounts_Name,
             a.Accounts_Type,
             SUM(
-                (h.Quantity - COALESCE((
+                GREATEST(COALESCE((
                     SELECT SUM(CASE
                         WHEN Action IN ('Buy','Reinvest','ShrIn') THEN  Quantity
                         WHEN Action IN ('Sell','ShrOut')          THEN -Quantity
                         ELSE 0 END)
-                    FROM Investments
-                    WHERE Securities_Id = h.Securities_Id
-                      AND Accounts_Id   = h.Accounts_Id
-                      AND Date          > p.period_end
-                ), 0)) *
+                    FROM Investments i2
+                    WHERE i2.Securities_Id = i.Securities_Id
+                      AND i2.Accounts_Id   = i.Accounts_Id
+                      AND i2.Date          <= p.period_end
+                ), 0), 0) *
                 COALESCE((
                     SELECT Close FROM Historical_Prices
-                    WHERE Securities_Id = h.Securities_Id AND Date <= p.period_end
+                    WHERE Securities_Id = i.Securities_Id AND Date <= p.period_end
                     ORDER BY Date DESC LIMIT 1
                 ), 0) *
                 COALESCE(
@@ -348,11 +371,10 @@ def get_net_worth_report_data(start_date: str, interval: str = 'Year'):
                 )
             ) AS balance_eur
         FROM period_dates p
-        CROSS JOIN Holdings h
-        JOIN Accounts   a ON h.Accounts_Id   = a.Accounts_Id
-        JOIN Securities s ON h.Securities_Id = s.Securities_Id
-        WHERE a.Is_Active = TRUE
-          AND a.Accounts_Type IN ('Brokerage', 'Margin')
+        CROSS JOIN investment_universe i
+        JOIN Accounts   a ON i.Accounts_Id   = a.Accounts_Id
+        JOIN Securities s ON i.Securities_Id = s.Securities_Id
+        WHERE a.Accounts_Type IN ('Brokerage', 'Margin')
         GROUP BY p.period_end, a.Accounts_Id, a.Accounts_Name, a.Accounts_Type
     ),
     -- Pension: backwards from current balance via CashIn/CashOut
@@ -362,7 +384,7 @@ def get_net_worth_report_data(start_date: str, interval: str = 'Year'):
             a.Accounts_Id,
             a.Accounts_Name,
             a.Accounts_Type,
-            (a.Accounts_Balance - COALESCE((
+            GREATEST(0, a.Accounts_Balance - COALESCE((
                 SELECT SUM(CASE
                     WHEN Action IN ('CashIn', 'IntInc') THEN  Total_Amount
                     WHEN Action IN ('CashOut')          THEN -Total_Amount
@@ -376,7 +398,8 @@ def get_net_worth_report_data(start_date: str, interval: str = 'Year'):
             ) AS balance_eur
         FROM period_dates p
         CROSS JOIN Accounts a
-        WHERE a.Is_Active = TRUE AND a.Accounts_Type = 'Pension'
+        WHERE a.Accounts_Type = 'Pension'
+          {acc_filter}
     )
     SELECT
         period_end,
@@ -422,6 +445,231 @@ def get_net_worth_report_data(start_date: str, interval: str = 'Year'):
     return df
 
 
+def get_all_accounts_for_nwr():
+    """All accounts available for Net Worth Report selection, ordered by type then name."""
+    conn = get_connection()
+    df = pd.read_sql("""
+        SELECT Accounts_Id AS accounts_id, Accounts_Name AS accounts_name,
+               Accounts_Type AS accounts_type
+        FROM Accounts
+        ORDER BY Accounts_Type, Accounts_Name
+    """, conn)
+    conn.close()
+    return df
+
+
+@st.cache_data(ttl=300)
+def get_price_anomalies(threshold_pct: float = 100.0, securities_ids: tuple = None):
+    """
+    Detect Historical_Prices rows that are outliers via two independent signals:
+      1. Day-to-day spike: price ratio vs previous OR next trading day >= threshold.
+      2. Transaction divergence: price deviates from the nearest buy/sell within 90 days
+         by >= threshold — catches whole blocks of systematically wrong prices (e.g.
+         pre-split prices in wrong units) that look internally consistent.
+    A LATERAL join fetches the nearest transaction once per price row efficiently.
+    """
+    conn = get_connection()
+
+    sec_filter = (
+        f"AND hp.Securities_Id IN ({', '.join(str(int(i)) for i in securities_ids)})"
+        if securities_ids else ""
+    )
+    ratio = 1.0 + threshold_pct / 100.0
+
+    query = f"""
+    WITH price_neighbors AS (
+        SELECT
+            hp.Securities_Id,
+            s.Securities_Name AS security_name,
+            hp.Date,
+            hp.Close,
+            LAG(hp.Close)  OVER (PARTITION BY hp.Securities_Id ORDER BY hp.Date) AS prev_close,
+            LEAD(hp.Close) OVER (PARTITION BY hp.Securities_Id ORDER BY hp.Date) AS next_close
+        FROM Historical_Prices hp
+        JOIN Securities s ON s.Securities_Id = hp.Securities_Id
+        WHERE hp.Close > 0
+          {sec_filter}
+    ),
+    enriched AS (
+        SELECT
+            pn.*,
+            CASE WHEN pn.prev_close > 0
+                 THEN ROUND(((pn.Close / pn.prev_close) - 1) * 100, 1) END AS pct_vs_prev,
+            CASE WHEN pn.next_close > 0
+                 THEN ROUND(((pn.Close / pn.next_close) - 1) * 100, 1) END AS pct_vs_next,
+            tx.tx_date,
+            tx.tx_action,
+            tx.tx_price,
+            tx.days_diff
+        FROM price_neighbors pn
+        LEFT JOIN LATERAL (
+            SELECT
+                i.Date  AS tx_date,
+                i.Action AS tx_action,
+                ROUND((i.Total_Amount / NULLIF(i.Quantity, 0))::numeric, 4) AS tx_price,
+                ABS(pn.Date - i.Date) AS days_diff
+            FROM Investments i
+            WHERE i.Securities_Id = pn.Securities_Id
+              AND i.Action IN ('Buy','Sell','Reinvest','ShrIn','ShrOut')
+              AND i.Quantity > 0
+              AND ABS(pn.Date - i.Date) <= 90
+            ORDER BY ABS(pn.Date - i.Date)
+            LIMIT 1
+        ) tx ON TRUE
+    )
+    SELECT
+        Securities_Id AS securities_id,
+        security_name,
+        Date          AS date,
+        Close         AS price,
+        prev_close,
+        next_close,
+        pct_vs_prev,
+        pct_vs_next,
+        tx_date,
+        tx_action,
+        tx_price,
+        days_diff,
+        CASE WHEN tx_price > 0
+             THEN ROUND(((Close / tx_price) - 1) * 100, 1)
+        END AS pct_vs_tx
+    FROM enriched
+    WHERE
+        -- Signal 1: day-to-day spike
+        (prev_close > 0 AND (Close / prev_close >= {ratio} OR prev_close / Close >= {ratio}))
+        OR
+        (next_close > 0 AND (Close / next_close >= {ratio} OR next_close / Close >= {ratio}))
+        -- Signal 2: systematic offset vs nearest transaction
+        OR
+        (tx_price > 0 AND (Close / tx_price >= {ratio} OR tx_price / Close >= {ratio}))
+    ORDER BY security_name, date
+    """
+
+    df = pd.read_sql(query, conn)
+    conn.close()
+    return df
+
+
+def get_all_securities_for_filter():
+    """All securities for use in filter dropdowns."""
+    conn = get_connection()
+    df = pd.read_sql(
+        "SELECT Securities_Id AS securities_id, Securities_Name AS securities_name "
+        "FROM Securities ORDER BY Securities_Name",
+        conn,
+    )
+    conn.close()
+    return df
+
+
+def get_nwr_account_selection():
+    """Load saved account selection for Net Worth Report. Returns list of ints or None."""
+    conn = get_connection()
+    cur = conn.cursor()
+    import json
+    try:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT)
+        """)
+        conn.commit()
+        cur.execute("SELECT value FROM app_settings WHERE key = 'nwr_account_ids'")
+        row = cur.fetchone()
+        return json.loads(row[0]) if row else None
+    except Exception:
+        conn.rollback()
+        return None
+    finally:
+        cur.close()
+        conn.close()
+
+
+@st.cache_data(ttl=3600)
+def get_nwr_security_detail(start_date: str, interval: str, account_id: int):
+    """Security-level historical values for a single investment account (for NWR drilldown)."""
+    conn = get_connection()
+
+    trunc_map = {'Year': 'year', 'Quarter': 'quarter', 'Month': 'month'}
+    intv_map  = {'Year': '1 year', 'Quarter': '3 months', 'Month': '1 month'}
+    trunc_unit  = trunc_map.get(interval, 'year')
+    pg_interval = intv_map.get(interval, '1 year')
+    acc_id = int(account_id)
+
+    query = f"""
+    WITH
+    period_dates AS (
+        SELECT (gs - INTERVAL '1 day')::date AS period_end
+        FROM generate_series(
+            date_trunc('{trunc_unit}', '{start_date}'::date) + '{pg_interval}'::interval,
+            date_trunc('{trunc_unit}', CURRENT_DATE),
+            '{pg_interval}'::interval
+        ) gs
+        UNION SELECT CURRENT_DATE::date
+        ORDER BY 1
+    ),
+    daily_fx AS (
+        SELECT p.period_end, cur.Currencies_Id,
+            (SELECT FX_Rate FROM Historical_FX
+             WHERE Currencies_Id_1 = cur.Currencies_Id AND Date <= p.period_end
+             ORDER BY Date DESC LIMIT 1) AS fx_rate
+        FROM period_dates p
+        CROSS JOIN Currencies cur
+        WHERE cur.Currencies_ShortName != 'EUR'
+    ),
+    sec_universe AS (
+        SELECT DISTINCT Securities_Id
+        FROM Investments
+        WHERE Accounts_Id = {acc_id}
+          AND Action IN ('Buy','Reinvest','ShrIn','Sell','ShrOut')
+    )
+    SELECT
+        p.period_end,
+        s.Securities_Name  AS security_name,
+        c.Currencies_ShortName AS currency,
+        GREATEST(COALESCE((
+            SELECT SUM(CASE
+                WHEN Action IN ('Buy','Reinvest','ShrIn') THEN  Quantity
+                WHEN Action IN ('Sell','ShrOut')          THEN -Quantity
+                ELSE 0 END)
+            FROM Investments i2
+            WHERE i2.Securities_Id = u.Securities_Id
+              AND i2.Accounts_Id   = {acc_id}
+              AND i2.Date          <= p.period_end
+        ), 0), 0) AS qty_at_date,
+        COALESCE((
+            SELECT Close FROM Historical_Prices
+            WHERE Securities_Id = u.Securities_Id AND Date <= p.period_end
+            ORDER BY Date DESC LIMIT 1
+        ), 0) AS price_at_date,
+        GREATEST(COALESCE((
+            SELECT SUM(CASE
+                WHEN Action IN ('Buy','Reinvest','ShrIn') THEN  Quantity
+                WHEN Action IN ('Sell','ShrOut')          THEN -Quantity
+                ELSE 0 END)
+            FROM Investments i2
+            WHERE i2.Securities_Id = u.Securities_Id
+              AND i2.Accounts_Id   = {acc_id}
+              AND i2.Date          <= p.period_end
+        ), 0), 0) *
+        COALESCE((
+            SELECT Close FROM Historical_Prices
+            WHERE Securities_Id = u.Securities_Id AND Date <= p.period_end
+            ORDER BY Date DESC LIMIT 1
+        ), 0) *
+        COALESCE(
+            (SELECT fx_rate FROM daily_fx
+             WHERE period_end = p.period_end AND Currencies_Id = s.Currencies_Id),
+            1
+        ) AS value_eur
+    FROM period_dates p
+    CROSS JOIN sec_universe u
+    JOIN Securities s ON u.Securities_Id = s.Securities_Id
+    JOIN Currencies c ON s.Currencies_Id = c.Currencies_Id
+    ORDER BY p.period_end, value_eur DESC, s.Securities_Name
+    """
+
+    df = pd.read_sql(query, conn)
+    conn.close()
+    return df
 
 
 @st.cache_data(ttl=3600)

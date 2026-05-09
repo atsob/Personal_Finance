@@ -471,3 +471,41 @@ def update_db_stats():
 
 # Καλέστε το στο τέλος του import process:
 # update_db_stats()
+
+
+def delete_historical_prices(rows: list):
+    """Delete specific Historical_Prices rows by (securities_id, date) pairs."""
+    if not rows:
+        return 0
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.executemany(
+            "DELETE FROM Historical_Prices WHERE Securities_Id = %s AND Date = %s",
+            [(int(r['securities_id']), r['date']) for r in rows],
+        )
+        deleted = cur.rowcount
+        conn.commit()
+        return deleted
+    finally:
+        cur.close()
+        conn.close()
+
+
+def save_nwr_account_selection(account_ids: list):
+    """Persist Net Worth Report account selection to app_settings table."""
+    import json
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT)
+        """)
+        cur.execute("""
+            INSERT INTO app_settings (key, value) VALUES ('nwr_account_ids', %s)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        """, (json.dumps(account_ids),))
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
