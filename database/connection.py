@@ -1,8 +1,12 @@
+import time
+import logging
 import psycopg2
 from contextlib import contextmanager
 from psycopg2 import pool, extensions
 from langchain_community.utilities import SQLDatabase
 from config.settings import ENV_CONFIG, DB_URI
+
+log = logging.getLogger(__name__)
 
 DB_CONFIG = {
     'dbname':   ENV_CONFIG['db_name'],
@@ -10,9 +14,30 @@ DB_CONFIG = {
     'password': ENV_CONFIG['db_password'],
     'host':     ENV_CONFIG['db_host'],
     'port':     int(ENV_CONFIG['db_port']),
+    'connect_timeout': 10,
 }
 
 _pool: "pool.SimpleConnectionPool | None" = None
+
+_RETRY_ATTEMPTS = 3
+_RETRY_BASE_DELAY = 1.5   # seconds; doubles each attempt
+
+
+def _retry(fn, label: str = "DB operation"):
+    """Call *fn()* up to _RETRY_ATTEMPTS times, backing off on OperationalError."""
+    delay = _RETRY_BASE_DELAY
+    last_exc = None
+    for attempt in range(1, _RETRY_ATTEMPTS + 1):
+        try:
+            return fn()
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as exc:
+            last_exc = exc
+            if attempt < _RETRY_ATTEMPTS:
+                log.warning("%s failed (attempt %d/%d): %s — retrying in %.1fs",
+                            label, attempt, _RETRY_ATTEMPTS, exc, delay)
+                time.sleep(delay)
+                delay *= 2
+    raise last_exc
 
 
 def _get_pool() -> pool.SimpleConnectionPool:
@@ -22,40 +47,66 @@ def _get_pool() -> pool.SimpleConnectionPool:
     return _pool
 
 
-def _is_conn_alive(conn) -> bool:
-    """Return True if the connection is still usable."""
+def _reset_pool():
+    """Close all pooled connections and force a fresh pool on next use."""
+    global _pool
     try:
-        return conn is not None and conn.closed == 0
+        if _pool is not None and not _pool.closed:
+            _pool.closeall()
+    except Exception:
+        pass
+    _pool = None
+
+
+def _is_conn_alive(conn) -> bool:
+    """Ping the server to verify the connection is actually usable."""
+    if conn is None or conn.closed != 0:
+        return False
+    try:
+        conn.cursor().execute("SELECT 1")
+        return True
     except Exception:
         return False
 
 
 @contextmanager
 def get_db():
-    """Yield a pooled connection with auto commit/rollback.
+    """Yield a pooled connection with auto commit/rollback and stale-connection recovery.
 
-    Broken connections (closed by the server, network drop, etc.) are
-    discarded rather than returned to the pool, preventing the
-    'connection already closed' cascade error on the next checkout.
+    If the checked-out connection is dead (network drop, server restart) it is
+    discarded and a fresh connection is opened before yielding to the caller.
+    If that also fails the pool is fully reset and one more attempt is made.
     """
     p = _get_pool()
     conn = p.getconn()
+
+    # Discard stale connections silently; replace with a fresh one.
+    if not _is_conn_alive(conn):
+        try:
+            p.putconn(conn, close=True)
+        except Exception:
+            pass
+        try:
+            conn = _retry(lambda: p.getconn(), "pool checkout")
+        except Exception:
+            _reset_pool()
+            p = _get_pool()
+            conn = p.getconn()
+
     try:
         yield conn
         conn.commit()
     except Exception:
-        # Only rollback if the connection is still alive.
         if _is_conn_alive(conn):
             try:
                 conn.rollback()
             except Exception:
-                pass  # ignore rollback errors on a broken connection
+                pass
         raise
     finally:
         if _is_conn_alive(conn):
-            p.putconn(conn)      # healthy — return to pool
+            p.putconn(conn)
         else:
-            # Discard the broken connection so the pool replaces it.
             try:
                 p.putconn(conn, close=True)
             except Exception:
@@ -63,21 +114,26 @@ def get_db():
 
 
 def get_connection() -> extensions.connection:
-    """Open and return a plain (non-pooled) connection.
+    """Open and return a plain (non-pooled) connection with retry on transient failure.
 
     Kept for backward compatibility. Prefer get_db() for new code.
     """
-    return psycopg2.connect(**DB_CONFIG)
+    return _retry(lambda: psycopg2.connect(**DB_CONFIG), "get_connection")
 
 
 def get_sql_database() -> SQLDatabase:
-    return SQLDatabase.from_uri(
-        DB_URI,
-        include_tables=[
-            'accounts', 'transactions', 'splits',
-            'categories', 'currencies', 'institutions',
-            'historical_fx', 'historical_prices', 'holdings',
-            'investments', 'payees', 'securities'
-        ],
-        sample_rows_in_table_info=0
-    )
+    """Return a LangChain SQLDatabase with pool_pre_ping so stale connections
+    are transparently replaced, and retry on the initial connect."""
+    def _build():
+        return SQLDatabase.from_uri(
+            DB_URI,
+            engine_args={"pool_pre_ping": True, "connect_args": {"connect_timeout": 10}},
+            include_tables=[
+                'accounts', 'transactions', 'splits',
+                'categories', 'currencies', 'institutions',
+                'historical_fx', 'historical_prices', 'holdings',
+                'investments', 'payees', 'securities'
+            ],
+            sample_rows_in_table_info=0
+        )
+    return _retry(_build, "get_sql_database")

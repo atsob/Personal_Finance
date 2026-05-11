@@ -37,8 +37,14 @@ def main():
     init_session_state()
     
     # Initialize LLM and database
+    # Cache the SQLDatabase so the SQLAlchemy engine (and its connection pool)
+    # is reused across Streamlit reruns rather than rebuilt on every interaction.
+    @st.cache_resource
+    def _cached_sql_database():
+        return get_sql_database()
+
     llm = init_llm()
-    db = get_sql_database()
+    db = _cached_sql_database()
     
     # Initialize chat history
     msgs = StreamlitChatMessageHistory(key="sql_agent_history")

@@ -550,6 +550,142 @@ def get_price_anomalies(threshold_pct: float = 100.0, securities_ids: tuple = No
     return df
 
 
+@st.cache_data(ttl=60)
+def get_missing_tx_prices() -> pd.DataFrame:
+    """Return investment transactions whose Price_Per_Share is not yet in Historical_Prices.
+
+    When multiple transactions for the same security exist on the same date the
+    average price is used.  Only actions that carry a meaningful per-share price
+    are included (Buy, Sell, Reinvest, ShrIn, ShrOut).
+    """
+    conn = get_connection()
+    df = pd.read_sql("""
+        SELECT
+            i.Securities_Id                      AS securities_id,
+            s.Securities_Name                    AS security_name,
+            i.Date                               AS date,
+            ROUND(AVG(i.Price_Per_Share)::numeric, 4) AS price,
+            string_agg(DISTINCT i.Action::text, ', ' ORDER BY i.Action::text) AS actions,
+            COUNT(*)                             AS tx_count
+        FROM Investments i
+        JOIN Securities s ON s.Securities_Id = i.Securities_Id
+        WHERE i.Price_Per_Share > 0
+          AND i.Action IN ('Buy','Sell','Reinvest','ShrIn','ShrOut')
+          AND NOT EXISTS (
+              SELECT 1 FROM Historical_Prices hp
+              WHERE hp.Securities_Id = i.Securities_Id
+                AND hp.Date          = i.Date
+          )
+        GROUP BY i.Securities_Id, s.Securities_Name, i.Date
+        ORDER BY s.Securities_Name, i.Date
+    """, conn)
+    conn.close()
+    return df
+
+
+@st.cache_data(ttl=60)
+def get_investments_with_dummy_prices() -> pd.DataFrame:
+    """Return Investments rows where Quantity or Price_Per_Share looks like a placeholder.
+
+    Detection: Price_Per_Share is a whole number (no decimal component) AND either
+    a Historical_Price exists (buy side) or there are corresponding buys to match against
+    (sell side).
+
+    Preview columns:
+      • Buys  — new_qty = Total_Amount / hist_price  (phase-1 formula)
+      • Sells — new_qty = total_buy_qty × (sell_total / all_sell_total)  (phase-2 formula,
+                so positions close correctly)
+
+    Total_Amount is never touched.
+    """
+    conn = get_connection()
+    df = pd.read_sql("""
+        WITH
+        -- Identify candidate rows (whole-number price → dummy placeholder)
+        candidates AS (
+            SELECT i.Investments_Id, i.Accounts_Id, i.Securities_Id,
+                   i.Date, i.Action::text AS action,
+                   i.Total_Amount, i.Quantity, i.Price_Per_Share
+            FROM Investments i
+            WHERE i.Action IN ('Buy','Sell','Reinvest','ShrIn','ShrOut')
+              AND i.Price_Per_Share > 0
+              AND i.Total_Amount    > 0
+              AND (
+                  i.Price_Per_Share = FLOOR(i.Price_Per_Share)
+                  OR
+                  (i.Quantity = FLOOR(i.Quantity)
+                   AND EXISTS (
+                       SELECT 1 FROM Historical_Prices hp2
+                       WHERE hp2.Securities_Id = i.Securities_Id
+                         AND hp2.Date          = i.Date
+                         AND ABS(i.Price_Per_Share - hp2.Close) > 0.001
+                   ))
+              )
+        ),
+        -- Normalised buy totals per (account, security) — used to pin sell quantities
+        buy_totals AS (
+            SELECT c.Accounts_Id, c.Securities_Id,
+                   SUM(ROUND((c.Total_Amount / NULLIF(hp.Close, 0))::numeric, 6)) AS total_buy_qty
+            FROM candidates c
+            JOIN Historical_Prices hp
+                 ON hp.Securities_Id = c.Securities_Id AND hp.Date = c.Date
+            WHERE c.action IN ('Buy','Reinvest','ShrIn')
+            GROUP BY c.Accounts_Id, c.Securities_Id
+        ),
+        -- Use ABS so losing trades (negative Total_Amount) don't invert weights
+        sell_totals AS (
+            SELECT Accounts_Id, Securities_Id,
+                   SUM(ABS(Total_Amount)) AS total_sell_amt_abs
+            FROM candidates
+            WHERE action IN ('Sell','ShrOut')
+            GROUP BY Accounts_Id, Securities_Id
+        )
+        SELECT
+            c.Investments_Id                        AS investments_id,
+            c.Accounts_Id                           AS accounts_id,
+            a.Accounts_Name                         AS account_name,
+            c.Securities_Id                         AS securities_id,
+            s.Securities_Name                       AS security_name,
+            c.Date                                  AS date,
+            c.action,
+            c.Total_Amount                          AS total_amount,
+            c.Quantity                              AS current_qty,
+            c.Price_Per_Share                       AS current_price,
+            hp.Close                                AS hist_price,
+            CASE
+                WHEN c.action IN ('Buy','Reinvest','ShrIn') THEN
+                    ROUND((c.Total_Amount / NULLIF(hp.Close, 0))::numeric, 6)
+                ELSE
+                    -- sell: proportional share of total normalised buy qty;
+                    -- ABS(Total_Amount) so losing trades (negative) stay positive
+                    ROUND((bt.total_buy_qty
+                           * (ABS(c.Total_Amount) / NULLIF(st.total_sell_amt_abs, 0)))::numeric, 6)
+            END                                     AS new_qty,
+            CASE
+                WHEN c.action IN ('Buy','Reinvest','ShrIn') THEN hp.Close
+                ELSE
+                    ROUND((ABS(c.Total_Amount)
+                           / NULLIF(bt.total_buy_qty
+                                    * (ABS(c.Total_Amount) / NULLIF(st.total_sell_amt_abs, 0)), 0))::numeric, 4)
+            END                                     AS new_price
+        FROM candidates c
+        JOIN Securities s ON s.Securities_Id = c.Securities_Id
+        JOIN Accounts   a ON a.Accounts_Id   = c.Accounts_Id
+        LEFT JOIN Historical_Prices hp
+             ON hp.Securities_Id = c.Securities_Id AND hp.Date = c.Date
+        LEFT JOIN buy_totals  bt ON bt.Accounts_Id  = c.Accounts_Id
+                                AND bt.Securities_Id = c.Securities_Id
+        LEFT JOIN sell_totals st ON st.Accounts_Id  = c.Accounts_Id
+                                AND st.Securities_Id = c.Securities_Id
+        -- Buys require a hist price; sells require a buy total to distribute against
+        WHERE (c.action IN ('Buy','Reinvest','ShrIn') AND hp.Close IS NOT NULL)
+           OR (c.action IN ('Sell','ShrOut')           AND bt.total_buy_qty IS NOT NULL)
+        ORDER BY s.Securities_Name, c.Date
+    """, conn)
+    conn.close()
+    return df
+
+
 def get_all_securities_for_filter():
     """All securities for use in filter dropdowns."""
     conn = get_connection()

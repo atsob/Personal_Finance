@@ -106,7 +106,7 @@ def execute_db_save(df_original, df_edited, table_name, id_col, current_acc_id=N
                         )
 
             elif table_name == "Transactions":
-                # Sync date to the mirrored transfer transaction when changed
+                # Sync date and Accounts_Id changes to the mirrored transfer transaction
                 for _, row in df_updates.iterrows():
                     transfers_id = _safe_val(row.get('transfers_id'))
                     if not transfers_id:
@@ -116,17 +116,34 @@ def execute_db_save(df_original, df_edited, table_name, id_col, current_acc_id=N
                     if orig_rows.empty:
                         continue
                     orig = orig_rows.iloc[0]
-                    new_date = _safe_val(row.get('date'))
-                    orig_date = _safe_val(orig.get('date'))
+
+                    new_date    = _safe_val(row.get('date'))
+                    orig_date   = _safe_val(orig.get('date'))
+                    new_acc_id  = _safe_val(row.get('accounts_id'))
+                    orig_acc_id = _safe_val(orig.get('accounts_id'))
+
                     if new_date != orig_date:
                         cur.execute(
                             """UPDATE Transactions SET date = %s
                                WHERE transfers_id = %s AND transactions_id != %s""",
                             (new_date, int(transfers_id), tx_id),
                         )
+                    # When this transaction's account changes, update the mirror's
+                    # Accounts_Id_Target so it still points to the correct account
+                    if new_acc_id and new_acc_id != orig_acc_id:
+                        cur.execute(
+                            """UPDATE Transactions SET accounts_id_target = %s
+                               WHERE transfers_id = %s AND transactions_id != %s""",
+                            (int(new_acc_id), int(transfers_id), tx_id),
+                        )
 
         # ── INSERT new rows ───────────────────────────────────────────────────
         if not df_new.empty:
+            # Ensure the sequence is at least at max(existing id) to avoid drift
+            cur.execute(
+                f"SELECT setval(pg_get_serial_sequence('{table_name}', '{id_col}'), "
+                f"COALESCE(MAX({id_col}), 0)) FROM {table_name}"
+            )
             cols_new = [c for c in df_new.columns.tolist() if c != id_col]
             for _, row in df_new.iterrows():
                 placeholders = ", ".join(["%s"] * len(cols_new))
@@ -487,6 +504,145 @@ def delete_historical_prices(rows: list):
         deleted = cur.rowcount
         conn.commit()
         return deleted
+    finally:
+        cur.close()
+        conn.close()
+
+
+def insert_prices_from_transactions(rows: list) -> int:
+    """Insert Historical_Prices rows derived from investment transaction prices.
+
+    Each element of *rows* must have 'securities_id', 'date', 'price'.
+    Existing rows are left untouched (ON CONFLICT DO NOTHING).
+    Returns the number of rows actually inserted.
+    """
+    if not rows:
+        return 0
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.executemany(
+            """
+            INSERT INTO Historical_Prices (Securities_Id, Date, Close)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (Securities_Id, Date) DO NOTHING
+            """,
+            [(int(r['securities_id']), r['date'], float(r['price'])) for r in rows],
+        )
+        inserted = cur.rowcount
+        conn.commit()
+        return inserted
+    finally:
+        cur.close()
+        conn.close()
+
+
+def normalize_investment_prices(investments_ids: list) -> int:
+    """Normalize Quantity and Price_Per_Share for investment transactions using Historical_Prices.
+
+    Two-phase update so positions close correctly:
+
+    Phase 1 — Buy / Reinvest / ShrIn:
+        Price_Per_Share = Historical_Prices.Close on that date
+        Quantity        = Total_Amount / Close
+
+    Phase 2 — Sell / ShrOut:
+        Quantity is distributed proportionally from the total normalised buy quantity
+        for the same (account, security), so sum(sell_qty) = sum(buy_qty) and the
+        position closes.  Price_Per_Share is back-computed as Total_Amount / Quantity
+        (effective realised price, which may differ from the hist close).
+
+    Total_Amount is never modified, so P&L and account balances are preserved.
+    Returns the total number of rows updated (buys + sells).
+    """
+    if not investments_ids:
+        return 0
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        # ── Phase 1: normalise buy-side rows ─────────────────────────────────
+        cur.execute(
+            """
+            UPDATE Investments i
+               SET Price_Per_Share = hp.Close,
+                   Quantity        = ROUND((i.Total_Amount / NULLIF(hp.Close, 0))::numeric, 6)
+              FROM Historical_Prices hp
+             WHERE hp.Securities_Id = i.Securities_Id
+               AND hp.Date          = i.Date
+               AND i.Action IN ('Buy', 'Reinvest', 'ShrIn')
+               AND i.Investments_Id = ANY(%s)
+            """,
+            (investments_ids,),
+        )
+        buy_updated = cur.rowcount
+
+        # ── Phase 2: normalise sell-side rows ─────────────────────────────────
+        # Sell qty is distributed proportionally from the total normalised buy qty
+        # for the same (account, security), so sum(sell_qty) = sum(buy_qty) and the
+        # position closes correctly.
+        #
+        # IMPORTANT: use ABS(Total_Amount) throughout so that sells whose
+        # Total_Amount is negative (e.g. a losing CFD trade) still produce a
+        # positive quantity.  Price is back-computed as ABS(Total_Amount) / Quantity
+        # so that Quantity × Price_Per_Share = ABS(Total_Amount).
+        cur.execute(
+            """
+            WITH buy_totals AS (
+                -- Sum of already-normalised buy quantities for each (account, security)
+                -- that has at least one sell being normalised now.
+                SELECT i.Accounts_Id, i.Securities_Id,
+                       SUM(i.Quantity) AS total_buy_qty
+                FROM Investments i
+                WHERE i.Action IN ('Buy', 'Reinvest', 'ShrIn')
+                  AND EXISTS (
+                      SELECT 1 FROM Investments s2
+                      WHERE s2.Investments_Id = ANY(%s)
+                        AND s2.Action IN ('Sell', 'ShrOut')
+                        AND s2.Accounts_Id   = i.Accounts_Id
+                        AND s2.Securities_Id = i.Securities_Id
+                  )
+                GROUP BY i.Accounts_Id, i.Securities_Id
+            ),
+            sell_totals AS (
+                -- Use ABS so mixed-sign Total_Amounts (losing trades) don't cancel
+                -- each other out or invert the proportional weight.
+                SELECT Accounts_Id, Securities_Id,
+                       SUM(ABS(Total_Amount)) AS total_sell_amt_abs
+                FROM Investments
+                WHERE Action IN ('Sell', 'ShrOut')
+                  AND Investments_Id = ANY(%s)
+                GROUP BY Accounts_Id, Securities_Id
+            )
+            UPDATE Investments i
+               SET Quantity        = ROUND(
+                       (bt.total_buy_qty
+                        * (ABS(i.Total_Amount) / NULLIF(st.total_sell_amt_abs, 0)))::numeric,
+                       6),
+                   Price_Per_Share = ROUND(
+                       (ABS(i.Total_Amount)
+                        / NULLIF(bt.total_buy_qty
+                                 * (ABS(i.Total_Amount) / NULLIF(st.total_sell_amt_abs, 0)),
+                                 0))::numeric,
+                       4)
+              FROM buy_totals bt
+              JOIN sell_totals st
+                   ON  st.Accounts_Id   = bt.Accounts_Id
+                   AND st.Securities_Id = bt.Securities_Id
+             WHERE i.Accounts_Id   = bt.Accounts_Id
+               AND i.Securities_Id = bt.Securities_Id
+               AND i.Action IN ('Sell', 'ShrOut')
+               AND i.Investments_Id = ANY(%s)
+            """,
+            (investments_ids, investments_ids, investments_ids),
+        )
+        sell_updated = cur.rowcount
+
+        conn.commit()
+
+        # Refresh Holdings so the portfolio view is immediately consistent.
+        update_holdings()
+
+        return buy_updated + sell_updated
     finally:
         cur.close()
         conn.close()

@@ -75,38 +75,87 @@ def _gather_context(conn, month_start: str, month_end: str) -> str:
 
     blocks = []
 
-    # 1. Net worth snapshot
+    # 1. Net worth snapshot — reconstructed as of month_end
     try:
         df = _query(conn, """
-            WITH fx AS (
+            WITH
+            -- FX rates on or before period end
+            fx AS (
                 SELECT DISTINCT ON (Currencies_Id_1) Currencies_Id_1, FX_Rate
-                FROM Historical_FX ORDER BY Currencies_Id_1, Date DESC
+                FROM Historical_FX
+                WHERE Date <= %s::date
+                ORDER BY Currencies_Id_1, Date DESC
             ),
+            -- Prices on or before period end
             prices AS (
                 SELECT DISTINCT ON (Securities_Id) Securities_Id, Close
-                FROM Historical_Prices ORDER BY Securities_Id, Date DESC
+                FROM Historical_Prices
+                WHERE Date <= %s::date
+                ORDER BY Securities_Id, Date DESC
             ),
+            -- Cash / liability account balances reconstructed backwards to period_end
             account_totals AS (
                 SELECT
-                    SUM(CASE WHEN a.Accounts_Type NOT IN ('Brokerage','Pension','Other Investment','Margin',
-                                                          'Real Estate','Vehicle','Asset','Liability')
-                        THEN a.Accounts_Balance * COALESCE(fx.FX_Rate,1) ELSE 0 END) AS cash_eur,
-                    SUM(CASE WHEN a.Accounts_Type IN ('Pension')
-                        THEN a.Accounts_Balance * COALESCE(fx.FX_Rate,1) ELSE 0 END) AS pension_eur,
-                    SUM(CASE WHEN a.Accounts_Type IN ('Real Estate','Vehicle','Asset','Liability')
-                        THEN a.Accounts_Balance * COALESCE(fx.FX_Rate,1) ELSE 0 END) AS assets_eur
+                    SUM(CASE
+                        WHEN a.Accounts_Type NOT IN ('Brokerage','Pension','Other Investment','Margin',
+                                                     'Real Estate','Vehicle','Asset','Liability')
+                        THEN (a.Accounts_Balance - COALESCE((
+                                SELECT SUM(t.Total_Amount) FROM Transactions t
+                                WHERE t.Accounts_Id = a.Accounts_Id AND t.Date > %s::date
+                             ), 0)) * COALESCE(fx.FX_Rate, 1)
+                        ELSE 0
+                    END) AS cash_eur,
+
+                    SUM(CASE
+                        WHEN a.Accounts_Type IN ('Pension')
+                        THEN a.Accounts_Balance * COALESCE(fx.FX_Rate, 1)
+                        ELSE 0
+                    END) AS pension_eur,
+
+                    SUM(CASE
+                        WHEN a.Accounts_Type IN ('Real Estate','Vehicle','Asset','Liability')
+                        THEN (CASE
+                                WHEN a.Accounts_Type IN ('Real Estate','Vehicle','Asset')
+                                THEN GREATEST(0, a.Accounts_Balance - COALESCE((
+                                        SELECT SUM(t.Total_Amount) FROM Transactions t
+                                        WHERE t.Accounts_Id = a.Accounts_Id AND t.Date > %s::date
+                                     ), 0))
+                                ELSE a.Accounts_Balance - COALESCE((
+                                        SELECT SUM(t.Total_Amount) FROM Transactions t
+                                        WHERE t.Accounts_Id = a.Accounts_Id AND t.Date > %s::date
+                                     ), 0)
+                              END) * COALESCE(fx.FX_Rate, 1)
+                        ELSE 0
+                    END) AS assets_eur
                 FROM Accounts a
                 LEFT JOIN fx ON fx.Currencies_Id_1 = a.Currencies_Id
                 WHERE a.Is_Active = TRUE
             ),
+            -- Investment positions at period_end (forward cumulative)
+            investment_universe AS (
+                SELECT DISTINCT Securities_Id, Accounts_Id FROM Investments
+                WHERE Action IN ('Buy','Reinvest','ShrIn','Sell','ShrOut')
+            ),
             investment_totals AS (
                 SELECT
-                    SUM(h.Quantity * COALESCE(p.Close,0) * COALESCE(fx.FX_Rate,1)) AS investments_eur
-                FROM Holdings h
-                JOIN Securities s ON h.Securities_Id = s.Securities_Id
-                LEFT JOIN prices p ON p.Securities_Id = h.Securities_Id
+                    SUM(
+                        GREATEST(COALESCE((
+                            SELECT SUM(CASE
+                                WHEN Action IN ('Buy','Reinvest','ShrIn') THEN Quantity
+                                WHEN Action IN ('Sell','ShrOut')          THEN -Quantity
+                                ELSE 0 END)
+                            FROM Investments i2
+                            WHERE i2.Securities_Id = iu.Securities_Id
+                              AND i2.Accounts_Id   = iu.Accounts_Id
+                              AND i2.Date <= %s::date
+                        ), 0), 0)
+                        * COALESCE(p.Close, 0)
+                        * COALESCE(fx.FX_Rate, 1)
+                    ) AS investments_eur
+                FROM investment_universe iu
+                JOIN Securities s ON s.Securities_Id = iu.Securities_Id
+                LEFT JOIN prices p ON p.Securities_Id = iu.Securities_Id
                 LEFT JOIN fx      ON fx.Currencies_Id_1 = s.Currencies_Id
-                WHERE h.Quantity > 0
             )
             SELECT
                 at.cash_eur,
@@ -115,12 +164,12 @@ def _gather_context(conn, month_start: str, month_end: str) -> str:
                 it.investments_eur
             FROM account_totals at
             CROSS JOIN investment_totals it
-        """, conn)
+        """, (month_end,) * 6)
         if not df.empty:
             r = df.iloc[0]
             total = sum(float(v or 0) for v in r)
             blocks.append(
-                f"NET WORTH SNAPSHOT:\n"
+                f"NET WORTH SNAPSHOT (as of {month_end}):\n"
                 f"  Cash: €{float(r.cash_eur or 0):,.0f}  "
                 f"Investments: €{float(r.investments_eur or 0):,.0f}  "
                 f"Pension: €{float(r.pension_eur or 0):,.0f}  "

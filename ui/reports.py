@@ -173,7 +173,14 @@ def render_reports():
                 st.error("Error fetching P&L data. Please try refreshing.")
                 return
 
-            if st.sidebar.button("🔄 Refresh P&L", key="refresh_pnl_btn"):
+            if st.sidebar.button("🔄 Recalculate P&L", key="recalculate_pnl_btn"):
+                get_pnl_report_data.clear()
+                with st.spinner("Running :green[update_holdings()]"):
+                    update_holdings()
+                st.cache_data.clear()
+                st.rerun()
+
+            if st.sidebar.button ("🔄 Refresh Market Data", key="refresh_market_data_btn"):
                 get_pnl_report_data.clear()
                 with st.spinner("Running :green[download_historical_fx('2d')]"):
                     download_historical_fx("2d")
@@ -1637,7 +1644,7 @@ def render_income_expense_reports():
 
             net_savings = overall_income + overall_expense
             
-            overall_col1, overall_col2, overall_col3, overall_col4, overall_col5 = st.columns(5)
+            overall_col1, overall_col2, overall_col3, overall_col4 = st.columns(4)
             with overall_col1:
             #    st.metric("Overall Income", f"€ {overall_income:,.2f}") 
                 custom_metric(
@@ -1645,14 +1652,14 @@ def render_income_expense_reports():
                     value=f"€ {overall_income:,.2f}", 
                     pnl_value=overall_income    
                 )                
-            with overall_col3:
+            with overall_col2:
             #    st.metric("Overall Expenses", f"€ {overall_expense:,.2f}")
                 custom_metric(
                     label="Overall Expenses", 
                     value=f"€ {overall_expense:,.2f}", 
                     pnl_value=overall_expense    
                 )                     
-            with overall_col4:
+            with overall_col3:
                 if report_type == "Total Summary":
                 #    st.metric("Net Savings", f"€ {net_savings:,.2f}", 
                 #            delta="Positive" if net_savings > 0 else "Negative",
@@ -1662,7 +1669,7 @@ def render_income_expense_reports():
                         value=f"€ {net_savings:,.2f}", 
                         pnl_value=net_savings    
                     )                        
-            with overall_col5:
+            with overall_col4:
                 if report_type == "Total Summary":
                     savings_rate = (net_savings / overall_income * 100) if overall_income > 0 else 0
                 #    st.metric("Savings Rate", f"{savings_rate:.1f}%")
@@ -1672,7 +1679,7 @@ def render_income_expense_reports():
                         pnl_value=savings_rate    
                     )       
 
-            m_col1, m_col2, m_col3, m_col4, m_col5 = st.columns(5)
+            m_col1, m_col2, m_col3, m_col4 = st.columns(4)
 
             with m_col1:
                 # Χρήση f-string και πρόσβαση στο dictionary με []
@@ -1686,7 +1693,7 @@ def render_income_expense_reports():
                     </div>
                 """, unsafe_allow_html=True)
 
-            with m_col3:
+            with m_col2:
                 st.markdown(f"""
                     <div style="line-height: 1.5;text-align: center;">
                         <p style="color: grey; font-size: 16px; margin: 0; font-family: sans-serif;">Expenses / Taxes / Investments</p>
@@ -1698,30 +1705,21 @@ def render_income_expense_reports():
                     </div>
                 """, unsafe_allow_html=True)
 
+            with m_col3:
+                bank_total = df[df['source_type'] == 'Bank']['split_amount'].sum()
+                inv_total = df[df['source_type'] == 'Investment']['split_amount'].sum()
+
+                st.markdown(f"""
+                    <div style="line-height: 1.5;text-align: center;">
+                        <p style="color: grey; font-size: 16px; margin: 0; font-family: sans-serif;">Savings by Cash / Investments</p>
+                        <p style="margin: 0; font-weight: bold;">
+                            <span style="color: {get_color(bank_total)};">€ {bank_total:+,.2f}</span> / 
+                            <span style="color: {get_color(inv_total)};">€ {inv_total:+,.2f}</span> 
+                        </p>
+                    </div>
+                """, unsafe_allow_html=True)
 
             st.divider()
-
-            if 'source_type' in df.columns:
-                st.markdown("### 📊 Savings by Source")
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    bank_total = df[df['source_type'] == 'Bank']['split_amount'].sum()
-                    custom_metric(
-                        label="🏦 Cash", 
-                        value=f"€ {bank_total:,.2f}", 
-                        pnl_value=bank_total    
-                    )
-                            
-                with col2:
-                    inv_total = df[df['source_type'] == 'Investment']['split_amount'].sum()
-                    custom_metric(
-                        label="📈 Investments",
-                        value=f"€ {inv_total:,.2f}",
-                        pnl_value=inv_total
-                    )
-
-                st.divider()
 
             # Define aggregate_by_period inside the function
             def aggregate_by_period(df, period='monthly'):
@@ -2432,7 +2430,7 @@ def render_net_worth_report():
             return ''
         if abs(v) < 0.005:
             return '—'
-        return f'€ {v:,.0f}'
+        return f'€ {v:,.2f}'
 
     def color_neg(v):
         if isinstance(v, (int, float)) and not pd.isna(v) and v < -0.005:
@@ -2516,8 +2514,6 @@ def render_net_worth_report():
                     aggfunc='sum',
                 )
 
-                grp_total = {p: float(grp_pivot[p].sum()) if p in grp_pivot.columns else 0.0 for p in period_cols}
-
                 if not show_zero:
                     row_max = grp_pivot.reindex(columns=period_cols, fill_value=0).abs().max(axis=1)
                     visible_pivot = grp_pivot[row_max >= 0.005]
@@ -2526,6 +2522,8 @@ def render_net_worth_report():
 
                 if visible_pivot.empty and not show_zero:
                     continue
+
+                grp_total = {p: float(visible_pivot[p].sum()) if p in visible_pivot.columns else 0.0 for p in period_cols}
 
                 for (acc_id, acc_name), row in visible_pivot.iterrows():
                     vals = {p: float(row.get(p, 0)) for p in period_cols}
@@ -2708,12 +2706,12 @@ def render_net_worth_report():
         grp_sums = p_df.groupby('group_name')['balance_eur'].sum()
 
         m1, m2, m3, m4, m5, m6 = st.columns(6)
-        m1.metric("Net Worth",       f"€ {nw:,.0f}")
-        m2.metric("Cash & Bank",     f"€ {grp_sums.get('Cash & Bank', 0):,.0f}")
-        m3.metric("Investments",     f"€ {grp_sums.get('Investments', 0):,.0f}")
-        m4.metric("Pension",         f"€ {grp_sums.get('Pension', 0):,.0f}")
-        m5.metric("Other Assets",    f"€ {grp_sums.get('Other Assets', 0):,.0f}")
-        m6.metric("Liabilities",     f"€ {(liabs):,.0f}")
+        m1.metric("Net Worth",       f"€ {nw:,.2f}")
+        m2.metric("Cash & Bank",     f"€ {grp_sums.get('Cash & Bank', 0):,.2f}")
+        m3.metric("Investments",     f"€ {grp_sums.get('Investments', 0):,.2f}")
+        m4.metric("Pension",         f"€ {grp_sums.get('Pension', 0):,.2f}")
+        m5.metric("Other Assets",    f"€ {grp_sums.get('Other Assets', 0):,.2f}")
+        m6.metric("Liabilities",     f"€ {(liabs):,.2f}")
 
         df_breakdown = (
             grp_sums[grp_sums.abs() >= 0.005]
@@ -2753,7 +2751,7 @@ def render_net_worth_report():
                     width='stretch',
                     column_config={
                         'Category':       st.column_config.TextColumn('Category'),
-                        'Value (€)':      st.column_config.NumberColumn('Value (€)',  format='€ %,.0f'),
+                        'Value (€)':      st.column_config.NumberColumn('Value (€)',  format='€ %,.2f'),
                         '% of Net Worth': st.column_config.NumberColumn('% of NW',   format='%.2f%%'),
                     },
                 )
@@ -2852,13 +2850,13 @@ def render_net_worth_report():
                 aggfunc='sum',
             )
 
-            grp_total = {p: float(grp_pivot[p].sum()) if p in grp_pivot.columns else 0.0
-                         for p in period_cols}
-
             visible_pivot = grp_pivot
             if not show_zero:
                 row_max = grp_pivot.reindex(columns=period_cols, fill_value=0).abs().max(axis=1)
                 visible_pivot = grp_pivot[row_max >= 0.005]
+
+            grp_total = {p: float(visible_pivot[p].sum()) if p in visible_pivot.columns else 0.0
+                         for p in period_cols}
 
             for (acc_id, acc_name), row in visible_pivot.iterrows():
                 vals = {p: float(row.get(p, 0)) for p in period_cols}
@@ -2897,3 +2895,76 @@ def render_net_worth_report():
             styled_ab, width='stretch', hide_index=True,
             column_config={'Account': st.column_config.TextColumn("Account", pinned=True)},
         )
+
+        # ── Investment account drilldown ───────────────────────────────────
+        inv_types_ab    = {'Brokerage', 'Margin'}
+        inv_accounts_ab = df_accounts[
+            df_accounts['accounts_id'].isin(selected_ids) &
+            df_accounts['accounts_type'].isin(inv_types_ab)
+        ]
+
+        if not inv_accounts_ab.empty:
+            st.markdown("---")
+            st.subheader("🔍 Investment Account Detail")
+
+            detail_acc_id_ab = st.selectbox(
+                "Select account:",
+                options=inv_accounts_ab['accounts_id'].tolist(),
+                format_func=lambda x: f"{id_to_name[x]} ({id_to_type[x]})",
+                key="nwr_detail_acc_ab",
+            )
+
+            with st.spinner("Loading security detail…"):
+                df_detail_ab = get_nwr_security_detail(
+                    start_date.isoformat(), interval, int(detail_acc_id_ab)
+                )
+
+            if df_detail_ab.empty:
+                st.info("No investment transactions found for this account.")
+            else:
+                df_detail_ab['period_end'] = pd.to_datetime(df_detail_ab['period_end'])
+
+                detail_pivot_ab = df_detail_ab.pivot_table(
+                    index='security_name',
+                    columns='period_end',
+                    values='value_eur',
+                    fill_value=0,
+                    aggfunc='sum',
+                )
+
+                if not show_zero:
+                    row_max_ab = detail_pivot_ab.reindex(columns=period_cols, fill_value=0).abs().max(axis=1)
+                    detail_pivot_ab = detail_pivot_ab[row_max_ab >= 0.005]
+
+                if detail_pivot_ab.empty:
+                    st.info("All securities have zero value in the selected period.")
+                else:
+                    detail_pivot_ab.columns = [label_map.get(c, str(c)) for c in detail_pivot_ab.columns]
+                    present_labels_ab = [lbl for lbl in period_labels if lbl in detail_pivot_ab.columns]
+                    detail_pivot_ab = detail_pivot_ab[present_labels_ab].reset_index()
+                    detail_pivot_ab.rename(columns={'security_name': 'Security'}, inplace=True)
+
+                    total_row_ab = {'Security': 'TOTAL'}
+                    for lbl in present_labels_ab:
+                        total_row_ab[lbl] = detail_pivot_ab[lbl].sum()
+                    detail_pivot_ab = pd.concat(
+                        [detail_pivot_ab, pd.DataFrame([total_row_ab])], ignore_index=True
+                    )
+
+                    def style_total_row_ab(row):
+                        if row.get('Security') == 'TOTAL':
+                            return ['font-weight: bold; border-top: 1px solid rgba(255,255,255,0.4)'] * len(row)
+                        return [''] * len(row)
+
+                    styled_detail_ab = (
+                        detail_pivot_ab.style
+                        .apply(style_total_row_ab, axis=1)
+                        .format({lbl: fmt_val for lbl in present_labels_ab}, na_rep='')
+                        .map(color_neg, subset=present_labels_ab)
+                        .hide(axis='index')
+                    )
+
+                    st.dataframe(
+                        styled_detail_ab, width='stretch', hide_index=True,
+                        column_config={'Security': st.column_config.TextColumn("Security", pinned=True)},
+                    )
