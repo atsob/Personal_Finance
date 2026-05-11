@@ -300,7 +300,7 @@ def _period_to_n_bars(tsperiod: str) -> int:
         return 40
     value = int(match.group(1))
     unit = match.group(2)
-    multiplier = {"d": 1, "w": 7, "mo": 30, "y": 365}
+    multiplier = {"d": 1, "w": 5, "mo": 22, "y": 250}
     return value * multiplier[unit] + 10
 
 

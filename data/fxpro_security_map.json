@@ -1,0 +1,22 @@
+{
+  "#Euro50": "EEA | The European Equity Fund Inc | EUR",
+  "#GerTech30": "INDEX:DE30DT.T | DJ GER TNS 30TR | USD",
+  "#UK100": "INDEXFTSE: UKX | UK 100 | GBP",
+  "#USNDAQ100": "INDEX:NDX | NASDAQ 100 INDEX | USD",
+  "#USSPX500": "INX | S&P 500 INDEX | USD",
+  "BRENT": "Brent (UK) Spot Oil | Brent (UK) Spot Oil | USD",
+  "EURCAD": "^EURCAD | Euro/Canadian Dollar | CAD",
+  "EURGBP": "^EURGBP | Euro/British Pound | GBP",
+  "EURJPY": "^EURJPY | Euro/Japanese Yen | JPY",
+  "EURTRY": "^EURTRY | Euro/Turkish New Lira | TRY",
+  "EURUSD": "^EURUSD | Euro/U.S. Dollar | USD",
+  "GBPUSD": "GBPUSD=X | British Pound/U.S. Dollar | USD",
+  "GOLD": "^XAUEUR | Gold/EUR | EUR",
+  "GOLDgr": "^XAUEURG | Gold Gram/EUR | EUR",
+  "GOLDoz": "^XAUUSD | Gold/USD | USD",
+  "USDCAD": "USD/CAD | USD/CAD | CAD",
+  "USDCHF": "USD/CHF | USD/CHF | CHF",
+  "USDJPY": "USD/JPY | USD/JPY | JPY",
+  "USDTRY": "USD/TRY | USD/TRY | TRY",
+  "WTI": "INDEX:BCOMRCL | WTI Crude Oil | USD"
+}

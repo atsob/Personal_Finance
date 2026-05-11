@@ -4,6 +4,7 @@ import pandas as pd
 from data.qif_importer import render_qif_importer
 from data.transfer_issues import render_transfer_issues
 from data.capitalcom_importer import render_capitalcom_importer
+from data.fxpro_importer import render_fxpro_importer
 from database.backup import render_backup_restore
 from database.backup import render_backup_restore_simple
 from database.backup import render_backup_restore_quick
@@ -435,48 +436,61 @@ def _render_normalize_investments():
         st.caption("Recalculates the Holdings table from Investments data. Run this after normalization to update portfolio quantities and P&L.")
 
 
-def render_tools(conn):
-    """Render the Tools page."""
-    st.title("System Tools")
-    t1, t2, t3, t4, t5, t6, t7, t8, t9, t10 = st.tabs([
+_CATEGORIES = {
+    "📁 Importers": [
         "📁 QIF Importer",
-        "📝 Transfer Issues",
+        "📝 QIF Importer: Transfer Issues",
+        "📈 Capital.com Importer",
+        "📈 FxPro Importer",
+    ],
+    "💾 Database": [
         "💾 Backup & Restore",
         "💾 Backup & Restore Simple",
         "💾 Quick Backup & Restore",
         "🛢 SQL Interface",
+    ],
+    "📊 Market Data & Prices": [
         "🔍 Price Quality",
         "📥 Fill Missing Prices",
         "⚖ Normalize Investments",
-        "📈 Capital.com Importer",
-    ])
+    ],
+}
 
-    with t1:
-        render_qif_importer()
+_TOOL_RENDERERS = {
+    "📁 QIF Importer":           render_qif_importer,
+    "📝 QIF Importer: Transfer Issues":        render_transfer_issues,
+    "📈 Capital.com Importer":   render_capitalcom_importer,
+    "📈 FxPro Importer":         render_fxpro_importer,
+    "💾 Backup & Restore":       render_backup_restore,
+    "💾 Backup & Restore Simple": render_backup_restore_simple,
+    "💾 Quick Backup & Restore": render_backup_restore_quick,
+    "🛢 SQL Interface":          _render_sql_interface,
+    "🔍 Price Quality":          _render_price_quality,
+    "📥 Fill Missing Prices":    _render_fill_missing_prices,
+    "⚖ Normalize Investments":  _render_normalize_investments,
+}
 
-    with t2:
-        render_transfer_issues()
 
-    with t3:
-        render_backup_restore()
+def render_tools(conn):
+    """Render the Tools page. Only the selected tool is rendered to keep it fast."""
+    st.title("System Tools")
 
-    with t4:
-        render_backup_restore_simple()
+    category = st.radio(
+        "category",
+        list(_CATEGORIES.keys()),
+        horizontal=True,
+        label_visibility="collapsed",
+        key="tools_category",
+    )
+    st.divider()
 
-    with t5:
-        render_backup_restore_quick()
+    tools_in_category = _CATEGORIES[category]
+    tool = st.selectbox(
+        "Tool",
+        tools_in_category,
+        label_visibility="collapsed",
+        key="tools_tool",
+    )
+    st.divider()
 
-    with t6:
-        _render_sql_interface()
-
-    with t7:
-        _render_price_quality()
-
-    with t8:
-        _render_fill_missing_prices()
-
-    with t9:
-        _render_normalize_investments()
-
-    with t10:
-        render_capitalcom_importer()
+    _TOOL_RENDERERS[tool]()

@@ -224,6 +224,27 @@ def _render_transaction_table(acc_id, payee_options, acc_options, cat_options, t
                 "UPDATE Transactions SET Accounts_Id = %s WHERE Transactions_Id = ANY(%s)",
                 (_move_target_id, _selected_ids)
             )
+            # For transfer transactions: find counterpart rows in other accounts
+            # that reference acc_id as target, and remap to _move_target_id
+            cur.execute(
+                """
+                SELECT DISTINCT t2.Transactions_Id
+                FROM Transactions t1
+                JOIN Transactions t2 ON t2.Transfers_Id = t1.Transfers_Id
+                WHERE t1.Transactions_Id = ANY(%s)
+                  AND t1.Transfers_Id IS NOT NULL
+                  AND t2.Transactions_Id != ALL(%s)
+                  AND t2.Accounts_Id NOT IN (%s, %s)
+                  AND t2.Accounts_Id_Target = %s
+                """,
+                (_selected_ids, _selected_ids, acc_id, _move_target_id, acc_id)
+            )
+            counterpart_ids = [r[0] for r in cur.fetchall()]
+            if counterpart_ids:
+                cur.execute(
+                    "UPDATE Transactions SET Accounts_Id_Target = %s WHERE Transactions_Id = ANY(%s)",
+                    (_move_target_id, counterpart_ids)
+                )
         update_accounts_balances(acc_id)
         update_accounts_balances(_move_target_id)
         st.success(
@@ -770,6 +791,100 @@ def _render_new_investment_form(acc_id, acc_type, df_accs, df_securities, get_db
 
             except Exception as exc:
                 st.error(f"Error saving investment transaction: {exc}")
+
+
+def _render_security_transactions(acc_id: int, sec_options: dict, key_suffix: str):
+    """Render a security selector and, once chosen, all investment transactions
+    for that security within the current account.
+
+    sec_options  – {securities_id: securities_name} for the account.
+    key_suffix   – unique string to avoid Streamlit key collisions across tabs.
+    """
+    with get_db() as conn:
+        df_secs = pd.read_sql(
+            f"""SELECT DISTINCT i.securities_id, s.securities_name
+                FROM investments i
+                JOIN securities s ON i.securities_id = s.securities_id
+                WHERE i.accounts_id = {acc_id}
+                ORDER BY s.securities_name""",
+            conn,
+        )
+
+    if df_secs.empty:
+        return
+
+    sec_map = dict(zip(df_secs['securities_id'], df_secs['securities_name']))
+
+    st.divider()
+    selected = st.selectbox(
+        "🔍 Security transactions:",
+        options=[None] + list(sec_map.keys()),
+        format_func=lambda x: "— select a security —" if x is None else sec_map.get(x, str(x)),
+        key=f"sec_txn_sel_{acc_id}_{key_suffix}",
+        label_visibility="collapsed",
+    )
+
+    if selected is None:
+        st.caption("Select a security above to view its transactions in this account.")
+        return
+
+    with get_db() as conn:
+        df_inv = pd.read_sql(
+            f"""SELECT date, action, quantity, price_per_share, total_amount, description
+                FROM investments
+                WHERE accounts_id = {acc_id} AND securities_id = {selected}
+                ORDER BY date ASC, investments_id ASC""",
+            conn,
+        )
+
+    if df_inv.empty:
+        st.info("No investment records found for this security.")
+        return
+
+    # ── Summary metrics ──────────────────────────────────────────────────────
+    buy_mask  = df_inv['action'].isin(['Buy', 'ShrIn', 'Reinvest', 'Vest'])
+    sell_mask = df_inv['action'].isin(['Sell', 'ShrOut', 'Expire'])
+    misc_mask = df_inv['action'] == 'MiscExp'
+
+    net_qty   = df_inv.loc[buy_mask, 'quantity'].sum() - df_inv.loc[sell_mask, 'quantity'].sum()
+    buy_amt   = df_inv.loc[buy_mask,  'total_amount'].sum()
+    sell_amt  = df_inv.loc[sell_mask, 'total_amount'].sum()
+    misc_amt  = df_inv.loc[misc_mask, 'total_amount'].sum()
+    net_pnl   = sell_amt - buy_amt - misc_amt
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Net Qty",       f"{net_qty:,.6f}")
+    c2.metric("Buy Amount",    f"{buy_amt:,.2f}")
+    c3.metric("Sell Amount",   f"{sell_amt:,.2f}")
+    c4.metric("Costs",         f"{misc_amt:,.2f}")
+    c5.metric("Net P&L",       f"{net_pnl:,.2f}", delta_color="normal")
+
+    # ── Transaction table ────────────────────────────────────────────────────
+    def _colour_action(val):
+        colours = {
+            'Buy': 'color:#2ecc71', 'ShrIn': 'color:#2ecc71',
+            'Reinvest': 'color:#27ae60', 'Vest': 'color:#27ae60',
+            'Sell': 'color:#e74c3c', 'ShrOut': 'color:#e74c3c', 'Expire': 'color:#e74c3c',
+            'Dividend': 'color:#3498db', 'RtrnCap': 'color:#3498db',
+            'MiscExp': 'color:#e67e22',
+        }
+        return colours.get(val, '')
+
+    styled = df_inv.style.map(_colour_action, subset=['action'])
+
+    st.dataframe(
+        styled,
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            'date':            st.column_config.DateColumn('Date', format='DD/MM/YYYY'),
+            'action':          st.column_config.TextColumn('Action'),
+            'quantity':        st.column_config.NumberColumn('Quantity',     format='%,.8f'),
+            'price_per_share': st.column_config.NumberColumn('Price',        format='%,.5f'),
+            'total_amount':    st.column_config.NumberColumn('Total Amount', format='%,.4f'),
+            'description':     st.column_config.TextColumn('Description',    width='large'),
+        },
+    )
 
 
 def render_register():
@@ -1551,6 +1666,8 @@ def render_register():
                 }
             )
 
+            _render_security_transactions(acc_id, sec_options, "view")
+
         with tab_edit_hold:
          #   st.subheader(f"Current Holdings: {selected_inv_acc['accounts_name']}")
             with get_db() as conn:
@@ -1597,7 +1714,8 @@ def render_register():
                 save_df = edited_h.drop(columns=["Status"])
                 save_changes(df_h.drop(columns=["Status"]), save_df, "Holdings", "holdings_id")
 
-        
+            _render_security_transactions(acc_id, sec_options, "edit")
+
         if st.button("🚀 Update Holdings"):
             with st.spinner("Processing..."):
                 update_holdings()
