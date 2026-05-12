@@ -11,6 +11,7 @@ from database.backup import render_backup_restore_quick
 from database.connection import get_connection
 from database.queries import get_price_anomalies, get_missing_tx_prices, get_investments_with_dummy_prices
 from database.crud import delete_historical_prices, insert_prices_from_transactions, normalize_investment_prices
+from ui.components import copy_df_button
 
 
 _WRITE_PATTERN = re.compile(
@@ -72,6 +73,7 @@ def _render_sql_interface():
         rows, cols = df.shape
         st.caption(f"{rows:,} row(s) · {cols} column(s)")
         st.dataframe(df, width="stretch", hide_index=True)
+        copy_df_button(df, key="dl_tools_sql")
         with col_export:
             csv = df.to_csv(index=False).encode("utf-8")
             export_placeholder.download_button(
@@ -155,6 +157,7 @@ def _render_price_quality():
         width="stretch",
         key="pq_editor",
     )
+    copy_df_button(df, key="dl_tools_price_quality")
 
     to_delete = edited[edited['Delete']]
     n_selected = len(to_delete)
@@ -252,6 +255,7 @@ def _render_fill_missing_prices():
         hide_index=True,
         use_container_width=True,
     )
+    copy_df_button(df_display, key="dl_tools_missing_prices")
 
     col_ins, col_ins_all, col_info = st.columns([1, 1, 3])
 
@@ -388,6 +392,7 @@ def _render_normalize_investments():
         hide_index=True,
         use_container_width=True,
     )
+    copy_df_button(df_display, key="dl_tools_norm_prices")
     st.caption(
         "**Buys**: Price ← hist close, Qty ← Total ÷ hist close.  "
         "**Sells**: Qty is distributed from the total buy quantity so the position closes; "

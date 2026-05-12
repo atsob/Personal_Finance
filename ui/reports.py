@@ -14,7 +14,7 @@ from database.queries import (
     get_fx_exposure_data, get_bond_schedule_data,
 )
 from data.downloaders import download_historical_fx, download_historical_prices_from_tradingview, download_historical_prices_from_yahoo, download_bond_prices_from_solidus, download_securities_info_from_yahoo
-from ui.components import color_negative_red, color_value, custom_metric, get_color
+from ui.components import color_negative_red, color_value, custom_metric, get_color, copy_df_button
 from datetime import datetime, timedelta
 
 def render_reports():
@@ -129,12 +129,12 @@ def render_reports():
            
             # 4. Εμφάνιση του πίνακα με το config
             st.dataframe(
-                df_summary, 
-                hide_index=False, 
+                df_summary,
+                hide_index=False,
                 width='stretch',
                 column_config=col_config,
             )
-
+            copy_df_button(df_summary, key="dl_rpt_hist_inv_summary")
 
         with tab_details:
             st.markdown("### 🔍 Drill-down per Security")
@@ -157,6 +157,7 @@ def render_reports():
                 hide_index=True,
                 width="stretch"
             )
+            copy_df_button(df_snapshot, key="dl_rpt_hist_inv_detail")
     
     elif hist_sub_menu == "P&L Reports":
         tab_report, tab_movers, tab_savings = st.tabs(["📊 P&L Report", "🚀 Top Movers", "💰 Savings"])
@@ -422,9 +423,10 @@ def render_reports():
                     .format({
                         **{col: "{:,.2f} €" for col in euro_cols}, # Όλα τα υπόλοιπα σε €
                         'Annual YOC %': "{:.4f}%"                  # Το YOC σε %
-                    }), 
+                    }),
                     width="stretch"
                 )
+                copy_df_button(df_acc, key="dl_rpt_pnl_account")
 
 
 
@@ -580,6 +582,7 @@ def render_reports():
                         width="stretch",
                         hide_index=False
                     )
+                    copy_df_button(df_to_show, key="dl_rpt_pnl_positions")
 
                 else:
                     st.warning(f"No account found with name: {selected_acc}")
@@ -619,9 +622,10 @@ def render_reports():
                     "accounts_name": st.column_config.TextColumn("Account", width="small"),
                     "Daily P&L (€)": st.column_config.NumberColumn("P&L (€)", format="%.2f €", width="small"),
                     "Daily Change (%)": st.column_config.NumberColumn("Day %", format="%.2f%%", width="small"),
-                }                
+                }
                 )
-            
+                copy_df_button(top_gainers, key="dl_rpt_pnl_gainers")
+
             with loser_col:
                 st.error("📉 Top Losers")
                 top_losers = df_movers.sort_values(by=col_to_sort, ascending=True).head(10)
@@ -634,8 +638,9 @@ def render_reports():
                     "accounts_name": st.column_config.TextColumn("Account", width="small"),
                     "Daily P&L (€)": st.column_config.NumberColumn("P&L (€)", format="%.2f €", width="small"),
                     "Daily Change (%)": st.column_config.NumberColumn("Day %", format="%.2f%%", width="small"),
-                }                
+                }
                 )
+                copy_df_button(top_losers, key="dl_rpt_pnl_losers")
 
         with tab_savings:
             st.subheader("💰 Savings Accounts — Yield over Cost & APY")
@@ -991,6 +996,7 @@ def render_reports():
                         'last_tx_date':         'Last Transaction',
                     }
                 )
+                copy_df_button(df_display, key="dl_rpt_savings_detail")
 
             #    csv = df_display.to_csv(index=False)
             #    st.download_button(
@@ -1047,8 +1053,7 @@ def render_reports():
                         'last_interest_date':       'Period End (Last Interest)',
                     }
                 )
-
-
+                copy_df_button(df_display2, key="dl_rpt_savings_detail2")
 
 
     elif hist_sub_menu == "Securities & Portfolio Analysis":
@@ -1154,8 +1159,9 @@ def render_reports():
                     column_config={
                         "Security": st.column_config.TextColumn("Security"),
                         mover_col: st.column_config.NumberColumn(mover_col, format="%.2f%%"),
-                    }                
+                    }
                 )
+                copy_df_button(top_gainers, key="dl_rpt_sec_gainers")
 
             with loser_col:
                 st.error(f"📉 Top Losers ({mover_col})")
@@ -1167,10 +1173,10 @@ def render_reports():
                     column_config={
                         "Security": st.column_config.TextColumn("Security"),
                         mover_col: st.column_config.NumberColumn(mover_col, format="%.2f%%"),
-                    }                
+                    }
                 )
+                copy_df_button(top_losers, key="dl_rpt_sec_losers")
 
- 
         with tab_volat:
             st.subheader("🌊 Securities Top Volatility")
 
@@ -1211,8 +1217,9 @@ def render_reports():
                     column_config={
                         "Security": st.column_config.TextColumn("Security"),
                         vol_period: st.column_config.NumberColumn("Volatility %", format="%.2f%%"),
-                    }                
+                    }
                 )
+                copy_df_button(top_high_vol, key="dl_rpt_high_vol")
 
             with low_vol_col:
                 st.info(f"🛡️ Low Volatility ({vol_period})")
@@ -1224,8 +1231,9 @@ def render_reports():
                     column_config={
                         "Security": st.column_config.TextColumn("Security"),
                         vol_period: st.column_config.NumberColumn("Volatility %", format="%.2f%%"),
-                    }                
+                    }
                 )
+                copy_df_button(top_low_vol, key="dl_rpt_low_vol")
 
 
         with tab_inv_signals:
@@ -1282,6 +1290,7 @@ def render_reports():
                 hide_index=True,
                 width='stretch'
             )
+            copy_df_button(top_picks, key="dl_rpt_top_picks")
 
         with tab_port_signals:
             st.subheader("📢 Portfolio Action Signals")
@@ -1335,6 +1344,7 @@ def render_reports():
                 hide_index=True,
                 width='stretch'
             )
+            copy_df_button(df_rec, key="dl_rpt_signals")
 
             # Update buttons
             # Custom CSS to center the "Update All" button row and add spacing
@@ -1908,15 +1918,7 @@ def render_income_expense_reports():
                             "category_full_path": "Category",
                             "categories_type": "Type"}
                     )
-                    
-                    # Download button
-                    csv = display_df.to_csv(index=False)
-                    st.download_button(
-                        label="📥 Download as CSV",
-                        data=csv,
-                        file_name=f"{report_type}_{start_date}_{end_date}.csv",
-                        mime="text/csv"
-                    )
+                    copy_df_button(display_df, key="dl_rpt_ie_breakdown")
                 
                 with tab_trend:
                     st.subheader("Monthly Trend Analysis")
@@ -1987,7 +1989,8 @@ def render_income_expense_reports():
                                 'accounts_name': 'Account'
                             }
                         )
-                        
+                        copy_df_button(display_drill_df, key="dl_rpt_ie_drilldown")
+
                         if selected_drill_cat != "All Categories":
                             total = drill_df['split_amount'].sum()
                             st.info(f"**Total for {selected_drill_cat}:** € {total:,.2f}")
@@ -2002,23 +2005,78 @@ def render_income_expense_reports():
 def render_dividend_tracker():
     st.subheader("💸 Dividend & Interest Income Tracker")
 
+    # ── Sidebar period controls ───────────────────────────────────────────────
+    today = pd.Timestamp.now().date()
+
+    period_opt = st.sidebar.radio(
+        "Period:",
+        ["1 Year", "2 Years", "3 Years", "5 Years", "All Time", "Custom"],
+        index=0,
+        key="div_period",
+    )
+
+    _period_days = {"1 Year": 365, "2 Years": 730, "3 Years": 1095, "5 Years": 1825}
+    if period_opt == "Custom":
+        start_date = st.sidebar.date_input("From", value=today - pd.Timedelta(days=365), key="div_from")
+        end_date   = st.sidebar.date_input("To",   value=today,                          key="div_to")
+    elif period_opt == "All Time":
+        start_date = pd.Timestamp("1900-01-01").date()
+        end_date   = today
+    else:
+        start_date = today - pd.Timedelta(days=_period_days[period_opt])
+        end_date   = today
+
+    period_label = (
+        period_opt if period_opt in ("All Time", "Custom")
+        else f"Last {period_opt}"
+    )
+
     if st.sidebar.button("🔄 Refresh", key="div_refresh"):
         get_dividend_tracker_data.clear()
         st.rerun()
 
-    df = get_dividend_tracker_data()
+    df = get_dividend_tracker_data(str(start_date), str(end_date))
 
     if df.empty:
-        st.info("No dividend or interest transactions found.")
+        st.info("No dividend or interest transactions found for the selected period.")
         return
 
     df['month'] = pd.to_datetime(df['month'])
+
+    # Drop income events where the position was closed at that date (cost_basis = 0).
+    # This excludes e.g. MiscExp charged a few days after a full sell, when no shares
+    # are held and the expense cannot be attributed to any open position.
+    df = df[df['cost_basis_eur'] > 0].copy()
+    if df.empty:
+        st.info("No income found for open positions in the selected period.")
+        return
+
+    # Cap the income span per security to (N×12 − 1) months.
+    # For a 1-year window the oldest included event must be no more than 11 months
+    # before the most recent one; for 2 years no more than 23 months, etc.
+    # This prevents accidentally collecting N+1 payment cycles when a dividend
+    # lands right at the edge of the calendar window.
+    _period_months = {"1 Year": 12, "2 Years": 24, "3 Years": 36, "5 Years": 60}
+    if period_opt in _period_months:
+        _max_span_days = (_period_months[period_opt] - 1) * 365.25 / 12
+    elif period_opt == "Custom":
+        _custom_months = (end_date - start_date).days / (365.25 / 12)
+        _max_span_days = max(_custom_months - 1, 0) * 365.25 / 12
+    else:  # All Time — no cap
+        _max_span_days = None
+
+    if _max_span_days is not None:
+        _last_per_sec = df.groupby('securities_name')['date'].transform('max')
+        df = df[(_last_per_sec - df['date']).dt.days <= _max_span_days].copy()
+        if df.empty:
+            st.info("No income found for the selected period after span cap.")
+            return
 
     # Monthly bar chart
     df_monthly = df.groupby('month')['income_eur'].sum().reset_index()
     fig_bar = px.bar(
         df_monthly, x='month', y='income_eur',
-        title="<b>Monthly Dividend & Interest Income (€)</b>",
+        title=f"<b>Monthly Dividend & Interest Income (€) — {period_label}</b>",
         labels={'income_eur': 'Income (€)', 'month': 'Month'},
         template='plotly_dark',
         color_discrete_sequence=['#2ECC71'],
@@ -2026,37 +2084,92 @@ def render_dividend_tracker():
     fig_bar.update_layout(margin=dict(l=0, r=0, t=50, b=0))
     st.plotly_chart(fig_bar, width='stretch')
 
-    # Trailing 12m by security
-    st.markdown("#### Trailing 12-Month Income by Security")
+    # Income by security for the selected period
+    st.markdown(f"#### Income by Security — {period_label}")
+
+    # ── YoC: total income / cost × (365 / holding days) ──────────────────────
+    # Annualise over the actual holding period of the position, not the calendar
+    # period or the gap between dividends.
+    #
+    # cost_basis_eur and position_start_date come from the LATERAL FIFO for each
+    # income row.  We use the LAST payment's values (sorted ascending by date) so
+    # the cost and position-start reflect the most-recent portfolio state.
+    #
+    # holding_days = last_income_date − position_start_date
+    # (position_start_date = date of the oldest FIFO lot still held at the time of
+    #  the last income payment for this security)
+    df_sorted = df.sort_values(['securities_name', 'date'])
+
+    def _wtd_cost(g):
+        """Income-weighted average FIFO cost across all payments in the period.
+        Each payment carries the cost at its own date, so this correctly weights
+        larger positions (higher cost) that generated more income."""
+        abs_inc = g['income_eur'].abs()
+        total_w = abs_inc.sum()
+        if total_w == 0:
+            return g['cost_basis_eur'].iloc[-1]
+        return (g['cost_basis_eur'] * abs_inc).sum() / total_w
+
     df_t12 = (
-        df.groupby(['securities_name', 'securities_type'])
-        .agg(trailing_12m_eur=('income_eur', 'sum'), cost_basis_eur=('cost_basis_eur', 'first'))
+        df_sorted.groupby(['securities_name', 'securities_type'])
+        .apply(lambda g: pd.Series({
+            'period_income_eur':   g['income_eur'].sum(),
+            'cost_basis_eur':      _wtd_cost(g),
+            'position_start_date': g['position_start_date'].min(),
+            'last_income_date':    g['date'].max(),
+        }))
         .reset_index()
-        .sort_values('trailing_12m_eur', ascending=False)
+        .sort_values('period_income_eur', ascending=False)
     )
-    df_t12['yoc_pct'] = (df_t12['trailing_12m_eur'] / df_t12['cost_basis_eur'].replace(0, float('nan')) * 100).fillna(0)
+
+    # Annualised YoC = (income / cost) × (365 / period_days).
+    # Dividends are paid on a per-share periodic basis, so annualise over the
+    # selected calendar window — NOT over inter-dividend gaps or buy-to-dividend spans.
+    # Exception: "All Time" has no fixed window, so use the actual holding period
+    # (position_start_date → last income date) as the denominator.
+    _ann_days_map = {"1 Year": 365, "2 Years": 730, "3 Years": 1095, "5 Years": 1825}
+    if period_opt == "All Time":
+        ann_days = (
+            (df_t12['last_income_date'] - df_t12['position_start_date'])
+            .dt.days
+            .clip(lower=1)
+        )
+    elif period_opt in _ann_days_map:
+        ann_days = _ann_days_map[period_opt]
+    else:  # Custom
+        ann_days = max((end_date - start_date).days, 1)
+
+    df_t12['yoc_pct'] = (
+        df_t12['period_income_eur']
+        / df_t12['cost_basis_eur'].replace(0, float('nan'))
+        * 100 * 365
+        / ann_days
+    ).fillna(0)
 
     m1, m2, m3 = st.columns(3)
-    m1.metric("Total (12m)", f"€ {df_t12['trailing_12m_eur'].sum():,.2f}")
+    m1.metric(f"Total ({period_label})", f"€ {df_t12['period_income_eur'].sum():,.2f}")
     m2.metric("Securities paying", str(len(df_t12)))
     _avg_yoc = df_t12[df_t12['yoc_pct'] > 0]['yoc_pct'].mean()
-    m3.metric("Avg YOC (12m)", f"{_avg_yoc:.2f}%" if not pd.isna(_avg_yoc) else "N/A")
+    m3.metric("Avg Ann. YOC", f"{_avg_yoc:.2f}%" if not pd.isna(_avg_yoc) else "N/A")
 
     st.dataframe(
-        df_t12.style.format({
-            'trailing_12m_eur': '{:,.2f} €',
-            'cost_basis_eur':   '{:,.2f} €',
-            'yoc_pct':          '{:.2f}%',
+        df_t12[['securities_name','securities_type','period_income_eur','cost_basis_eur','yoc_pct']].style.format({
+            'period_income_eur': '{:,.2f} €',
+            'cost_basis_eur':    '{:,.2f} €',
+            'yoc_pct':           '{:.2f}%',
         }),
         hide_index=True, width='stretch',
         column_config={
-            'securities_name':  'Security',
-            'securities_type':  'Type',
-            'trailing_12m_eur': st.column_config.NumberColumn('Income 12m (€)', format='%,.2f €'),
-            'cost_basis_eur':   st.column_config.NumberColumn('Cost Basis (€)', format='%,.2f €'),
-            'yoc_pct':          st.column_config.NumberColumn('YOC %', format='%.2f%%'),
+            'securities_name':   'Security',
+            'securities_type':   'Type',
+            'period_income_eur': st.column_config.NumberColumn(f'Income ({period_label})', format='%,.2f €'),
+            'cost_basis_eur':    st.column_config.NumberColumn('Cost Basis (€)', format='%,.2f €',
+                                     help='Average FIFO cost basis across all income payments in the period (EUR). Expire/Reinvest on the same date as the income payment are excluded so closed positions show their true cost.'),
+            'yoc_pct':           st.column_config.NumberColumn('Ann. YOC %', format='%.2f%%',
+                                     help='Annualised yield on cost: (total period income / FIFO cost at last payment) × (365 / days from oldest held lot to last dividend). MiscExp deducted from income.'),
         }
     )
+    copy_df_button(df_t12, key="dl_rpt_div_t12")
 
     # Full detail table
     with st.expander("Full transaction detail"):
@@ -2071,6 +2184,7 @@ def render_dividend_tracker():
                 'income_eur':     st.column_config.NumberColumn('Income (€)', format='%,.2f €'),
             }
         )
+        copy_df_button(df, key="dl_rpt_div_detail")
 
 
 # ======================================================
@@ -2122,6 +2236,7 @@ def render_cash_flow_forecast():
                 .style.format({'amount_eur': '{:,.2f} €'}),
                 hide_index=True, width='stretch',
             )
+            copy_df_button(df_f, key="dl_rpt_cf_future")
 
     st.markdown("#### Detected Recurring Payments")
     st.caption("Payees with ≥ 2 transactions in the last 120 days, showing projected next occurrence.")
@@ -2146,6 +2261,7 @@ def render_cash_flow_forecast():
                     'currency':           'Currency',
                 }
             )
+            copy_df_button(df_r, key="dl_rpt_cf_recurring")
 
 
 # ======================================================
@@ -2216,6 +2332,7 @@ def render_asset_allocation():
             'rebalance_eur':   st.column_config.NumberColumn('Rebalance €', format='%+,.2f €'),
         }
     )
+    copy_df_button(df_display, key="dl_rpt_alloc")
 
     st.caption("Set target allocations via SQL: `UPDATE Allocation_Targets SET Target_Pct = 40 WHERE Securities_Type = 'ETF';`")
 
@@ -2275,6 +2392,7 @@ def render_fx_exposure():
             'impact_down_5pct':  st.column_config.NumberColumn('-5% FX Impact',   format='%+,.2f €'),
         }
     )
+    copy_df_button(df_display, key="dl_rpt_fx_exposure")
 
 
 # ======================================================
@@ -2346,6 +2464,7 @@ def render_bond_schedule():
             'currency':          'Currency',
         }
     )
+    copy_df_button(df, key="dl_rpt_bonds")
 
 
 # ======================================================
@@ -2573,6 +2692,7 @@ def render_net_worth_report():
             styled, width='stretch', hide_index=True,
             column_config={'Account': st.column_config.TextColumn("Account", pinned=True)},
         )
+        copy_df_button(df_display, key="dl_rpt_nwr_overview")
 
         # ── Investment account drilldown ───────────────────────────────────
         inv_types    = {'Brokerage', 'Margin'}
@@ -2646,6 +2766,7 @@ def render_net_worth_report():
                         styled_detail, width='stretch', hide_index=True,
                         column_config={'Security': st.column_config.TextColumn("Security", pinned=True)},
                     )
+                    copy_df_button(detail_pivot, key="dl_rpt_nwr_detail")
 
     # ═══════════════════════════════════════════════════════════════════════
     with tab2:
@@ -2688,6 +2809,7 @@ def render_net_worth_report():
             styled_summary, width='stretch', hide_index=True,
             column_config={'Period': st.column_config.TextColumn('Period', pinned=True)},
         )
+        copy_df_button(df_summary, key="dl_rpt_nwr_summary")
 
     # ═══════════════════════════════════════════════════════════════════════
     with tab3:
@@ -2755,6 +2877,7 @@ def render_net_worth_report():
                         '% of Net Worth': st.column_config.NumberColumn('% of NW',   format='%.2f%%'),
                     },
                 )
+                copy_df_button(df_breakdown, key="dl_rpt_nwr_breakdown")
 
     # ═══════════════════════════════════════════════════════════════════════
     with tab4:
@@ -2895,6 +3018,7 @@ def render_net_worth_report():
             styled_ab, width='stretch', hide_index=True,
             column_config={'Account': st.column_config.TextColumn("Account", pinned=True)},
         )
+        copy_df_button(df_ab, key="dl_rpt_nwr_balances")
 
         # ── Investment account drilldown ───────────────────────────────────
         inv_types_ab    = {'Brokerage', 'Margin'}
@@ -2968,3 +3092,4 @@ def render_net_worth_report():
                         styled_detail_ab, width='stretch', hide_index=True,
                         column_config={'Security': st.column_config.TextColumn("Security", pinned=True)},
                     )
+                    copy_df_button(detail_pivot_ab, key="dl_rpt_nwr_detail_ab")

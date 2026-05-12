@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 from database.crud import save_changes, update_holdings
+from ui.components import copy_df_button
 
 def render_investments(conn):
     """Render the Investments page."""
@@ -102,6 +103,7 @@ def render_investments(conn):
             }
         )
         save_changes(df_inv_tx, edited_inv_tx, "Investments", "investments_id")
+        copy_df_button(df_inv_tx, key=f"dl_inv_tx_{inv_acc_id}")
     
     with tab_hold:
         st.subheader(f"Current Holdings: {selected_inv_acc['accounts_name']}")
@@ -128,6 +130,7 @@ def render_investments(conn):
         )
 
         save_changes(df_h, edited_h, "Holdings", "holdings_id")
+        copy_df_button(df_h, key=f"dl_inv_holdings_{inv_acc_id}")
     
     if st.button("🚀 Update Holdings"):
         with st.spinner("Processing..."):

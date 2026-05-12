@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 from database.crud import save_changes_no_serial, save_changes_mid
+from ui.components import copy_df_button
 from data.downloaders import download_historical_fx, download_historical_prices_from_tradingview, download_historical_prices_from_yahoo, download_bond_prices_from_solidus
 
 def render_market_data(conn):
@@ -28,7 +29,8 @@ def render_market_data(conn):
             "currencies_id_2": st.column_config.SelectboxColumn("Target Currency", options=list(curr_options.keys()), format_func=lambda x: curr_options.get(x, "Unknown"))
         })
         save_changes_no_serial(df, edited_hfx, "Historical_FX", "date")
-        
+        copy_df_button(df, key="dl_mkt_fx")
+
         if not df.empty:
             st.subheader("📈 Exchange Rate Chart")
             df_plot = df.copy()
@@ -117,7 +119,8 @@ def render_market_data(conn):
             }
         )
         save_changes_mid(edited_hpr_tx, "Historical_Prices", id_cols=["securities_id", "date"], filter_col="securities_id", filter_val=inv_sec_id)
-        
+        copy_df_button(df_hpr_tx, key=f"dl_mkt_prices_{inv_sec_id}")
+
         if not df_hpr_tx.empty:
             st.subheader("📈 Security Pricing Chart")
 

@@ -1842,8 +1842,8 @@ def get_cash_flow_forecast():
 # ======================================================
 
 @st.cache_data(ttl=3600)
-def get_dividend_tracker_data():
-    """Monthly dividend and interest income, YOC per security, and 12-month projection."""
+def get_dividend_tracker_data(start_date: str, end_date: str):
+    """Monthly dividend and interest income and FIFO YOC per security for the given date range."""
     conn = get_connection()
 
     df = pd.read_sql("""
@@ -1851,58 +1851,95 @@ def get_dividend_tracker_data():
             SELECT DISTINCT ON (Currencies_Id_1) Currencies_Id_1, FX_Rate
             FROM Historical_FX ORDER BY Currencies_Id_1, Date DESC
         ),
+        -- One row per actual income date (not truncated to month) so the LATERAL
+        -- cutoffs use the exact date, avoiding the Expire-same-day bug.
         income AS (
             SELECT
-                DATE_TRUNC('month', i.Date)::date      AS month,
+                i.Date,
+                DATE_TRUNC('month', i.Date)::date                        AS month,
                 i.Securities_Id,
                 s.Securities_Name,
                 s.Securities_Type,
                 a.Accounts_Name,
                 a.Currencies_Id,
-                SUM(i.Total_Amount)                    AS income_native,
-                SUM(i.Total_Amount * COALESCE(fx.FX_Rate, 1)) AS income_eur,
+                SUM(
+                    CASE WHEN i.Action = 'MiscExp'
+                    THEN -i.Total_Amount * COALESCE(fx.FX_Rate, 1)
+                    ELSE  i.Total_Amount * COALESCE(fx.FX_Rate, 1)
+                    END
+                )                                                          AS income_eur,
                 i.Action
             FROM Investments i
             JOIN Securities s ON i.Securities_Id = s.Securities_Id
-            JOIN Accounts a   ON i.Accounts_Id   = a.Accounts_Id
+            JOIN Accounts   a ON i.Accounts_Id   = a.Accounts_Id
             LEFT JOIN fx      ON fx.Currencies_Id_1 = a.Currencies_Id
-            WHERE i.Action IN ('Dividend', 'IntInc', 'Reinvest')
-            GROUP BY month, i.Securities_Id, s.Securities_Name, s.Securities_Type,
+            WHERE i.Action IN ('Dividend','IntInc','Reinvest','RtrnCap','MiscExp')
+              AND i.Date BETWEEN %(start_date)s AND %(end_date)s
+            GROUP BY i.Date, i.Securities_Id, s.Securities_Name, s.Securities_Type,
                      a.Accounts_Name, a.Currencies_Id, i.Action
-        ),
-        cost_basis AS (
-            SELECT
-                i.Securities_Id,
-                i.Accounts_Id,
-                SUM(ABS(i.Total_Amount) * COALESCE(fx.FX_Rate, 1)) AS cost_eur
-            FROM Investments i
-            JOIN Accounts a ON i.Accounts_Id = a.Accounts_Id
-            LEFT JOIN fx    ON fx.Currencies_Id_1 = a.Currencies_Id
-            WHERE i.Action = 'Buy'
-            GROUP BY i.Securities_Id, i.Accounts_Id
         )
         SELECT
+            i.Date                                                        AS date,
             i.month,
             i.Securities_Name,
             i.Securities_Type,
             i.Accounts_Name,
             i.Action,
-            ROUND(i.income_eur::numeric, 2) AS income_eur,
-            ROUND((SUM(i.income_eur) OVER (
-                PARTITION BY i.Securities_Id
-                ORDER BY i.month
-                ROWS BETWEEN 11 PRECEDING AND CURRENT ROW
-            ))::numeric, 2) AS trailing_12m_eur,
-            ROUND(cb.cost_eur::numeric, 2)  AS cost_basis_eur
+            ROUND(i.income_eur::numeric, 2)                               AS income_eur,
+            ROUND(COALESCE(fc.cost_eur, 0)::numeric, 2)                   AS cost_basis_eur,
+            -- date of the oldest FIFO lot still held at this income payment's date
+            -- (used only for "All Time" annualisation)
+            fc.position_start_date
         FROM income i
-        LEFT JOIN cost_basis cb
-               ON cb.Securities_Id = i.Securities_Id
-        ORDER BY i.month DESC, i.income_eur DESC
-    """, conn)
+        -- FIFO cost of the position held on the exact day of each income payment.
+        -- Buys: on or before income date. Sells/Expire: strictly before (so same-day
+        -- expiry on a bond maturity date does not zero out the cost basis).
+        -- Also returns position_start_date = oldest remaining lot date, used for YoC.
+        CROSS JOIN LATERAL (
+            WITH buys AS (
+                SELECT
+                    b.Date                                                                       AS buy_date,
+                    b.Quantity                                                                   AS buy_qty,
+                    ABS(b.Total_Amount) * COALESCE(fx2.FX_Rate, 1) / NULLIF(b.Quantity, 0)     AS cost_per_unit_eur,
+                    SUM(b.Quantity) OVER (ORDER BY b.Date, b.Investments_Id)                    AS running_buy_qty
+                FROM Investments b
+                JOIN  Accounts a2 ON b.Accounts_Id      = a2.Accounts_Id
+                LEFT JOIN fx fx2  ON fx2.Currencies_Id_1 = a2.Currencies_Id
+                WHERE b.Securities_Id = i.Securities_Id
+                  AND (
+                      b.Action IN ('Buy','ShrIn','Vest')
+                      OR (b.Action = 'Reinvest' AND i.Securities_Type NOT IN ('CD','Bond'))
+                  )
+                  AND b.Date    <= i.Date
+                  AND b.Quantity > 0
+            ),
+            sells AS (
+                SELECT COALESCE(SUM(s.Quantity), 0) AS total_sell_qty
+                FROM Investments s
+                WHERE s.Securities_Id = i.Securities_Id
+                  AND s.Action IN ('Sell','ShrOut','Expire')
+                  AND s.Date     < i.Date
+            ),
+            fifo AS (
+                SELECT
+                    b.buy_date,
+                    GREATEST(0.0, LEAST(b.buy_qty, b.running_buy_qty - s.total_sell_qty))                         AS remaining_qty,
+                    GREATEST(0.0, LEAST(b.buy_qty, b.running_buy_qty - s.total_sell_qty)) * b.cost_per_unit_eur   AS lot_cost
+                FROM buys b CROSS JOIN sells s
+            )
+            SELECT
+                COALESCE(SUM(lot_cost), 0)                              AS cost_eur,
+                MIN(CASE WHEN remaining_qty > 0 THEN buy_date END)      AS position_start_date
+            FROM fifo
+        ) AS fc
+        ORDER BY i.Date DESC, i.income_eur DESC
+    """, conn, params={'start_date': start_date, 'end_date': end_date})
 
     conn.close()
     if not df.empty:
-        df['month'] = pd.to_datetime(df['month'])
+        df['month']               = pd.to_datetime(df['month'])
+        df['date']                = pd.to_datetime(df['date'])
+        df['position_start_date'] = pd.to_datetime(df['position_start_date'])
     return df
 
 

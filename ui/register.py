@@ -4,6 +4,7 @@ from datetime import datetime, date, timedelta
 import calendar
 from database.connection import get_db
 from database.crud import save_changes, execute_db_save, update_accounts_balances, update_holdings, update_investment_balances, update_pension_balances
+from ui.components import copy_df_button
 
 def _render_transaction_table(acc_id, payee_options, acc_options, cat_options, tab_key):
     """Render a filtered transaction register for one account.
@@ -154,6 +155,11 @@ def _render_transaction_table(acc_id, payee_options, acc_options, cat_options, t
         width="stretch",
         column_config=col_config,
     )
+    _copy_txns = df_original.drop(columns=["_selected", "accounts_id", "transfers_id", "embedding"], errors="ignore").copy()
+    _copy_txns["payees_id"] = _copy_txns["payees_id"].map(payee_options).fillna("")
+    _copy_txns["accounts_id_target"] = _copy_txns["accounts_id_target"].map(acc_options).fillna("")
+    _copy_txns = _copy_txns.rename(columns={"payees_id": "Payee", "accounts_id_target": "Target Account"})
+    copy_df_button(_copy_txns, key=f"dl_reg_txns_{unique_key}")
 
     # ── Change detection & Save ───────────────────────────────────────────────
     _orig_for_cmp   = df_original.drop(columns=["_selected"])
@@ -320,6 +326,10 @@ def _render_transaction_table(acc_id, payee_options, acc_options, cat_options, t
                 "embedding": None,
             }
         )
+        _copy_splits = df_splits.drop(columns=["splits_id", "transactions_id", "embedding"], errors="ignore").copy()
+        _copy_splits["categories_id"] = _copy_splits["categories_id"].map(cat_options).fillna("")
+        _copy_splits = _copy_splits.rename(columns={"categories_id": "Category"})
+        copy_df_button(_copy_splits, key=f"dl_reg_splits_{tx_id}_{tab_key}")
 
         if not edited_splits.equals(df_splits):
             df_to_save = edited_splits.copy()
@@ -885,6 +895,7 @@ def _render_security_transactions(acc_id: int, sec_options: dict, key_suffix: st
             'description':     st.column_config.TextColumn('Description',    width='large'),
         },
     )
+    copy_df_button(df_inv, key=f"dl_reg_sec_txns_{acc_id}_{key_suffix}")
 
 
 def render_register():
@@ -1595,6 +1606,10 @@ def render_register():
                     "embedding": None,
                 },
             )
+            _copy_inv = df_inv.drop(columns=["investments_id", "accounts_id", "transactions_id", "embedding"], errors="ignore").copy()
+            _copy_inv["securities_id"] = _copy_inv["securities_id"].map(_full_sec_options).fillna("")
+            _copy_inv = _copy_inv.rename(columns={"securities_id": "Security"})
+            copy_df_button(_copy_inv, key=f"dl_reg_inv_{acc_id}")
 
             if not edited_df.equals(df_inv):
                 # 1. Indentidy new records (the ones not in the initial df_inv)
@@ -1665,6 +1680,10 @@ def render_register():
                     "fifo_avg_price": st.column_config.NumberColumn("FIFO Avg Price", format="%,.4f")
                 }
             )
+            _copy_h = df_h.drop(columns=["holdings_id", "accounts_id"], errors="ignore").copy()
+            _copy_h["securities_id"] = _copy_h["securities_id"].map(sec_options).fillna("")
+            _copy_h = _copy_h.rename(columns={"securities_id": "Security"})
+            copy_df_button(_copy_h, key=f"dl_reg_holdings_view_{acc_id}")
 
             _render_security_transactions(acc_id, sec_options, "view")
 
@@ -1707,6 +1726,10 @@ def render_register():
                 },
                 hide_index=True
             )
+            _copy_h_edit = df_h.drop(columns=["holdings_id", "accounts_id", "Status"], errors="ignore").copy()
+            _copy_h_edit["securities_id"] = _copy_h_edit["securities_id"].map(sec_options).fillna("")
+            _copy_h_edit = _copy_h_edit.rename(columns={"securities_id": "Security"})
+            copy_df_button(_copy_h_edit, key=f"dl_reg_holdings_edit_{acc_id}")
 
         #    save_changes(df_h, edited_h, "Holdings", "holdings_id")
 

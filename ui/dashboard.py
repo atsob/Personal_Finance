@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-from ui.components import format_qty_display, color_negative_red, style_qty_display
+from ui.components import format_qty_display, color_negative_red, style_qty_display, copy_df_button
 from database.queries import get_hist_net_worth_data, get_transaction_anomalies, get_weekly_summaries
 from database.crud import update_accounts_balances, update_holdings, update_investment_balances, update_pension_balances
 from datetime import datetime
@@ -174,6 +174,7 @@ def render_dashboard(conn):
             "value_eur": "Value (€)"
         }
     )
+    copy_df_button(styled_df, key="dl_dashboard_portfolio")
 
     # Update buttons
     # Custom CSS to center the "Update All" button row and add spacing
@@ -299,5 +300,6 @@ def render_dashboard(conn):
                                         help="How many standard deviations from the mean for this payee/category"),
                 }
             )
+            copy_df_button(df_anomalies, key="dl_dashboard_anomalies")
     except Exception as e:
         st.info(f"Anomaly detection unavailable: {e}")
