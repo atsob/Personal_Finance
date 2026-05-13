@@ -581,7 +581,7 @@ def _render_new_investment_form(acc_id, acc_type, df_accs, df_securities, get_db
     # (same pattern as the payee selector in the bank transaction form)
     enable_linked = st.checkbox(
         "Create linked cash account transfer (BuyX / SellX / DivX)",
-        value=False,
+        value=(acc_linked_default is not None),  # default ON when account has a configured linked account
         key=f"inv_linked_chk_{rc}",
     )
     linked_acc_id = None
@@ -1534,32 +1534,33 @@ def render_register():
 
         with tab_inv_view:
 
-            with get_db() as conn:
-                df_inv = pd.read_sql(f"SELECT * FROM Investments WHERE Accounts_Id = {acc_id} ORDER BY Date DESC", conn)
+            # ── Cache the investment data ──────────────────────────────────────
+            # Fetch from DB only on first render for this account, or after a save.
+            # This prevents re-querying on every cell edit (every Streamlit rerun).
+            _inv_orig_key = f"inv_reg_{acc_id}_orig"
+            if _inv_orig_key not in st.session_state:
+                _column_order = [
+                    "investments_id", "accounts_id", "date", "securities_id",
+                    "action", "quantity", "price_per_share", "commission",
+                    "total_amount", "description", "transactions_id", "embedding",
+                ]
+                with get_db() as conn:
+                    _df_fresh = pd.read_sql(
+                        "SELECT * FROM Investments WHERE Accounts_Id = %(acc_id)s ORDER BY Date DESC",
+                        conn, params={'acc_id': acc_id}
+                    )
+                _df_fresh = _df_fresh[[c for c in _column_order if c in _df_fresh.columns]]
+                st.session_state[_inv_orig_key] = _df_fresh
 
-            column_order = [
-                "investments_id",
-                "accounts_id",
-                "date",
-                "securities_id",
-                "action",
-                "quantity",
-                "price_per_share",
-                "commission",
-                "total_amount",
-                "description",
-                "transactions_id",
-                "embedding",
-            ]
-            df_inv = df_inv[[col for col in column_order if col in df_inv.columns]]
+            df_inv_orig = st.session_state[_inv_orig_key]
 
             # Build full sec_options from df_securities for the editor (all securities, not currency-filtered)
             _full_sec_options = df_securities.set_index('securities_id')['securities_name'].to_dict()
 
             edited_df = st.data_editor(
-                df_inv,
+                df_inv_orig,           # always render from cached original so edits persist across reruns
                 num_rows="dynamic",
-                key="inv_reg",
+                key=f"inv_reg_{acc_id}",  # per-account key so switching accounts resets the editor
                 width="stretch",
                 column_config={
                     "investments_id": st.column_config.NumberColumn(
@@ -1606,39 +1607,239 @@ def render_register():
                     "embedding": None,
                 },
             )
-            _copy_inv = df_inv.drop(columns=["investments_id", "accounts_id", "transactions_id", "embedding"], errors="ignore").copy()
+            _copy_inv = df_inv_orig.drop(columns=["investments_id", "accounts_id", "transactions_id", "embedding"], errors="ignore").copy()
             _copy_inv["securities_id"] = _copy_inv["securities_id"].map(_full_sec_options).fillna("")
             _copy_inv = _copy_inv.rename(columns={"securities_id": "Security"})
             copy_df_button(_copy_inv, key=f"dl_reg_inv_{acc_id}")
 
-            if not edited_df.equals(df_inv):
-                # 1. Indentidy new records (the ones not in the initial df_inv)
-                # Usually new lines have NaN in ID or not included in the index of df_inv
-                new_rows_mask = ~edited_df['investments_id'].isin(df_inv['investments_id'])
+            # ── Change detection & Save ────────────────────────────────────────
+            # Align dtypes before comparing — data_editor can return different
+            # dtypes than read_sql (e.g. object vs int64 for nullable columns).
+            try:
+                _edited_aligned = edited_df.astype(df_inv_orig.dtypes.to_dict())
+            except Exception:
+                _edited_aligned = edited_df
+            _inv_has_changes = not _edited_aligned.equals(df_inv_orig)
 
-                # 2. We fill in accounts_id only for the new rows
+            if _inv_has_changes:
+                # Fill accounts_id for new rows
+                new_rows_mask = ~edited_df['investments_id'].isin(df_inv_orig['investments_id'])
                 edited_df.loc[new_rows_mask, 'accounts_id'] = acc_id
 
-                # 3. Ορισμός συνάρτησης υπολογισμού
+                # Auto-calculate total_amount for new Buy/Sell rows
                 def calculate_total(row):
-                    qty = float(row.get('quantity') or 0)
-                    price = float(row.get('price_per_share') or 0)
-                    comm = float(row.get('commission') or 0)
+                    qty    = float(row.get('quantity') or 0)
+                    price  = float(row.get('price_per_share') or 0)
+                    comm   = float(row.get('commission') or 0)
                     action = str(row.get('action')).strip()
-
                     if action == 'Buy':
                         return (qty * price) + comm
                     elif action == 'Sell':
                         return (qty * price) - comm
                     return row.get('total_amount')
 
-                # 4. Εφαρμογή του υπολογισμού ΜΟΝΟ στις νέες γραμμές (new_rows_mask)
                 if new_rows_mask.any():
                     edited_df.loc[new_rows_mask, 'total_amount'] = edited_df[new_rows_mask].apply(calculate_total, axis=1)
 
-                # 5. Αποθήκευση και Rerun
-                save_changes(df_inv, edited_df, "Investments", "investments_id")
-                st.rerun()
+                if st.button("💾 Save Investments", key=f"save_inv_reg_{acc_id}", type="primary"):
+                    # Clear the cache before execute_db_save calls st.rerun(),
+                    # so the next render re-fetches fresh data from the DB.
+                    st.session_state.pop(_inv_orig_key, None)
+                    with get_db() as _conn_save:
+                        execute_db_save(
+                            df_inv_orig, edited_df,
+                            "Investments", "investments_id",
+                            conn=_conn_save
+                        )
+
+            # ── Manage linked cash account ─────────────────────────────────────────
+            # Allows creating a cash-account link for unlinked transactions, or
+            # removing/inspecting an existing link.
+            # Note: when an existing linked transaction is saved via the register above,
+            # execute_db_save already syncs its Date and Total_Amount automatically.
+            _LINK_CAPABLE_MGR = {'Buy', 'Sell', 'Dividend', 'IntInc', 'RtrnCap', 'MiscExp'}
+            _CASH_OUT_MGR     = {'Buy', 'MiscExp'}
+            _INV_TYPES_MGR    = {'Brokerage', 'Pension', 'Other Investment', 'Margin'}
+
+            # Resolve the account's default linked cash account from df_accs
+            _mgr_acc_row = df_accs[df_accs['accounts_id'] == acc_id].iloc[0]
+            _raw_linked  = _mgr_acc_row.get('accounts_id_linked')
+            _mgr_linked_default = (
+                None if (_raw_linked is None or pd.isna(_raw_linked))
+                else int(_raw_linked)
+            )
+
+            _df_linkable = df_inv_orig[df_inv_orig['action'].isin(_LINK_CAPABLE_MGR)].copy()
+
+            with st.expander("🔗 Manage Linked Cash Account", expanded=False):
+                if _df_linkable.empty:
+                    st.caption("No linkable transactions (Buy / Sell / Dividend / IntInc / RtrnCap / MiscExp) in this account.")
+                else:
+                    def _fmt_inv_row(r):
+                        sec   = _full_sec_options.get(r['securities_id'], '—')
+                        total = f"{r['total_amount']:,.2f}" if pd.notna(r.get('total_amount')) else '—'
+                        icon  = "🔗" if pd.notna(r.get('transactions_id')) else "⚪"
+                        d     = r['date'].date() if hasattr(r['date'], 'date') else r['date']
+                        return f"{d} | {r['action']} | {sec} | {total} {icon}"
+
+                    _link_opts = {int(r['investments_id']): _fmt_inv_row(r)
+                                  for _, r in _df_linkable.iterrows()}
+
+                    _sel_inv_id = st.selectbox(
+                        "Select transaction  (🔗 = already linked  ⚪ = unlinked)",
+                        options=list(_link_opts.keys()),
+                        format_func=lambda x: _link_opts.get(x, str(x)),
+                        key=f"inv_link_sel_{acc_id}",
+                    )
+
+                    _sel_row    = _df_linkable[_df_linkable['investments_id'] == _sel_inv_id].iloc[0]
+                    _raw_tx_id  = _sel_row.get('transactions_id')
+                    _existing_tx_id = (
+                        None if (_raw_tx_id is None or pd.isna(_raw_tx_id))
+                        else int(_raw_tx_id)
+                    )
+
+                    if _existing_tx_id:
+                        # ── Already linked — show details & offer to remove ────────
+                        with get_db() as _conn_lk:
+                            _linked_tx = pd.read_sql(
+                                """SELECT t.transactions_id, t.date, a.accounts_name,
+                                          t.total_amount, t.description
+                                   FROM Transactions t
+                                   JOIN Accounts a ON t.accounts_id = a.accounts_id
+                                   WHERE t.transactions_id = %s""",
+                                _conn_lk, params=(_existing_tx_id,)
+                            )
+                        if not _linked_tx.empty:
+                            _lr = _linked_tx.iloc[0]
+                            st.success(
+                                f"✅ Linked → **{_lr['accounts_name']}** | "
+                                f"Date: {_lr['date']} | Amount: {_lr['total_amount']:,.2f}"
+                            )
+                            st.caption(
+                                "Editing the transaction above and saving will automatically "
+                                "sync the date and amount to this cash entry."
+                            )
+                            if st.button(
+                                "🔓 Remove link (deletes the cash transaction)",
+                                key=f"inv_unlink_{acc_id}_{_sel_inv_id}",
+                                type="secondary",
+                            ):
+                                with get_db() as _conn_ul:
+                                    _cur_ul = _conn_ul.cursor()
+                                    _cur_ul.execute(
+                                        "DELETE FROM Transactions WHERE transactions_id = %s",
+                                        (_existing_tx_id,)
+                                    )
+                                    _cur_ul.execute(
+                                        "UPDATE Investments SET transactions_id = NULL "
+                                        "WHERE investments_id = %s",
+                                        (_sel_inv_id,)
+                                    )
+                                    _conn_ul.commit()
+                                st.session_state.pop(_inv_orig_key, None)
+                                st.session_state.pop("df_accs", None)
+                                st.success("Link removed.")
+                                st.rerun()
+                        else:
+                            st.warning(
+                                f"Linked transaction #{_existing_tx_id} not found "
+                                f"(may have been deleted externally)."
+                            )
+                            if st.button(
+                                "🗑 Clear stale reference",
+                                key=f"inv_stale_{acc_id}_{_sel_inv_id}",
+                                type="secondary",
+                            ):
+                                with get_db() as _conn_cs:
+                                    _cur_cs = _conn_cs.cursor()
+                                    _cur_cs.execute(
+                                        "UPDATE Investments SET transactions_id = NULL "
+                                        "WHERE investments_id = %s",
+                                        (_sel_inv_id,)
+                                    )
+                                    _conn_cs.commit()
+                                st.session_state.pop(_inv_orig_key, None)
+                                st.rerun()
+
+                    else:
+                        # ── Not linked — offer to create a link ────────────────────
+                        st.info("This transaction has no linked cash account entry.")
+
+                        _ca_opts = {
+                            int(r['accounts_id']):
+                                f"{r['accounts_name']} ({r['accounts_balance']:,.2f})"
+                            for _, r in df_accs.iterrows()
+                            if r['accounts_type'] not in _INV_TYPES_MGR
+                            and r['accounts_id'] != acc_id
+                        }
+                        _ca_ids = list(_ca_opts.keys())
+
+                        if not _ca_ids:
+                            st.warning("No eligible cash/bank accounts found.")
+                        else:
+                            _ca_default_idx = (
+                                _ca_ids.index(_mgr_linked_default)
+                                if _mgr_linked_default and _mgr_linked_default in _ca_ids
+                                else 0
+                            )
+                            _link_target_id = st.selectbox(
+                                "Cash account to link to",
+                                options=_ca_ids,
+                                format_func=lambda x: _ca_opts.get(x, str(x)),
+                                index=_ca_default_idx,
+                                key=f"inv_link_target_{acc_id}_{_sel_inv_id}",
+                            )
+                            if st.button(
+                                "🔗 Create linked cash transaction",
+                                key=f"inv_create_link_{acc_id}_{_sel_inv_id}",
+                                type="primary",
+                            ):
+                                _action  = str(_sel_row['action'])
+                                _total   = float(_sel_row.get('total_amount') or 0)
+                                _dt      = _sel_row['date']
+                                _sec_id  = _sel_row.get('securities_id')
+                                _sec_nm  = _full_sec_options.get(_sec_id) if _sec_id else None
+                                _cash_sign = -abs(_total) if _action in _CASH_OUT_MGR else abs(_total)
+                                try:
+                                    with get_db() as _conn_cl:
+                                        _cur_cl = _conn_cl.cursor()
+                                        _payee_id = (
+                                            get_or_create_payee_id(_cur_cl, _sec_nm)
+                                            if _sec_nm else None
+                                        )
+                                        _cur_cl.execute(
+                                            """
+                                            INSERT INTO Transactions
+                                                (Accounts_Id, Date, Payees_Id, Description,
+                                                 Total_Amount, Cleared,
+                                                 Accounts_Id_Target, Total_Amount_Target,
+                                                 Transfers_Id)
+                                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                            RETURNING Transactions_Id
+                                            """,
+                                            (
+                                                _link_target_id, _dt, _payee_id,
+                                                _sec_nm or _action, _cash_sign, True,
+                                                acc_id, abs(_total), None,
+                                            ),
+                                        )
+                                        _new_tx_id = _cur_cl.fetchone()[0]
+                                        _cur_cl.execute(
+                                            "UPDATE Investments SET Transactions_Id = %s "
+                                            "WHERE Investments_Id = %s",
+                                            (_new_tx_id, int(_sel_inv_id))
+                                        )
+                                        _conn_cl.commit()
+                                    st.session_state.pop(_inv_orig_key, None)
+                                    st.session_state.pop("df_accs", None)
+                                    st.success(
+                                        f"✅ Cash transaction #{_new_tx_id} created in "
+                                        f"{_ca_opts[_link_target_id]} and linked."
+                                    )
+                                    st.rerun()
+                                except Exception as _link_err:
+                                    st.error(f"Error creating link: {_link_err}")
 
 
         with tab_view_hold:

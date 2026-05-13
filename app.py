@@ -12,7 +12,6 @@ from ai.agent import create_ai_agent
 from database.connection import get_connection, get_sql_database
 from ui.dashboard import render_dashboard
 from ui.register import render_register
-from ui.investments import render_investments
 from ui.reports import render_reports
 from ui.market_data import render_market_data
 from ui.ai_assistant import render_ai_assistant

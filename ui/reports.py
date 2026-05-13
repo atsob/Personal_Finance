@@ -220,7 +220,13 @@ def render_reports():
                 with row1_col1:
                     total_dtd_pnl = df_pnl['pnl_dtd_eur'].sum()
                     total_current_value = df_pnl['current_value_eur'].sum()
-                    st.metric("Total Current Value (EUR)", f"{total_current_value:,.2f} €", delta=f"{total_dtd_pnl:,.2f} €")
+                    _prev_value = total_current_value - total_dtd_pnl
+                    _dtd_pct = (total_dtd_pnl / _prev_value * 100) if _prev_value != 0 else 0
+                    st.metric(
+                        "Total Current Value (EUR)",
+                        f"{total_current_value:,.2f} €",
+                        delta=f"{total_dtd_pnl:,.2f} €  ({_dtd_pct:+.2f}%)",
+                    )
  
                 with row1_col2:
                     total_realized_pnl = df_pnl['realized_pnl_eur'].fillna(0).sum()
@@ -1361,18 +1367,19 @@ def render_reports():
             st.subheader("Market Data Synchronization")
 
             # Create a 2x2 grid for specific updates
-            grid = st.columns(2)
+            grid = st.columns(5)
 
             # Define the buttons in a list to keep code DRY (Don't Repeat Yourself)
             tasks = [
                 ("FX Rates from Yahoo", download_historical_fx),
                 ("Security Prices from Yahoo", download_historical_prices_from_yahoo),
+                ("Security Prices from TradingView", download_historical_prices_from_tradingview),
                 ("Bond Prices from Solidus", download_bond_prices_from_solidus),
                 ("Info from Yahoo", download_securities_info_from_yahoo)
             ]
 
             for i, (label, func) in enumerate(tasks):
-                with grid[i % 2]:
+                with grid[i % 5]:
                     if st.button(f"🔄 Update {label}", width='stretch'):
                         with st.spinner(f"Updating {label}..."):
                             func()
@@ -1390,6 +1397,7 @@ def render_reports():
                     with st.spinner("Processing full update..."):
                         download_historical_fx("3y")
                         download_historical_prices_from_yahoo("3y")
+                        download_historical_prices_from_tradingview("3y")
                         download_bond_prices_from_solidus()
                         download_securities_info_from_yahoo()
                         st.balloons()
