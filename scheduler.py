@@ -28,6 +28,7 @@ from data.downloaders import (
     download_historical_fx,
     download_securities_info_from_yahoo,
 )
+from database.backup import DatabaseBackup
 from database.connection import get_connection
 
 logging.basicConfig(
@@ -39,6 +40,10 @@ logging.basicConfig(
 MARKET_REFRESH_INTERVAL_MINUTES = 5   # how often to refresh prices & FX
 MARKET_HOURS_START = 7                 # inclusive  (local time, 24-h), earlier for FX markets and Cryptos considering global nature and after-hours trading
 MARKET_HOURS_END   = 23                # exclusive, considering late trading and after-hours for US markets
+
+# ── Daily backup config ───────────────────────────────────────────────────────
+BACKUP_HOUR            = 6    # local hour at which the daily backup runs (06:00 AM)
+BACKUP_RETENTION_DAYS  = 30   # delete backups older than this many days
 
 # Tick interval — the scheduler wakes up this often to check all jobs.
 # Keep it at 60 s so Monday-07:00 is never missed by more than a minute.
@@ -120,6 +125,45 @@ def _securities_info_job():
         logging.error(f"Securities info refresh failed: {e}", exc_info=True)
 
 
+def _backup_job():
+    """Create a daily database backup and purge files older than BACKUP_RETENTION_DAYS."""
+    logging.info("Running daily database backup…")
+    bm = DatabaseBackup()
+    try:
+        result = bm.create_backup()
+        if result['success']:
+            logging.info(
+                f"Backup created: {result['filename']} ({result['size_mb']:.1f} MB)"
+            )
+        else:
+            logging.error(f"Backup failed: {result['message']}")
+            return
+    except Exception as e:
+        logging.error(f"Backup job failed: {e}", exc_info=True)
+        return
+
+    # Purge backups older than the retention period
+    try:
+        cutoff = datetime.now() - timedelta(days=BACKUP_RETENTION_DAYS)
+        purged = 0
+        for backup in bm.get_backup_history():
+            if backup['modified'] < cutoff:
+                del_result = bm.delete_backup(backup['filename'])
+                if del_result['success']:
+                    purged += 1
+                    logging.info(f"Purged old backup: {backup['filename']}")
+                else:
+                    logging.warning(
+                        f"Could not purge {backup['filename']}: {del_result['message']}"
+                    )
+        logging.info(
+            f"Retention purge complete — {purged} backup(s) removed "
+            f"(retention: {BACKUP_RETENTION_DAYS} days)."
+        )
+    except Exception as e:
+        logging.error(f"Backup retention purge failed: {e}", exc_info=True)
+
+
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -147,6 +191,22 @@ if __name__ == "__main__":
 
     _last_weekly_summary_date: date = date.today() if datetime.now().weekday() == 0 and datetime.now().hour >= 7 else date.min
 
+    # Daily backup: skip today's run if a backup file for today already exists
+    # (prevents duplicate backups when the container is restarted mid-day)
+    _last_backup_date: date = date.min
+    try:
+        _today_backups = [
+            b for b in DatabaseBackup().get_backup_history()
+            if b['modified'].date() == date.today()
+        ]
+        if _today_backups:
+            _last_backup_date = date.today()
+            logging.info(
+                f"Today's backup already exists ({_today_backups[0]['filename']}) — skipping."
+            )
+    except Exception:
+        pass  # if check fails, let the normal schedule handle it
+
     # Securities info: run once at startup every day
     _last_securities_info_date: date = date.min
     logging.info("Running initial securities info refresh.")
@@ -168,6 +228,15 @@ if __name__ == "__main__":
         if _last_securities_info_date != date.today():
             _securities_info_job()
             _last_securities_info_date = date.today()
+
+        # ── Daily backup at BACKUP_HOUR (fire once per calendar day) ─────────
+        if (
+            now.hour == BACKUP_HOUR
+            and now.minute < 5          # within the first 5 minutes of the hour
+            and _last_backup_date != date.today()
+        ):
+            _backup_job()
+            _last_backup_date = date.today()
 
         # ── Weekly summary: Monday at 07:00 (fire once per Monday) ───────────
         if (
