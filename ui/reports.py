@@ -345,6 +345,11 @@ def render_reports():
                 df_input['annual_div_cash_eur'] = (df_input['dividend_yoc_pct'] / 100) * df_input['current_cost_basis_eur']
 
                 # 4. Ομαδοποίηση
+                # Percentage columns must NOT be aggregated directly — averaging
+                # percentages across positions gives a wrong result.  They are
+                # recomputed from the aggregated EUR totals after the groupby.
+                _PCT_COLS = {'pnl_dtd_percent', 'pnl_ytd_percent', 'pnl_net_all_time_percent'}
+
                 agg_dict = {
                     'current_value_eur': 'sum',
                     'pnl_dtd_market_eur': 'sum',
@@ -362,25 +367,78 @@ def render_reports():
                     'realized_pnl_eur': 'sum',
                     'unrealized_pnl_eur': 'sum',
                     'pnl_net_all_time_eur': 'sum',
-                    'annual_div_cash_eur': 'sum', # Προσθέτουμε τα ευρώ των μερισμάτων
-                    'current_cost_basis_eur': 'sum' # Προσθέτουμε το κόστος βάσης
+                    'gross_invested_all_time_eur': 'sum',
+                    'direct_cashin_eur': 'first',   # same value for every row of an account
+                    'linked_cashin_eur': 'first',
+                    'annual_div_cash_eur': 'sum',
+                    'current_cost_basis_eur': 'sum',
                 }
 
-                # Προσθέστε δυναμικά όποιες άλλες στήλες P&L έχετε (DTD Market, κλπ)
+                # Add any other pnl_* EUR columns dynamically, but skip percentage columns
                 for col in df_input.columns:
-                    if col.startswith('pnl_') and col not in agg_dict:
+                    if col.startswith('pnl_') and col not in agg_dict and col not in _PCT_COLS:
                         agg_dict[col] = 'sum'
 
                 df_acc = df_input.groupby('accounts_name').agg(agg_dict)
 
-                # 5. Υπολογισμός του σταθμισμένου Yield on Cost για τον λογαριασμό
-                # (Συνολικά αναμενόμενα ευρώ μερισμάτων / Συνολικό τρέχον κόστος αγοράς) * 100
-                df_acc['dividend_yoc_pct'] = (df_acc['annual_div_cash_eur'] / df_acc['current_cost_basis_eur'].replace(0, np.nan)) * 100
-                df_acc['dividend_yoc_pct'] = df_acc['dividend_yoc_pct'].fillna(0)
+                # 5. Recompute percentage columns from aggregated EUR totals.
+                #    DTD/YTD: P&L / (current_value − P&L) = P&L / period_start_value.
+                #    ROI %: (current_value + withdrawals − deposits) / deposits
+                #           treats the account as a black box; avoids double-counting
+                #           internal reinvestments (sell A → buy B).
+                _safe = lambda s: s.replace(0, np.nan)
 
-                # 6. Καθαρισμός βοηθητικών στηλών πριν το display
-            #    df_acc = df_acc.drop(columns=['annual_div_cash_eur', 'current_cost_basis_eur'])
-                df_acc = df_acc.drop(columns=['pnl_all_time_eur','annual_div_cash_eur', 'current_cost_basis_eur'])
+                df_acc['pnl_dtd_percent'] = (
+                    df_acc['pnl_dtd_eur']
+                    / _safe(df_acc['current_value_eur'] - df_acc['pnl_dtd_eur'])
+                    * 100
+                ).fillna(0)
+
+                df_acc['pnl_ytd_percent'] = (
+                    df_acc['pnl_ytd_eur']
+                    / _safe(df_acc['current_value_eur'] - df_acc['pnl_ytd_eur'])
+                    * 100
+                ).fillna(0)
+
+                # Account-level ROI denominator — three-tier priority:
+                #
+                # 1. direct_cashin_eur  — explicit CashIn (Securities_Id IS NULL) in
+                #    Investments: pensions, accounts where contributions are recorded
+                #    before a Buy. Best: captures the true external capital deployed.
+                #
+                # 2. linked_cashin_eur  — transfers recorded in the LINKED cash account
+                #    with Accounts_Id_Target = this investment account.  Buy/Sell-linked
+                #    Transactions have Accounts_Id_Target = NULL so they are excluded;
+                #    no double-counting with gross_invested.
+                #
+                # 3. gross_invested_all_time_eur — sum of all Buy amounts (fallback).
+                #    Correct for simple accounts; understates ROI when proceeds are
+                #    reinvested (the reinvested amount is counted twice in the denominator).
+                def _roi_denom(row):
+                    if row['direct_cashin_eur'] > 0:
+                        return row['direct_cashin_eur']
+                    if row['linked_cashin_eur'] > 0:
+                        return row['linked_cashin_eur']
+                    if row['gross_invested_all_time_eur'] > 0:
+                        return row['gross_invested_all_time_eur']
+                    return np.nan
+
+                df_acc['pnl_net_all_time_percent'] = (
+                    df_acc['pnl_net_all_time_eur']
+                    / df_acc.apply(_roi_denom, axis=1)
+                    * 100
+                ).fillna(0)
+
+                # 6. Weighted Yield on Cost for the account
+                df_acc['dividend_yoc_pct'] = (
+                    df_acc['annual_div_cash_eur']
+                    / _safe(df_acc['current_cost_basis_eur'])
+                    * 100
+                ).fillna(0)
+
+                # 7. Drop helper columns before display
+                df_acc = df_acc.drop(columns=['pnl_all_time_eur', 'annual_div_cash_eur', 'current_cost_basis_eur',
+                                              'gross_invested_all_time_eur', 'direct_cashin_eur', 'linked_cashin_eur'])
 
                 st.divider() # Optional separation line for better visual effect
 
@@ -391,17 +449,22 @@ def render_reports():
                     show_market_fx_split = st.checkbox("Show Market/FX Split", value=False)
                 with col2:
                     show_realized_unrealized_split = st.checkbox("Show Realized/Unrealized Split", value=False)
-
+                with col3:
+                    show_pnl_percent = st.checkbox("Show P&L % Columns", value=False)
+                    
                 if not show_market_fx_split:
                     df_acc = df_acc.drop(columns=['pnl_dtd_market_eur','pnl_dtd_fx_eur', 'pnl_ytd_market_eur', 'pnl_ytd_fx_eur'])
                 if not show_realized_unrealized_split:
                     df_acc = df_acc.drop(columns=['realized_pnl_ytd_eur', 'unrealized_pnl_ytd_eur', 'realized_pnl_eur', 'unrealized_pnl_eur'])
+                if not show_pnl_percent:
+                    df_acc = df_acc.drop(columns=['pnl_dtd_percent', 'pnl_ytd_percent', 'pnl_net_all_time_percent'])
 
                 df_acc = df_acc.rename(columns={
                     'current_value_eur': 'Current Value',
                     'pnl_dtd_market_eur': 'Daily Market P&L',
                     'pnl_dtd_fx_eur': 'Daily FX P&L',
                     'pnl_dtd_eur': 'Daily P&L',
+                    'pnl_dtd_percent': 'Daily P&L %',
                     'pnl_wtd_eur': 'Weekly P&L',
                     'pnl_mtd_eur': 'Monthly P&L',
                     'pnl_qtd_eur': 'Quarterly P&L',
@@ -410,24 +473,45 @@ def render_reports():
                     'realized_pnl_ytd_eur': 'YTD Realized P&L',
                     'unrealized_pnl_ytd_eur': 'YTD Unrealized P&L',
                     'pnl_ytd_eur': 'YTD P&L',
+                    'pnl_ytd_percent': 'YTD P&L %',
                 #    'pnl_all_time_eur': 'Total P&L',
                     'realized_pnl_eur': 'Realized P&L',
                     'unrealized_pnl_eur': 'Unrealized P&L',
                     'pnl_net_all_time_eur': 'Total Net P&L',
+                    'pnl_net_all_time_percent': 'ROI %',
                     'dividend_yoc_pct': 'Annual YOC %'
                 })
+
+                # Reorder columns so each % column appears immediately after its EUR sibling
+                _col_order = [
+                    'Current Value',
+                    'Daily Market P&L', 'Daily FX P&L',
+                    'Daily P&L', 'Daily P&L %',
+                    'Weekly P&L', 'Monthly P&L', 'Quarterly P&L',
+                    'YTD Market P&L', 'YTD FX P&L',
+                    'YTD Realized P&L', 'YTD Unrealized P&L',
+                    'YTD P&L', 'YTD P&L %',
+                    'Realized P&L', 'Unrealized P&L',
+                    'Total Net P&L', 'ROI %',
+                    'Annual YOC %',
+                ]
+                df_acc = df_acc[[c for c in _col_order if c in df_acc.columns]]
 
                 df_acc.index.name = "Account"
             #    st.dataframe(df_acc.style.map(color_negative_red).format("{:,.2f} €"), width="stretch")
 
-                # Ορίζουμε τις στήλες που θέλουν σύμβολο € (όλες εκτός από το YOC)
-                euro_cols = [col for col in df_acc.columns if col != 'Annual YOC %']
+                # Ορίζουμε τις στήλες που θέλουν σύμβολο € (όλες εκτός από τα % columns)
+                _pct_display_cols = {'Daily P&L %', 'YTD P&L %', 'ROI %', 'Annual YOC %'}
+                euro_cols = [col for col in df_acc.columns if col not in _pct_display_cols]
 
                 st.dataframe(
                     df_acc.style
                     .map(color_negative_red)
                     .format({
                         **{col: "{:,.2f} €" for col in euro_cols}, # Όλα τα υπόλοιπα σε €
+                        'Daily P&L %': "{:+.2f}%",
+                        'YTD P&L %': "{:+.2f}%",
+                        'ROI %': "{:+.2f}%",
                         'Annual YOC %': "{:.4f}%"                  # Το YOC σε %
                     }),
                     width="stretch"
@@ -519,13 +603,31 @@ def render_reports():
                     df_details['quantity'] = df_details['quantity'].fillna(0)
                     df_details['latest_price'] = df_details['latest_price'].fillna(0)
 
+                    # ── Recompute % columns from EUR totals ───────────────
+                    # Averaging or summing percentages across rows is wrong.
+                    # DTD/YTD use:  P&L / (current_value − P&L) = P&L / period_start_value.
+                    # Total Net uses gross_invested (sum of all buy costs) as denominator.
+                    # net_invested is WRONG for profitable/closed positions: when sells exceed
+                    # buys the denominator goes negative, flipping the sign to e.g. -100%.
+                    def _pct(pnl_col, base_col):
+                        denom = (df_details[base_col] - df_details[pnl_col]).replace(0, float('nan'))
+                        return (df_details[pnl_col] / denom * 100).fillna(0)
+
+                    df_details['pnl_dtd_percent'] = _pct('pnl_dtd_eur', 'current_value_eur')
+                    df_details['pnl_ytd_percent'] = _pct('pnl_ytd_eur', 'current_value_eur')
+                    df_details['pnl_net_all_time_percent'] = (
+                        df_details['pnl_net_all_time_eur']
+                        / df_details['gross_invested_all_time_eur'].replace(0, float('nan'))
+                        * 100
+                    ).fillna(0)
+
                     df_display = df_details[[
                         'securities_name', 'quantity', 'latest_price', 'current_value_eur', 
                         'pnl_dtd_market_eur', 'pnl_dtd_fx_eur',
-                        'pnl_dtd_eur', 'pnl_wtd_eur', 'pnl_mtd_eur', 'pnl_qtd_eur',
-                        'pnl_ytd_market_eur', 'pnl_ytd_fx_eur',
+                        'pnl_dtd_eur', 'pnl_dtd_percent', 'pnl_wtd_eur', 'pnl_mtd_eur', 'pnl_qtd_eur',
+                        'pnl_ytd_market_eur', 'pnl_ytd_fx_eur', 
                         'realized_pnl_ytd_eur', 'unrealized_pnl_ytd_eur', 
-                        'pnl_ytd_eur', 'realized_pnl_eur', 'unrealized_pnl_eur', 'pnl_net_all_time_eur', 'dividend_yoc_pct'
+                        'pnl_ytd_eur', 'pnl_ytd_percent', 'realized_pnl_eur', 'unrealized_pnl_eur', 'pnl_net_all_time_eur', 'pnl_net_all_time_percent', 'dividend_yoc_pct'
                     ]].rename(columns={
                         'securities_name': 'Security',
                         'quantity': 'Quantity',        
@@ -534,6 +636,7 @@ def render_reports():
                         'pnl_dtd_market_eur': 'Daily Market P&L',
                         'pnl_dtd_fx_eur': 'Daily FX P&L',
                         'pnl_dtd_eur': 'Daily P&L',
+                        'pnl_dtd_percent': 'Daily P&L %',
                         'pnl_wtd_eur': 'Weekly P&L',
                         'pnl_mtd_eur': 'Monthly P&L',
                         'pnl_qtd_eur': 'Quarterly P&L',
@@ -542,10 +645,12 @@ def render_reports():
                         'realized_pnl_ytd_eur': 'YTD Realized P&L',
                         'unrealized_pnl_ytd_eur': 'YTD Unrealized P&L',
                         'pnl_ytd_eur': 'YTD P&L',
+                        'pnl_ytd_percent': 'YTD P&L %',
                     #    'pnl_all_time_eur': 'Total P&L',
                         'realized_pnl_eur': 'Realized P&L',
                         'unrealized_pnl_eur': 'Unrealized P&L',
                         'pnl_net_all_time_eur': 'Total Net P&L',
+                        'pnl_net_all_time_percent': 'ROI %',
                         'dividend_yoc_pct': 'Annual YOC %'
                     })
 
@@ -554,7 +659,7 @@ def render_reports():
                         df_display = df_display[df_display['Value (€)'] != 0]
 
 
-                    pnl_cols = ['Daily Market P&L', 'Daily FX P&L', 'Daily P&L', 'Weekly P&L', 'Monthly P&L', 'Quarterly P&L', 'YTD Market P&L', 'YTD FX P&L', 'YTD Realized P&L', 'YTD Unrealized P&L', 'YTD P&L', 'Realized P&L', 'Unrealized P&L', 'Total Net P&L', 'Annual YOC %']
+                    pnl_cols = ['Daily Market P&L', 'Daily FX P&L', 'Daily P&L', 'Daily P&L %', 'Weekly P&L', 'Monthly P&L', 'Quarterly P&L', 'YTD Market P&L', 'YTD FX P&L', 'YTD Realized P&L', 'YTD Unrealized P&L', 'YTD P&L', 'YTD P&L %', 'Realized P&L', 'Unrealized P&L', 'Total Net P&L', 'ROI %', 'Annual YOC %']
 
                     # 1. Set 'Security' as the index so Streamlit treats it as the frozen lead column
                     df_to_show = df_display.set_index('Security')
@@ -578,6 +683,9 @@ def render_reports():
                             # P&L columns
                     #        **{col: "{:,.2f} €" for col in pnl_cols},
                             **{col: "{:,.2f} €" for col in existing_pnl_cols},
+                            'Daily P&L %': "{:.2f}%",
+                            'YTD P&L %': "{:.2f}%",
+                            'ROI %': "{:.2f}%",
                             # Value column
                             'Value (€)': "{:,.2f} €",
                             # Price and Quantity columns

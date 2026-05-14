@@ -1138,7 +1138,13 @@ def get_pnl_report_data(start_date: str = '1900-01-01', end_date: str = None):
                             THEN i.Total_Amount * COALESCE(hfx.FX_Rate, 1)
                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'CashIn', 'RtrnCap')
                             THEN -i.Total_Amount * COALESCE(hfx.FX_Rate, 1)
-                         ELSE 0 END) AS net_invested_all_time_eur
+                         ELSE 0 END) AS net_invested_all_time_eur,
+                -- gross_invested_all_time_eur: total cost of all buys (correct denominator for % return)
+                -- Using net_invested as denominator is wrong for closed/profitable positions because
+                -- proceeds from sells make it negative, flipping the sign of the percentage.
+                SUM(CASE WHEN i.Action IN ('Buy', 'CashOut', 'MiscExp')
+                            THEN i.Total_Amount * COALESCE(hfx.FX_Rate, 1)
+                         ELSE 0 END) AS gross_invested_all_time_eur
             FROM Investments i
             JOIN Accounts a ON i.Accounts_Id = a.Accounts_Id
             LEFT JOIN Historical_FX hfx
@@ -1167,6 +1173,42 @@ def get_pnl_report_data(start_date: str = '1900-01-01', end_date: str = None):
             WHERE i.Action IN ('Dividend', 'Reinvest', 'ShrIn')
               AND i.Date >= CURRENT_DATE - INTERVAL '1 year'
             GROUP BY i.Securities_Id, i.Accounts_Id
+        ),
+        -- Account-level capital inflows — used as the ROI denominator.
+        -- Priority 1: explicit CashIn (Action='CashIn', Securities_Id IS NULL) recorded
+        --             directly in the Investments table (e.g. pension contributions, or
+        --             deposits recorded before a Buy).
+        account_direct_flows AS (
+            SELECT
+                i.Accounts_Id,
+                SUM(CASE WHEN i.Action = 'CashIn'
+                         THEN i.Total_Amount * COALESCE(hfx.FX_Rate, 1) ELSE 0 END) AS direct_cashin_eur
+            FROM Investments i
+            JOIN Accounts a ON i.Accounts_Id = a.Accounts_Id
+            LEFT JOIN Historical_FX hfx
+                   ON hfx.Currencies_Id_1 = a.Currencies_Id
+                  AND hfx.Date = i.Date
+            WHERE i.Securities_Id IS NULL   -- CashIn/CashOut never have a security
+            GROUP BY i.Accounts_Id
+        ),
+        -- Priority 2: explicit cash transfers recorded in the LINKED cash account
+        --             (Transactions.Accounts_Id_Target = investment_account).
+        --             Buy/Sell-linked transactions use transactions_id and have
+        --             Accounts_Id_Target = NULL, so they are NOT included here.
+        account_linked_flows AS (
+            SELECT
+                a.Accounts_Id AS inv_acc_id,
+                SUM(-t.Total_Amount * COALESCE(fxl.FX_Rate, 1)) AS linked_cashin_eur
+            FROM Accounts a
+            INNER JOIN Accounts al ON al.Accounts_Id = a.Accounts_Id_Linked
+            INNER JOIN Transactions t
+                    ON t.Accounts_Id       = al.Accounts_Id
+                   AND t.Accounts_Id_Target = a.Accounts_Id
+                   AND t.Total_Amount < 0   -- negative = cash leaving the linked account (deposit into investment)
+            LEFT JOIN Historical_FX fxl
+                   ON fxl.Currencies_Id_1 = al.Currencies_Id
+                  AND fxl.Date = t.Date
+            GROUP BY a.Accounts_Id
         )
         SELECT
             pf.Accounts_Name, pf.Securities_Name,
@@ -1180,7 +1222,11 @@ def get_pnl_report_data(start_date: str = '1900-01-01', end_date: str = None):
             (pf.qty_dtd * pf.price_dtd) * (COALESCE(pf.fx_today, 1) - COALESCE(pf.fx_dtd, 1)) as pnl_dtd_fx_eur,
             -- 3. Total P&L DTD		
             ((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)) - (pf.qty_dtd * pf.price_dtd * COALESCE(pf.fx_dtd, 1)) - COALESCE(cf.cf_dtd_eur, 0)) as pnl_dtd_eur,
-            
+            -- DTD P&L %
+            CASE WHEN (pf.qty_dtd * pf.price_dtd * COALESCE(pf.fx_dtd, 1)) = 0 THEN 0
+                 ELSE (((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)) - (pf.qty_dtd * pf.price_dtd * COALESCE(pf.fx_dtd, 1)) - COALESCE(cf.cf_dtd_eur, 0)) / (pf.qty_dtd * pf.price_dtd * COALESCE(pf.fx_dtd, 1))) * 100
+            END as pnl_dtd_percent,
+
             -- WTD/MTD/QTD Analysis
             ((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)) - (pf.qty_wtd * pf.price_wtd * COALESCE(pf.fx_wtd, 1)) - COALESCE(cf.cf_wtd_eur, 0)) as pnl_wtd_eur,
             ((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)) - (pf.qty_mtd * pf.price_mtd * COALESCE(pf.fx_mtd, 1)) - COALESCE(cf.cf_mtd_eur, 0)) as pnl_mtd_eur,
@@ -1208,6 +1254,10 @@ def get_pnl_report_data(start_date: str = '1900-01-01', end_date: str = None):
 				 ELSE COALESCE((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)), 0) - COALESCE((pf.qty_ytd * pf.price_ytd * COALESCE(pf.fx_ytd, 1)),0) -- this is required for outstanding positions
 			END   - COALESCE(cf.cf_ytd_eur, 0) -- this is required for positions closed within the year and by today
 			as pnl_ytd_eur,	 
+            -- Total YTD P&L %
+            CASE WHEN COALESCE((pf.qty_ytd * pf.price_ytd * COALESCE(pf.fx_ytd, 1)), 0) = 0 THEN 0
+                 ELSE (((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)) - COALESCE((pf.qty_ytd * pf.price_ytd * COALESCE(pf.fx_ytd, 1)),0) - COALESCE(cf.cf_ytd_eur, 0)) / COALESCE((pf.qty_ytd * pf.price_ytd * COALESCE(pf.fx_ytd, 1)), 1)) * 100
+            END as pnl_ytd_percent,
 
             -- YTD UNREALIZED P&L
 			CASE WHEN pf.qty_today <> 0 AND pf.qty_ytd = 0 THEN COALESCE((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)), 0) - COALESCE(cf.cf_ytd_eur, 0)  
@@ -1232,7 +1282,20 @@ def get_pnl_report_data(start_date: str = '1900-01-01', end_date: str = None):
 
             -- Συνολικό P&L από την αρχή (Total Net Economic Gain)
             COALESCE((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)),0) - COALESCE(cf.net_invested_all_time_eur, 0) as pnl_net_all_time_eur,
-            
+            -- Total Net Economic Gain %
+            -- Denominator is gross_invested (total cost of buys), NOT net_invested.
+            -- net_invested goes negative for profitable closed positions (proceeds > cost),
+            -- which would flip the sign.  gross_invested is always >= 0.
+            CASE WHEN COALESCE(cf.gross_invested_all_time_eur, 0) = 0 THEN 0
+                 ELSE (COALESCE((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)),0) - COALESCE(cf.net_invested_all_time_eur, 0))
+                      / cf.gross_invested_all_time_eur * 100
+            END as pnl_net_all_time_percent,
+            COALESCE(cf.gross_invested_all_time_eur, 0) as gross_invested_all_time_eur,
+            -- Capital-inflow columns for account-level ROI denominator (same value on every
+            -- row for an account; Python picks it up with groupby 'first').
+            COALESCE(adf.direct_cashin_eur, 0) AS direct_cashin_eur,
+            COALESCE(alf.linked_cashin_eur, 0) AS linked_cashin_eur,
+
             -- Unrealized P&L (FIFO based)
             h.Quantity * (pf.price_today - h.Fifo_Avg_Price) * COALESCE(pf.fx_today, 1) AS unrealized_pnl_eur,
 
@@ -1253,6 +1316,8 @@ def get_pnl_report_data(start_date: str = '1900-01-01', end_date: str = None):
                ON h.Accounts_Id = pf.Accounts_Id AND h.Securities_Id = pf.Securities_Id
         LEFT JOIN dividend_yoc dy
                ON dy.Accounts_Id = pf.Accounts_Id AND dy.Securities_Id = pf.Securities_Id
+        LEFT JOIN account_direct_flows adf ON adf.Accounts_Id    = pf.Accounts_Id
+        LEFT JOIN account_linked_flows alf ON alf.inv_acc_id = pf.Accounts_Id
         WHERE (pf.qty_today != 0 OR cf.cf_all_time IS NOT NULL) -- Εξασφαλίζει ότι βλέπουμε και κλειστές θέσεις με ιστορικό
     --  AND pf.Accounts_Id = 89
         ORDER BY pf.Accounts_Name, pf.Securities_Name;
