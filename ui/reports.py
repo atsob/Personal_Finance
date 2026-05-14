@@ -25,13 +25,13 @@ def render_reports():
         "Select Report:",
         [
             "Net Worth Report",
+            "Income & Expense",
+            "Cash Flow Forecast",
             "Historical Investment Positions",
             "P&L Reports",
-            "Securities & Portfolio Analysis",
-            "Income & Expense",
-            "Dividend Tracker",
-            "Cash Flow Forecast",
             "Asset Allocation",
+            "Dividend Tracker",
+            "Securities & Portfolio Analysis",
             "FX Exposure",
             "Bond Schedule",
         ],
@@ -2018,7 +2018,7 @@ def render_dividend_tracker():
 
     period_opt = st.sidebar.radio(
         "Period:",
-        ["1 Year", "2 Years", "3 Years", "5 Years", "All Time", "Custom"],
+        ["YTD", "Previous Year", "1 Year", "2 Years", "3 Years", "5 Years", "All Time", "Custom"],
         index=0,
         key="div_period",
     )
@@ -2030,14 +2030,23 @@ def render_dividend_tracker():
     elif period_opt == "All Time":
         start_date = pd.Timestamp("1900-01-01").date()
         end_date   = today
+    elif period_opt == "YTD":
+        import datetime as _dt
+        start_date = _dt.date(today.year, 1, 1)
+        end_date   = today
+    elif period_opt == "Previous Year":
+        import datetime as _dt
+        start_date = _dt.date(today.year - 1, 1, 1)
+        end_date   = _dt.date(today.year - 1, 12, 31)
     else:
         start_date = today - pd.Timedelta(days=_period_days[period_opt])
         end_date   = today
 
-    period_label = (
-        period_opt if period_opt in ("All Time", "Custom")
-        else f"Last {period_opt}"
-    )
+    period_label = {
+        "All Time": "All Time", "Custom": "Custom",
+        "YTD": f"YTD {today.year}",
+        "Previous Year": str(today.year - 1),
+    }.get(period_opt, f"Last {period_opt}")
 
     if st.sidebar.button("🔄 Refresh", key="div_refresh"):
         get_dividend_tracker_data.clear()
@@ -2064,10 +2073,11 @@ def render_dividend_tracker():
     # before the most recent one; for 2 years no more than 23 months, etc.
     # This prevents accidentally collecting N+1 payment cycles when a dividend
     # lands right at the edge of the calendar window.
-    _period_months = {"1 Year": 12, "2 Years": 24, "3 Years": 36, "5 Years": 60}
+    _period_months = {"1 Year": 12, "2 Years": 24, "3 Years": 36, "5 Years": 60,
+                      "Previous Year": 12}
     if period_opt in _period_months:
         _max_span_days = (_period_months[period_opt] - 1) * 365.25 / 12
-    elif period_opt == "Custom":
+    elif period_opt in ("Custom", "YTD"):
         _custom_months = (end_date - start_date).days / (365.25 / 12)
         _max_span_days = max(_custom_months - 1, 0) * 365.25 / 12
     else:  # All Time — no cap
@@ -2135,7 +2145,8 @@ def render_dividend_tracker():
     # selected calendar window — NOT over inter-dividend gaps or buy-to-dividend spans.
     # Exception: "All Time" has no fixed window, so use the actual holding period
     # (position_start_date → last income date) as the denominator.
-    _ann_days_map = {"1 Year": 365, "2 Years": 730, "3 Years": 1095, "5 Years": 1825}
+    _ann_days_map = {"1 Year": 365, "2 Years": 730, "3 Years": 1095, "5 Years": 1825,
+                     "Previous Year": 365}
     if period_opt == "All Time":
         ann_days = (
             (df_t12['last_income_date'] - df_t12['position_start_date'])
@@ -2144,7 +2155,7 @@ def render_dividend_tracker():
         )
     elif period_opt in _ann_days_map:
         ann_days = _ann_days_map[period_opt]
-    else:  # Custom
+    else:  # Custom or YTD — use actual calendar days
         ann_days = max((end_date - start_date).days, 1)
 
     df_t12['yoc_pct'] = (
@@ -2178,6 +2189,29 @@ def render_dividend_tracker():
         }
     )
     copy_df_button(df_t12, key="dl_rpt_div_t12")
+
+    # ── Pie chart: income allocation by Security Type ─────────────────────────
+    df_by_type = (
+        df_t12.groupby('securities_type')['period_income_eur']
+        .sum()
+        .reset_index()
+        .sort_values('period_income_eur', ascending=False)
+    )
+    fig_pie = px.pie(
+        df_by_type,
+        names='securities_type',
+        values='period_income_eur',
+        title=f"<b>Income Allocation by Security Type — {period_label}</b>",
+        template='plotly_dark',
+        hole=0.35,
+    )
+    fig_pie.update_traces(
+        textposition='inside',
+        textinfo='percent+label',
+        hovertemplate='<b>%{label}</b><br>€ %{value:,.2f}<br>%{percent}<extra></extra>',
+    )
+    fig_pie.update_layout(margin=dict(l=0, r=0, t=50, b=0), showlegend=True)
+    st.plotly_chart(fig_pie, width='stretch')
 
     # Full detail table
     with st.expander("Full transaction detail"):
@@ -2319,7 +2353,7 @@ def render_asset_allocation():
 
     st.markdown("#### Rebalancing Delta")
     df_display = df.copy()
-    df_display['delta_pct'] = df_display['actual_pct'] - df_display['target_pct']
+    df_display['delta_pct'] = df_display['target_pct'] - df_display['actual_pct']
     df_display['rebalance_eur'] = df_display['delta_pct'] / 100 * total_eur
 
     st.dataframe(

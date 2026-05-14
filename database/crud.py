@@ -351,9 +351,12 @@ def update_holdings():
     try:
         cur.execute("""
             DELETE FROM Holdings
-            WHERE (Accounts_Id, Securities_Id) NOT IN (
-                SELECT Accounts_Id, Securities_Id 
-                FROM Investments
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM Investments i
+                WHERE i.Accounts_Id  = Holdings.Accounts_Id
+                  AND i.Securities_Id = Holdings.Securities_Id
+                  AND i.Securities_Id IS NOT NULL
             );
 
             WITH TransactionFlow AS (
@@ -433,6 +436,20 @@ def update_holdings():
                 Simple_Avg_Price = EXCLUDED.Simple_Avg_Price, 
                 Fifo_Avg_Price = EXCLUDED.Fifo_Avg_Price, -- Update and the new column
                 Last_Update = CURRENT_TIMESTAMP;
+
+            -- Remove zero-quantity Holdings rows that have no remaining investments
+            -- (e.g. after all transactions for a security have been moved or deleted).
+            -- Holdings with Quantity=0 that still have Investments rows are kept
+            -- intentionally for closed-position P&L history.
+            DELETE FROM Holdings
+            WHERE ABS(Quantity) = 0
+              AND NOT EXISTS (
+                SELECT 1
+                FROM Investments i
+                WHERE i.Accounts_Id   = Holdings.Accounts_Id
+                  AND i.Securities_Id  = Holdings.Securities_Id
+                  AND i.Securities_Id IS NOT NULL
+              );
         """)
         conn.commit()
     except Exception as e:
@@ -648,8 +665,8 @@ def normalize_investment_prices(investments_ids: list) -> int:
         conn.close()
 
 
-def save_nwr_account_selection(account_ids: list):
-    """Persist Net Worth Report account selection to app_settings table."""
+def save_nwr_account_selection(account_ids: list, settings_key: str = 'nwr_account_ids'):
+    """Persist an account selection to app_settings under *settings_key*."""
     import json
     conn = get_connection()
     cur = conn.cursor()
@@ -658,9 +675,9 @@ def save_nwr_account_selection(account_ids: list):
             CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT)
         """)
         cur.execute("""
-            INSERT INTO app_settings (key, value) VALUES ('nwr_account_ids', %s)
+            INSERT INTO app_settings (key, value) VALUES (%s, %s)
             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
-        """, (json.dumps(account_ids),))
+        """, (settings_key, json.dumps(account_ids)))
         conn.commit()
     finally:
         cur.close()

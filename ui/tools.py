@@ -14,15 +14,22 @@ from database.crud import delete_historical_prices, insert_prices_from_transacti
 from ui.components import copy_df_button
 
 
-_WRITE_PATTERN = re.compile(
-    r"^\s*(INSERT|UPDATE|DELETE|DROP|TRUNCATE|ALTER|CREATE|REPLACE|MERGE|GRANT|REVOKE|CALL|DO)\b",
+# DDL operations that are always blocked (schema-destructive)
+_DDL_PATTERN = re.compile(
+    r"^\s*(DROP|TRUNCATE|ALTER|CREATE|REPLACE|MERGE|GRANT|REVOKE|CALL|DO)\b",
+    re.IGNORECASE,
+)
+
+# DML operations that are allowed (data modifications, committed immediately)
+_DML_PATTERN = re.compile(
+    r"^\s*(INSERT|UPDATE|DELETE)\b",
     re.IGNORECASE,
 )
 
 
 def _render_sql_interface():
     st.subheader("🛢 SQL Query Interface")
-    st.caption("Read-only: only SELECT and WITH…SELECT queries are allowed.")
+    st.caption("SELECT, INSERT, UPDATE and DELETE are allowed. DROP, TRUNCATE, ALTER, CREATE and other DDL statements are blocked.")
 
     default_sql = "SELECT table_name\nFROM information_schema.tables\nWHERE table_schema = 'public'\nORDER BY table_name;"
 
@@ -32,7 +39,7 @@ def _render_sql_interface():
         height=200,
         key="sql_query",
         label_visibility="collapsed",
-        placeholder="SELECT …",
+        placeholder="SELECT … / INSERT … / UPDATE … / DELETE …",
     )
 
     col_run, col_clear, col_export = st.columns([1, 1, 1])
@@ -44,6 +51,7 @@ def _render_sql_interface():
             st.session_state["sql_query"] = default_sql
             st.session_state.pop("sql_result", None)
             st.session_state.pop("sql_error", None)
+            st.session_state.pop("sql_dml_info", None)
             st.rerun()
     with col_export:
         export_placeholder = st.empty()
@@ -52,21 +60,44 @@ def _render_sql_interface():
         query = sql.strip()
         if not query:
             st.warning("Please enter a SQL query.")
-        elif _WRITE_PATTERN.match(query):
-            st.error("Write statements (INSERT, UPDATE, DELETE, DROP, …) are not allowed.")
+        elif _DDL_PATTERN.match(query):
+            st.error("DDL statements (DROP, TRUNCATE, ALTER, CREATE, …) are not allowed.")
+        elif _DML_PATTERN.match(query):
+            # ── DML: execute with commit, report rows affected ────────────────
+            try:
+                conn = get_connection()
+                cur = conn.cursor()
+                cur.execute(query)
+                rows_affected = cur.rowcount
+                conn.commit()
+                cur.close()
+                conn.close()
+                st.session_state["sql_dml_info"] = f"✅ Query executed successfully — {rows_affected} row(s) affected."
+                st.session_state.pop("sql_result", None)
+                st.session_state.pop("sql_error", None)
+            except Exception as e:
+                st.session_state["sql_error"] = str(e)
+                st.session_state.pop("sql_result", None)
+                st.session_state.pop("sql_dml_info", None)
         else:
+            # ── SELECT / WITH: return result set ──────────────────────────────
             try:
                 conn = get_connection()
                 df = pd.read_sql(query, conn)
                 conn.close()
                 st.session_state["sql_result"] = df
                 st.session_state.pop("sql_error", None)
+                st.session_state.pop("sql_dml_info", None)
             except Exception as e:
                 st.session_state["sql_error"] = str(e)
                 st.session_state.pop("sql_result", None)
+                st.session_state.pop("sql_dml_info", None)
 
     if "sql_error" in st.session_state:
         st.error(st.session_state["sql_error"])
+
+    if "sql_dml_info" in st.session_state:
+        st.success(st.session_state["sql_dml_info"])
 
     if "sql_result" in st.session_state:
         df = st.session_state["sql_result"]

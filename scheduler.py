@@ -37,9 +37,7 @@ logging.basicConfig(
 )
 
 # ── Market-data refresh config ────────────────────────────────────────────────
-MARKET_REFRESH_INTERVAL_MINUTES = 5   # how often to refresh prices & FX
-MARKET_HOURS_START = 7                 # inclusive  (local time, 24-h), earlier for FX markets and Cryptos considering global nature and after-hours trading
-MARKET_HOURS_END   = 23                # exclusive, considering late trading and after-hours for US markets
+MARKET_REFRESH_INTERVAL_MINUTES = 5   # how often to refresh prices & FX (24 × 7)
 
 # ── Daily backup config ───────────────────────────────────────────────────────
 BACKUP_HOUR            = 6    # local hour at which the daily backup runs (06:00 AM)
@@ -73,8 +71,8 @@ def _summary_exists_for_current_week() -> bool:
 
 
 def _is_market_open(now: datetime) -> bool:
-    """True on Mon–Fri between MARKET_HOURS_START and MARKET_HOURS_END."""
-    return now.weekday() < 5 and MARKET_HOURS_START <= now.hour < MARKET_HOURS_END
+    """Always True — market data is refreshed 24 × 7."""
+    return True
 
 
 # ── Jobs ──────────────────────────────────────────────────────────────────────

@@ -1,8 +1,9 @@
 import streamlit as st
 import pandas as pd
+import plotly.express as px
 from ui.components import format_qty_display, color_negative_red, style_qty_display, copy_df_button
-from database.queries import get_hist_net_worth_data, get_transaction_anomalies, get_weekly_summaries
-from database.crud import update_accounts_balances, update_holdings, update_investment_balances, update_pension_balances
+from database.queries import get_hist_net_worth_data, get_transaction_anomalies, get_weekly_summaries, get_all_accounts_for_nwr, get_nwr_account_selection
+from database.crud import update_accounts_balances, update_holdings, update_investment_balances, update_pension_balances, save_nwr_account_selection
 from datetime import datetime
 from ai.weekly_summary import run as run_weekly_summary
 from ai.monthly_summary import run as run_monthly_summary
@@ -61,120 +62,245 @@ def render_ai_monthly_summaries_ui(conn):
 
 def render_dashboard(conn):
     """Render the Dashboard page."""
-#    st.title("🏛 Net Worth (incl. future registered transactions)")
-    st.markdown(
-        f"<h1>🏛 Net Worth <span style='font-size: 0.6em; opacity: 0.7;'>(incl. future registered transactions)</span></h1>", 
-        unsafe_allow_html=True
-    )
+    st.title("🏛 Net Worth")
 
-    query_combined = """
-        WITH Latest_FX AS (
-            SELECT DISTINCT ON (Currencies_Id_1) Currencies_Id_1, FX_Rate 
-            FROM Historical_FX 
-            ORDER BY Currencies_Id_1, Date DESC
-        ),
-        Latest_Prices AS (
-            SELECT DISTINCT ON (Securities_Id) Securities_Id, Close 
-            FROM Historical_Prices 
-            ORDER BY Securities_Id, Date DESC
+    # ── Account selection & options ───────────────────────────────────────
+    _DASH_NW_KEY = 'dashboard_nw_account_ids'
+    df_accounts  = get_all_accounts_for_nwr()
+    all_ids      = df_accounts['accounts_id'].tolist()
+
+    saved_ids = get_nwr_account_selection(_DASH_NW_KEY)
+    init_sel  = set(saved_ids) if saved_ids is not None else set(all_ids)
+
+    df_sel = df_accounts.copy()
+    df_sel.insert(0, 'Include', df_sel['accounts_id'].isin(init_sel))
+
+    with st.expander("⚙️ Account Selection & Options", expanded=False):
+        edited_accs = st.data_editor(
+            df_sel.rename(columns={'accounts_name': 'Account', 'accounts_type': 'Type'}),
+            column_config={
+                'Include':     st.column_config.CheckboxColumn('Include', default=True),
+                'accounts_id': None,
+            },
+            hide_index=True,
+            width="stretch",
+            disabled=['Account', 'Type'],
+            key="dashboard_nw_account_editor",
         )
-            -- ASSETS
-        SELECT a.Accounts_Name as name, 'Assets' as type, c.Currencies_ShortName as curr, a.Accounts_Balance as qty,
-               CASE WHEN c.Currencies_ShortName = 'EUR' THEN a.Accounts_Balance ELSE a.Accounts_Balance * COALESCE(fx.FX_Rate, 1) END as value_eur
-        FROM Accounts a 
-        LEFT JOIN Currencies c ON a.Currencies_Id = c.Currencies_Id 
-        LEFT JOIN Latest_FX fx ON a.Currencies_Id = fx.Currencies_Id_1 
-        WHERE a.Is_Active = TRUE AND a.Accounts_Type NOT IN ('Cash', 'Checking', 'Savings', 'Credit Card', 'Brokerage', 'Pension', 'Other Investment', 'Margin', 'Loan', 'Other')
-        UNION ALL
-            -- CASH FROM NON-INVESTMENT ACCOUNTS
-        SELECT a.Accounts_Name as name, 'Cash' as type, c.Currencies_ShortName as curr, a.Accounts_Balance as qty,
-               CASE WHEN c.Currencies_ShortName = 'EUR' THEN a.Accounts_Balance ELSE a.Accounts_Balance * COALESCE(fx.FX_Rate, 1) END as value_eur
-        FROM Accounts a 
-        LEFT JOIN Currencies c ON a.Currencies_Id = c.Currencies_Id 
-        LEFT JOIN Latest_FX fx ON a.Currencies_Id = fx.Currencies_Id_1 
-        WHERE a.Is_Active = TRUE AND a.Accounts_Type NOT IN ('Brokerage', 'Pension', 'Other Investment', 'Margin', 'Real Estate', 'Vehicle', 'Asset', 'Liability')
-        UNION ALL
-            -- CASH FROM OTHER INVESTMENT ACCOUNTS
-        SELECT a.Accounts_Name as name, 'Cash' as type, c.Currencies_ShortName as curr, a.Accounts_Balance as qty,
-               CASE WHEN c.Currencies_ShortName = 'EUR' THEN a.Accounts_Balance ELSE a.Accounts_Balance * COALESCE(fx.FX_Rate, 1) END as value_eur
-        FROM Accounts a 
-        LEFT JOIN Currencies c ON a.Currencies_Id = c.Currencies_Id 
-        LEFT JOIN Latest_FX fx ON a.Currencies_Id = fx.Currencies_Id_1 
-        WHERE a.Is_Active = TRUE AND a.Accounts_Type IN ('Other Investment')
-        UNION ALL
-            -- PENSION ACCOUNTS
-        SELECT a.Accounts_Name as name, 'Pension' as type, c.Currencies_ShortName as curr, a.Accounts_Balance as qty,
-               CASE WHEN c.Currencies_ShortName = 'EUR' THEN a.Accounts_Balance ELSE a.Accounts_Balance * COALESCE(fx.FX_Rate, 1) END as value_eur
-        FROM Accounts a 
-        LEFT JOIN Currencies c ON a.Currencies_Id = c.Currencies_Id 
-        LEFT JOIN Latest_FX fx ON a.Currencies_Id = fx.Currencies_Id_1 
-        WHERE a.Is_Active = TRUE AND a.Accounts_Type IN ('Pension')
-        UNION ALL
-            -- INVESTMENTS
-        SELECT 
-            s.Securities_Name as name, 
-            'Investment' as type, 
-            c.Currencies_ShortName as curr, 
-            SUM(h.Quantity) as qty,
-            SUM(CASE 
-                WHEN c.Currencies_ShortName = 'EUR' THEN h.Quantity * COALESCE(lp.Close, 0) 
-                ELSE (h.Quantity * COALESCE(lp.Close, 0)) * COALESCE(fx.FX_Rate, 1) 
-            END) as value_eur
-        FROM Holdings h
-        JOIN Securities s ON s.Securities_Id = h.Securities_Id
-        JOIN Currencies c ON c.Currencies_Id = s.Currencies_Id
-        -- Χρησιμοποιούμε INNER JOIN για τις τιμές ώστε να μην φέρνει holdings χωρίς τιμή
-        JOIN Latest_Prices lp ON lp.Securities_Id = h.Securities_Id
-        -- To LEFT JOIN με την Latest_FX είναι πλέον ασφαλές λόγω του DISTINCT ON
-        LEFT JOIN Latest_FX fx ON s.Currencies_Id = fx.Currencies_Id_1
-        WHERE h.Quantity <> 0
-        GROUP BY name, type, curr
-        ORDER BY type ASC, value_eur DESC
-    """
-    
-    df_net = pd.read_sql(query_combined, conn)
-    df_net.columns = [c.lower() for c in df_net.columns]
-    df_net['type'] = df_net['type'].str.strip()
-    df_net['qty_display'] = df_net.apply(format_qty_display, axis=1)
-    
-    # Display metrics
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Net Worth", f"€ {df_net['value_eur'].sum():,.2f}")
-    m2.metric("Assets", f"€ {df_net[df_net['type']=='Assets']['value_eur'].sum():,.2f}")
-    m3.metric("Cash", f"€ {df_net[df_net['type']=='Cash']['value_eur'].sum():,.2f}")
-    m4.metric("Pension", f"€ {df_net[df_net['type']=='Pension']['value_eur'].sum():,.2f}")
-    m5.metric("Investments", f"€ {df_net[df_net['type']=='Investment']['value_eur'].sum():,.2f}")
-    
-    # Apply Style and Formatting
-    # We define the new order (qty_display before value_eur)
-    new_order = ['name', 'type', 'curr', 'qty', 'qty_display', 'value_eur']
-    df_net = df_net.reindex(columns=new_order)
-    # We use .style for color and format simultaneously
-    styled_df = df_net.style \
-        .map(color_negative_red, subset=['value_eur', 'qty']) \
-        .apply(lambda x: style_qty_display(df_net), subset=['qty_display'], axis=0) \
-        .format({
-            "qty": "{:,.2f}",
-            "value_eur": "{:,.2f} €"
-        }) \
-        .hide(['qty'], axis=1)  # If this doesn't work, try: .hide(subset=['qty'], axis=1)
+        selected_ids = edited_accs[edited_accs['Include']]['accounts_id'].tolist()
 
-    # Display the Styled DataFrame
-    # We define the order we want, skipping the 'qty' column
-    st.dataframe(
-        styled_df, 
-        width="stretch", 
-        hide_index=True,
-        column_order=("name", "type", "curr", "qty_display", "value_eur"),
-        column_config={
-            "name": "Description",
-            "type": "Category",
-            "curr": "Currency",
-            "qty_display": "Value / Quantity",
-            "value_eur": "Value (€)"
+        include_future = st.checkbox(
+            "Include future registered transactions",
+            value=False,
+            help="When unchecked (default) balances reflect only transactions up to today's date.",
+            key="dashboard_nw_future",
+        )
+
+        _cs, _ = st.columns([1, 5])
+        if _cs.button("💾 Save Selection", key="dashboard_nw_save"):
+            save_nwr_account_selection(selected_ids, _DASH_NW_KEY)
+            st.success("Selection saved!")
+
+    if not selected_ids:
+        st.warning("No accounts selected — open the ⚙️ panel above and include at least one account.")
+    else:
+        # ── Build query ───────────────────────────────────────────────────
+        _ids_sql   = ", ".join(str(int(i)) for i in selected_ids)
+        _acc_filt  = f"AND a.Accounts_Id IN ({_ids_sql})"
+        _hold_filt = f"AND h.Accounts_Id IN ({_ids_sql})"
+
+        # Balance expressions
+        # ─ Cash/bank accounts: balances come from the Transactions table.
+        #   When "exclude future" is on, cap to Date <= today.
+        # ─ All other account types (Assets, Pension, Other Investment) have
+        #   their balance pre-computed from the Investments table by the
+        #   update_*_balances() functions and stored in Accounts_Balance.
+        #   Using a Transactions subquery there always returns 0, so we
+        #   always read the stored value for those types.
+        if include_future:
+            _b_cash = "a.Accounts_Balance"
+        else:
+            _b_cash = (
+                "(SELECT COALESCE(SUM(t.Total_Amount), 0) "
+                " FROM Transactions t "
+                " WHERE t.Accounts_Id = a.Accounts_Id AND t.Date <= CURRENT_DATE)"
+            )
+        # Stored balance — used for Assets, Pension, Other Investment cash
+        _b_stored = "a.Accounts_Balance"
+
+        query_combined = f"""
+            WITH Latest_FX AS (
+                SELECT DISTINCT ON (Currencies_Id_1) Currencies_Id_1, FX_Rate
+                FROM Historical_FX
+                ORDER BY Currencies_Id_1, Date DESC
+            ),
+            Latest_Prices AS (
+                SELECT DISTINCT ON (Securities_Id) Securities_Id, Close
+                FROM Historical_Prices
+                ORDER BY Securities_Id, Date DESC
+            )
+            -- ASSETS (Real Estate, Vehicle, Asset …)
+            -- Balance stored in Accounts_Balance via manual/bulk updates — no Transactions rows.
+            SELECT a.Accounts_Name AS name, 'Assets' AS type, c.Currencies_ShortName AS curr,
+                   {_b_stored} AS qty,
+                   CASE WHEN c.Currencies_ShortName = 'EUR' THEN {_b_stored}
+                        ELSE {_b_stored} * COALESCE(fx.FX_Rate, 1) END AS value_eur
+            FROM Accounts a
+            LEFT JOIN Currencies c  ON a.Currencies_Id = c.Currencies_Id
+            LEFT JOIN Latest_FX fx  ON a.Currencies_Id = fx.Currencies_Id_1
+            WHERE a.Is_Active = TRUE
+              AND a.Accounts_Type NOT IN ('Cash','Checking','Savings','Credit Card',
+                                          'Brokerage','Pension','Other Investment',
+                                          'Margin','Loan','Other')
+              {_acc_filt}
+
+            UNION ALL
+            -- CASH (bank, checking, savings, credit card …)
+            -- Balance derived from Transactions — date filter applied when exclude_future.
+            SELECT a.Accounts_Name AS name, 'Cash' AS type, c.Currencies_ShortName AS curr,
+                   {_b_cash} AS qty,
+                   CASE WHEN c.Currencies_ShortName = 'EUR' THEN {_b_cash}
+                        ELSE {_b_cash} * COALESCE(fx.FX_Rate, 1) END AS value_eur
+            FROM Accounts a
+            LEFT JOIN Currencies c  ON a.Currencies_Id = c.Currencies_Id
+            LEFT JOIN Latest_FX fx  ON a.Currencies_Id = fx.Currencies_Id_1
+            WHERE a.Is_Active = TRUE
+              AND a.Accounts_Type NOT IN ('Brokerage','Pension','Other Investment',
+                                          'Margin','Real Estate','Vehicle','Asset','Liability')
+              {_acc_filt}
+
+            UNION ALL
+            -- CASH balance of Other Investment accounts
+            -- Computed by update_investment_balances() from Investments + Transactions.
+            -- Always read the stored value; the future-toggle has no meaningful effect here.
+            SELECT a.Accounts_Name AS name, 'Cash' AS type, c.Currencies_ShortName AS curr,
+                   {_b_stored} AS qty,
+                   CASE WHEN c.Currencies_ShortName = 'EUR' THEN {_b_stored}
+                        ELSE {_b_stored} * COALESCE(fx.FX_Rate, 1) END AS value_eur
+            FROM Accounts a
+            LEFT JOIN Currencies c  ON a.Currencies_Id = c.Currencies_Id
+            LEFT JOIN Latest_FX fx  ON a.Currencies_Id = fx.Currencies_Id_1
+            WHERE a.Is_Active = TRUE AND a.Accounts_Type = 'Other Investment'
+              {_acc_filt}
+
+            UNION ALL
+            -- PENSION accounts
+            -- Balance computed by update_pension_balances() from Investments (CashIn/IntInc/CashOut).
+            -- Always read the stored value; pension entries are never "future" in practice.
+            SELECT a.Accounts_Name AS name, 'Pension' AS type, c.Currencies_ShortName AS curr,
+                   {_b_stored} AS qty,
+                   CASE WHEN c.Currencies_ShortName = 'EUR' THEN {_b_stored}
+                        ELSE {_b_stored} * COALESCE(fx.FX_Rate, 1) END AS value_eur
+            FROM Accounts a
+            LEFT JOIN Currencies c  ON a.Currencies_Id = c.Currencies_Id
+            LEFT JOIN Latest_FX fx  ON a.Currencies_Id = fx.Currencies_Id_1
+            WHERE a.Is_Active = TRUE AND a.Accounts_Type = 'Pension'
+              {_acc_filt}
+
+            UNION ALL
+            -- INVESTMENTS (market value from Holdings × latest close price)
+            SELECT s.Securities_Name AS name, 'Investment' AS type,
+                   c.Currencies_ShortName AS curr,
+                   SUM(h.Quantity) AS qty,
+                   SUM(CASE WHEN c.Currencies_ShortName = 'EUR'
+                                THEN h.Quantity * COALESCE(lp.Close, 0)
+                            ELSE (h.Quantity * COALESCE(lp.Close, 0)) * COALESCE(fx.FX_Rate, 1)
+                       END) AS value_eur
+            FROM Holdings h
+            JOIN Securities s   ON s.Securities_Id  = h.Securities_Id
+            JOIN Currencies c   ON c.Currencies_Id  = s.Currencies_Id
+            JOIN Latest_Prices lp ON lp.Securities_Id = h.Securities_Id
+            LEFT JOIN Latest_FX fx ON s.Currencies_Id  = fx.Currencies_Id_1
+            WHERE h.Quantity <> 0 {_hold_filt}
+            GROUP BY s.Securities_Name, c.Currencies_ShortName
+
+            ORDER BY type ASC, value_eur DESC
+        """
+
+        df_net = pd.read_sql(query_combined, conn)
+        df_net.columns = [c.lower() for c in df_net.columns]
+        df_net['type'] = df_net['type'].str.strip()
+        df_net['qty_display'] = df_net.apply(format_qty_display, axis=1)
+
+        _future_note = (
+            "including future registered transactions"
+            if include_future else
+            "transactions up to today · future entries excluded"
+        )
+        st.caption(f"Balances: {_future_note}")
+
+        # ── Pie chart — allocation by asset class ─────────────────────────
+        _TYPE_COLORS = {
+            'Cash':       '#3498DB',
+            'Investment': '#F39C12',
+            'Assets':     '#2ECC71',
+            'Pension':    '#9B59B6',
         }
-    )
-    copy_df_button(styled_df, key="dl_dashboard_portfolio")
+
+        _df_pie = (
+            df_net[df_net['value_eur'] > 0]
+            .groupby('type')['value_eur']
+            .sum()
+            .reset_index()
+            .sort_values('value_eur', ascending=False)
+        )
+
+        if not _df_pie.empty:
+            _total_pos = _df_pie['value_eur'].sum()
+            fig_pie = px.pie(
+                _df_pie,
+                names='type',
+                values='value_eur',
+                title='<b>Net Worth Allocation by Asset Class</b>',
+                template='plotly_dark',
+                hole=0.40,
+                color='type',
+                color_discrete_map=_TYPE_COLORS,
+            )
+            fig_pie.update_traces(
+                textposition='inside',
+                textinfo='percent+label',
+                hovertemplate='<b>%{label}</b><br>€ %{value:,.2f}<br>%{percent}<extra></extra>',
+            )
+            fig_pie.update_layout(
+                margin=dict(l=0, r=0, t=50, b=10),
+                showlegend=True,
+                legend=dict(orientation='h', yanchor='bottom', y=-0.15, xanchor='center', x=0.5),
+            )
+            st.plotly_chart(fig_pie, use_container_width=True)
+
+        # ── Summary metrics ───────────────────────────────────────────────
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Net Worth",   f"€ {df_net['value_eur'].sum():,.2f}")
+        m2.metric("Assets",      f"€ {df_net[df_net['type']=='Assets']['value_eur'].sum():,.2f}")
+        m3.metric("Cash",        f"€ {df_net[df_net['type']=='Cash']['value_eur'].sum():,.2f}")
+        m4.metric("Pension",     f"€ {df_net[df_net['type']=='Pension']['value_eur'].sum():,.2f}")
+        m5.metric("Investments", f"€ {df_net[df_net['type']=='Investment']['value_eur'].sum():,.2f}")
+
+        # ── Detail table ──────────────────────────────────────────────────
+        new_order  = ['name', 'type', 'curr', 'qty', 'qty_display', 'value_eur']
+        df_net     = df_net.reindex(columns=new_order)
+        styled_df  = (
+            df_net.style
+            .map(color_negative_red, subset=['value_eur', 'qty'])
+            .apply(lambda x: style_qty_display(df_net), subset=['qty_display'], axis=0)
+            .format({"qty": "{:,.2f}", "value_eur": "{:,.2f} €"})
+            .hide(['qty'], axis=1)
+        )
+        st.dataframe(
+            styled_df,
+            width="stretch",
+            hide_index=True,
+            column_order=("name", "type", "curr", "qty_display", "value_eur"),
+            column_config={
+                "name":        "Description",
+                "type":        "Category",
+                "curr":        "Currency",
+                "qty_display": "Value / Quantity",
+                "value_eur":   "Value (€)",
+            },
+        )
+        copy_df_button(styled_df, key="dl_dashboard_portfolio")
 
     # Update buttons
     # Custom CSS to center the "Update All" button row and add spacing

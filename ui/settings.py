@@ -479,8 +479,153 @@ def render_settings():
 
         if st.button("🚀 Update Securities Information from Yahoo", key="download_sec_info", width="stretch"):
             download_securities_info_from_yahoo()
-            st.rerun
-    
+            st.rerun()
+
+        # ── Security Investment Details ───────────────────────────────────────
+        st.divider()
+        st.subheader("📊 Investment Transactions for Security")
+
+        _det_sec_keys = list(sec_options.keys())
+        if _det_sec_keys:
+            _det_sel_id = st.selectbox(
+                "Select Security:",
+                _det_sec_keys,
+                format_func=lambda x: sec_options.get(x, str(x)),
+                key="settings_sec_detail_sel",
+            )
+
+            with get_db() as _conn_det:
+                # All transactions for this security across all accounts
+                df_inv_det = pd.read_sql(
+                    """
+                    SELECT
+                        a.accounts_name                        AS "Account",
+                        i.date                                 AS "Date",
+                        i.action                               AS "Action",
+                        COALESCE(i.quantity, 0)                AS "Quantity",
+                        COALESCE(i.price_per_share, 0)         AS "Price/Share",
+                        COALESCE(i.commission, 0)              AS "Commission",
+                        COALESCE(i.total_amount, 0)            AS "Total Amount",
+                        i.description                          AS "Description"
+                    FROM Investments i
+                    JOIN Accounts  a ON a.accounts_id = i.accounts_id
+                    WHERE i.securities_id = %(sid)s
+                    ORDER BY i.date DESC, i.investments_id DESC
+                    """,
+                    _conn_det, params={"sid": _det_sel_id},
+                )
+
+                # Latest close price
+                df_price = pd.read_sql(
+                    """
+                    SELECT close AS current_price, date AS price_date
+                    FROM Historical_Prices
+                    WHERE securities_id = %(sid)s
+                    ORDER BY date DESC LIMIT 1
+                    """,
+                    _conn_det, params={"sid": _det_sel_id},
+                )
+
+                # Holdings aggregated per account
+                df_hold = pd.read_sql(
+                    """
+                    SELECT
+                        a.accounts_name AS "Account",
+                        SUM(CASE
+                            WHEN i.action IN ('Buy','ShrIn','Reinvest','Vest','Grant','Exercise')
+                                THEN COALESCE(i.quantity, 0)
+                            WHEN i.action IN ('Sell','ShrOut','Expire')
+                                THEN -COALESCE(i.quantity, 0)
+                            ELSE 0
+                        END)                                                      AS "Qty Held",
+                        SUM(CASE
+                            WHEN i.action IN ('Buy','ShrIn','Reinvest','Vest','Grant','Exercise')
+                                THEN COALESCE(i.total_amount, 0)
+                            WHEN i.action IN ('Sell','ShrOut','Expire')
+                                THEN -COALESCE(i.total_amount, 0)
+                            ELSE 0
+                        END)                                                      AS "Cost Basis"
+                    FROM Investments i
+                    JOIN Accounts a ON a.accounts_id = i.accounts_id
+                    WHERE i.securities_id = %(sid)s
+                    GROUP BY a.accounts_id, a.accounts_name
+                    ORDER BY a.accounts_name
+                    """,
+                    _conn_det, params={"sid": _det_sel_id},
+                )
+
+            # ── Summary metrics ───────────────────────────────────────────────
+            _cur_price = (
+                float(df_price["current_price"].iloc[0])
+                if not df_price.empty and df_price["current_price"].iloc[0] is not None
+                else None
+            )
+            _price_date = (
+                str(df_price["price_date"].iloc[0])
+                if not df_price.empty else "N/A"
+            )
+            _total_qty = float(df_hold["Qty Held"].sum()) if not df_hold.empty else 0.0
+            _total_cost = float(df_hold["Cost Basis"].sum()) if not df_hold.empty else 0.0
+
+            _m1, _m2, _m3, _m4 = st.columns(4)
+            with _m1:
+                st.metric("Transactions", f"{len(df_inv_det):,}")
+            with _m2:
+                st.metric("Total Qty Held", f"{_total_qty:,.4f}")
+            with _m3:
+                st.metric(
+                    f"Price ({_price_date})",
+                    f"{_cur_price:,.4f}" if _cur_price else "N/A",
+                )
+            with _m4:
+                if _cur_price and _total_qty:
+                    _cur_val   = _total_qty * _cur_price
+                    _unrealised = _cur_val - _total_cost
+                    st.metric(
+                        "Est. Current Value",
+                        f"{_cur_val:,.2f}",
+                        delta=f"{_unrealised:+,.2f} P&L",
+                    )
+                else:
+                    st.metric("Est. Current Value", "N/A")
+
+            # ── Holdings by account ───────────────────────────────────────────
+            if not df_hold.empty:
+                st.markdown("**Holdings by Account**")
+                _df_hold_disp = df_hold.copy()
+                if _cur_price:
+                    _df_hold_disp["Cur. Value"]      = _df_hold_disp["Qty Held"] * _cur_price
+                    _df_hold_disp["Unrealised P&L"]  = _df_hold_disp["Cur. Value"] - _df_hold_disp["Cost Basis"]
+                st.dataframe(
+                    _df_hold_disp,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Qty Held":         st.column_config.NumberColumn(format="%,.4f"),
+                        "Cost Basis":       st.column_config.NumberColumn(format="%,.2f"),
+                        "Cur. Value":       st.column_config.NumberColumn(format="%,.2f"),
+                        "Unrealised P&L":   st.column_config.NumberColumn(format="%,.2f"),
+                    },
+                )
+
+            # ── Full transaction list ─────────────────────────────────────────
+            st.markdown(f"**All Transactions ({len(df_inv_det):,})**")
+            if not df_inv_det.empty:
+                st.dataframe(
+                    df_inv_det,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Date":         st.column_config.DateColumn(format="DD/MM/YYYY"),
+                        "Quantity":     st.column_config.NumberColumn(format="%,.4f"),
+                        "Price/Share":  st.column_config.NumberColumn(format="%,.4f"),
+                        "Commission":   st.column_config.NumberColumn(format="%,.4f"),
+                        "Total Amount": st.column_config.NumberColumn(format="%,.2f"),
+                    },
+                )
+            else:
+                st.info("No investment transactions recorded for this security.")
+
     with t5:
         with get_db() as conn:
             df = pd.read_sql("SELECT p.*, COALESCE((SELECT COUNT(*) FROM Transactions WHERE Transactions.Payees_Id = p.Payees_Id), 0) as transactions_count FROM Payees p ORDER BY p.Payees_Name ASC", conn)

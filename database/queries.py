@@ -698,8 +698,8 @@ def get_all_securities_for_filter():
     return df
 
 
-def get_nwr_account_selection():
-    """Load saved account selection for Net Worth Report. Returns list of ints or None."""
+def get_nwr_account_selection(settings_key: str = 'nwr_account_ids'):
+    """Load saved account selection from app_settings. Returns list of ints or None."""
     conn = get_connection()
     cur = conn.cursor()
     import json
@@ -708,7 +708,7 @@ def get_nwr_account_selection():
             CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT)
         """)
         conn.commit()
-        cur.execute("SELECT value FROM app_settings WHERE key = 'nwr_account_ids'")
+        cur.execute("SELECT value FROM app_settings WHERE key = %s", (settings_key,))
         row = cur.fetchone()
         return json.loads(row[0]) if row else None
     except Exception:

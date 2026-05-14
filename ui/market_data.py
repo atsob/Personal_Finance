@@ -258,4 +258,174 @@ def render_market_data(conn):
 
             if st.button("🚀 Download Bond Prices from Solidus", key="download_solidus", width="stretch"):
                 download_bond_prices_from_solidus()
-                st.rerun
+                st.rerun()
+
+        # ── Import Prices from File ───────────────────────────────────────────
+        # When the top security selector changes, reset the import selectbox and
+        # clear the file uploader (cycling its key forces Streamlit to discard it).
+        if st.session_state.get("_import_last_inv_sec_id") != inv_sec_id:
+            st.session_state["_import_last_inv_sec_id"] = inv_sec_id
+            st.session_state["_file_upload_counter"] = (
+                st.session_state.get("_file_upload_counter", 0) + 1
+            )
+            st.session_state["import_sec_select"] = inv_sec_id
+
+        with st.expander("📂 Import Prices from File", expanded=False):
+            st.markdown(
+                "Upload a tab-separated **`.txt` / `.csv` / `.tsv`** file with historical prices. "
+                "The file may contain metadata lines above the header — the importer will find the "
+                "`Date` header row automatically."
+            )
+
+            # Target security (defaults to the currently selected one)
+            _import_sec_keys = list(sec_options.keys())
+            _import_default_idx = _import_sec_keys.index(inv_sec_id) if inv_sec_id in _import_sec_keys else 0
+            import_sec_id = st.selectbox(
+                "Target Security:",
+                _import_sec_keys,
+                format_func=lambda x: sec_options.get(x, str(x)),
+                index=_import_default_idx,
+                key="import_sec_select",
+            )
+
+            _upload_key = f"price_file_uploader_{st.session_state.get('_file_upload_counter', 0)}"
+            uploaded_file = st.file_uploader(
+                "Choose file:",
+                type=["txt", "csv", "tsv"],
+                key=_upload_key,
+            )
+
+            conflict_mode = st.radio(
+                "If a date already exists in the database:",
+                ["Skip (keep existing)", "Overwrite (replace existing)"],
+                horizontal=True,
+                key="import_conflict_mode",
+            )
+
+            if uploaded_file is not None:
+                try:
+                    import io as _io
+
+                    raw = uploaded_file.read().decode("utf-8", errors="replace")
+                    lines = raw.splitlines()
+
+                    # Find the header row — first line whose first token is "Date"
+                    header_idx = None
+                    for _i, _line in enumerate(lines):
+                        if _line.strip().lower().startswith("date"):
+                            header_idx = _i
+                            break
+
+                    if header_idx is None:
+                        st.error("❌ Could not find a 'Date' header row in the file.")
+                    else:
+                        data_text = "\n".join(lines[header_idx:])
+                        df_import = pd.read_csv(
+                            _io.StringIO(data_text),
+                            sep="\t",
+                            dayfirst=True,
+                            parse_dates=["Date"],
+                        )
+
+                        # Normalise column names to lowercase
+                        df_import.columns = df_import.columns.str.strip().str.lower()
+
+                        # Rename "price" → "close"
+                        if "price" in df_import.columns and "close" not in df_import.columns:
+                            df_import.rename(columns={"price": "close"}, inplace=True)
+
+                        # Parse close as numeric, drop zero / NaN rows
+                        df_import["close"] = pd.to_numeric(df_import["close"], errors="coerce")
+                        df_import = df_import[
+                            df_import["close"].notna() & (df_import["close"] != 0)
+                        ].copy()
+
+                        # Treat 0 as NULL for High / Low / Volume
+                        for _col in ("high", "low", "volume"):
+                            if _col in df_import.columns:
+                                df_import[_col] = pd.to_numeric(df_import[_col], errors="coerce")
+                                df_import[_col] = df_import[_col].where(df_import[_col] != 0, other=None)
+
+                        df_import["date"] = pd.to_datetime(df_import["date"]).dt.date
+
+                        # Keep only the columns we care about
+                        _keep = [c for c in ("date", "close", "high", "low", "volume") if c in df_import.columns]
+                        df_import = df_import[_keep].dropna(subset=["date", "close"]).reset_index(drop=True)
+
+                        st.write(f"**Preview** — {len(df_import):,} rows parsed (showing first 20):")
+                        st.dataframe(df_import.head(20), use_container_width=True)
+
+                        if st.button("⬆️ Import into Database", key="do_import_prices", type="primary"):
+                            from database.connection import get_connection as _get_conn
+                            _conn = _get_conn()
+                            _cur  = _conn.cursor()
+                            _inserted = 0
+                            _skipped  = 0
+                            _overwritten = 0
+
+                            _has_high   = "high"   in df_import.columns
+                            _has_low    = "low"    in df_import.columns
+                            _has_volume = "volume" in df_import.columns
+
+                            def _db_val(v):
+                                """Convert pandas NaN/NA to Python None so psycopg2 can adapt it."""
+                                try:
+                                    import math
+                                    if math.isnan(float(v)):
+                                        return None
+                                except (TypeError, ValueError):
+                                    pass
+                                return None if v is None else v
+
+                            for _, _row in df_import.iterrows():
+                                _vals = (
+                                    import_sec_id,
+                                    _row["date"],
+                                    _db_val(_row["close"]),
+                                    _db_val(_row["high"])   if _has_high   else None,
+                                    _db_val(_row["low"])    if _has_low    else None,
+                                    _db_val(_row["volume"]) if _has_volume else None,
+                                )
+
+                                if conflict_mode.startswith("Skip"):
+                                    _cur.execute(
+                                        """INSERT INTO Historical_Prices
+                                               (Securities_Id, Date, Close, High, Low, Volume)
+                                           VALUES (%s, %s, %s, %s, %s, %s)
+                                           ON CONFLICT (Securities_Id, Date) DO NOTHING""",
+                                        _vals,
+                                    )
+                                    if _cur.rowcount == 1:
+                                        _inserted += 1
+                                    else:
+                                        _skipped += 1
+                                else:
+                                    _cur.execute(
+                                        """INSERT INTO Historical_Prices
+                                               (Securities_Id, Date, Close, High, Low, Volume)
+                                           VALUES (%s, %s, %s, %s, %s, %s)
+                                           ON CONFLICT (Securities_Id, Date) DO UPDATE
+                                               SET Close  = EXCLUDED.Close,
+                                                   High   = EXCLUDED.High,
+                                                   Low    = EXCLUDED.Low,
+                                                   Volume = EXCLUDED.Volume""",
+                                        _vals,
+                                    )
+                                    _overwritten += 1
+
+                            _conn.commit()
+                            _cur.close()
+                            _conn.close()
+
+                            _parts = []
+                            if conflict_mode.startswith("Skip"):
+                                _parts.append(f"{_inserted:,} inserted")
+                                if _skipped:
+                                    _parts.append(f"{_skipped:,} skipped (already exist)")
+                            else:
+                                _parts.append(f"{_overwritten:,} rows written (inserted or overwritten)")
+                            st.success(f"✅ Import complete — {', '.join(_parts)}.")
+                            st.rerun()
+
+                except Exception as _exc:
+                    st.error(f"❌ Error parsing file: {_exc}")

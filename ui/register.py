@@ -796,6 +796,15 @@ def _render_new_investment_form(acc_id, acc_type, df_accs, df_securities, get_db
                     from database.crud import update_pension_balances
                     update_pension_balances()
 
+                # Update the linked cash account balance when a transfer was created
+                if enable_linked and linked_acc_id and inv_action in LINKED_CAPABLE:
+                    update_accounts_balances()
+
+                # Clear caches so the investment register and account list
+                # both reflect the newly saved row on the next render.
+                st.session_state.pop(f"inv_reg_{acc_id}_orig", None)
+                st.session_state.pop("df_accs", None)
+
                 st.session_state['inv_form_reset'] = rc + 1
                 st.rerun()
 
@@ -1090,21 +1099,88 @@ def render_register():
                             )
                         payee_top_cats = st.session_state[_pcat_cache_key]
 
+                # ── Total Amount — kept OUTSIDE the form so pressing Enter while
+                # editing the amount does not accidentally submit the transaction.
+                _total_key   = f"tx_total_amount_{st.session_state.reset_counter}"
+                _pending_key = f"tx_total_pending_{st.session_state.reset_counter}"
+
+                # If the calculator applied a value in the previous run, promote it
+                # to the widget key NOW — before the widget is instantiated — then clear it.
+                if _pending_key in st.session_state:
+                    st.session_state[_total_key] = st.session_state.pop(_pending_key)
+
+                st.session_state.setdefault(_total_key, 0.0)
+
+                _ta_col, _calc_col = st.columns([3, 2])
+                with _ta_col:
+                    total_amount = st.number_input(
+                        "Total Amount",
+                        format="%.2f",
+                        key=_total_key,
+                    )
+
+                with _calc_col:
+                    with st.expander("🧮 Calculator", expanded=False):
+                        st.caption(
+                            "Enter any arithmetic expression. "
+                            "Examples: `1200 / 12` · `-350 * 3` · `(450 + 30) / 6`"
+                        )
+                        _expr = st.text_input(
+                            "Expression",
+                            placeholder="e.g.  1200 / 12",
+                            label_visibility="collapsed",
+                            key=f"calc_expr_{st.session_state.reset_counter}",
+                        )
+                        _calc_result = None
+                        if _expr and _expr.strip():
+                            try:
+                                import ast as _ast
+                                _tree = _ast.parse(_expr.strip(), mode="eval")
+                                _SAFE_NODES = (
+                                    _ast.Expression, _ast.Constant,
+                                    _ast.BinOp, _ast.UnaryOp,
+                                    _ast.Add, _ast.Sub, _ast.Mult, _ast.Div,
+                                    _ast.FloorDiv, _ast.Mod, _ast.Pow,
+                                    _ast.USub, _ast.UAdd,
+                                )
+                                if all(isinstance(n, _SAFE_NODES) for n in _ast.walk(_tree)):
+                                    _calc_result = float(
+                                        eval(compile(_tree, "<calc>", "eval"))  # noqa: S307
+                                    )
+                                    st.markdown(f"**= {_calc_result:,.4f}**")
+                                else:
+                                    st.warning("Only arithmetic is supported (+  −  ×  ÷  **).")
+                            except Exception:
+                                st.warning("Invalid expression — check syntax.")
+
+                        if _calc_result is not None:
+                            if st.button(
+                                f"→ Apply {_calc_result:,.2f} to Total Amount",
+                                key=f"calc_apply_{st.session_state.reset_counter}",
+                                type="primary",
+                                use_container_width=True,
+                            ):
+                                # Write to the PENDING key, not the widget key.
+                                # On the next run the pending value is promoted
+                                # before the widget renders (see above).
+                                st.session_state[_pending_key] = round(_calc_result, 2)
+                                st.rerun()
+
+                if total_amount > 0:
+                    st.success("Income transaction")
+                elif total_amount < 0:
+                    st.error("Expense transaction")
+                else:
+                    st.info("Enter a non-zero amount above to save.")
+
+                # ── Form starts here — no amount input inside, so Enter never submits ──
                 with st.form("tx_form_with_splits"):
                     c1, c2 = st.columns(2)
                     date = c1.date_input("Date", datetime.now().date(), key=f"tx_date_{st.session_state.reset_counter}", format="DD/MM/YYYY")
                     # Show the resolved payee name as read-only info inside the form
                     c2.text_input("Payee (selected above)", value=payee_name or "", disabled=True)
 
-                    total_amount = st.number_input("Total Amount", value=0.0, format="%.2f", key=f"tx_total_amount_{st.session_state.reset_counter}")
                     desc = st.text_input("Description", key=f"tx_description_{st.session_state.reset_counter}")
-
-                    if total_amount > 0:
-                        st.success("Income transaction")
-                    elif total_amount < 0:
-                        st.error("Expense transaction")
-                    else:
-                        st.info("Zero amount transaction. Enter a non-zero amount to save.")
 
                     st.write("---")
                     transaction_category = None
@@ -1212,7 +1288,7 @@ def render_register():
                     
                     if st.form_submit_button("🔥 Save Transaction & Splits"):
                         try:
-                            val_total_amount = float(total_amount)
+                            val_total_amount = float(st.session_state.get(_total_key, 0.0))
                             if val_total_amount == 0:
                                 st.error("The total amount must be non-zero.")
                             elif transaction_mode == "Single Category" and not transaction_category:
