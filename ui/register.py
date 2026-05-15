@@ -612,70 +612,70 @@ def _render_new_investment_form(acc_id, acc_type, df_accs, df_securities, get_db
                     _cur_fx = _conn_fx.cursor()
                     fx_rate = get_latest_fx_rate(_cur_fx, acc_currencies_id, linked_acc_curr)
 
-    with st.form(f"new_inv_tx_{rc}"):
-        col1, col2 = st.columns(2)
+    # ── Input widgets — outside st.form so Enter key never triggers a save ───
+    col1, col2 = st.columns(2)
 
-        with col1:
-            inv_date = st.date_input("Date", value=date.today(), key=f"inv_date_{rc}")
+    with col1:
+        inv_date = st.date_input("Date", value=date.today(), key=f"inv_date_{rc}")
 
-            inv_action = st.selectbox(
-                "Action", ALL_ACTIONS,
-                key=f"inv_action_{rc}",
-                help="Choose the investment action type."
-            )
+        inv_action = st.selectbox(
+            "Action", ALL_ACTIONS,
+            key=f"inv_action_{rc}",
+            help="Choose the investment action type."
+        )
 
-            sec_ids = [None] + list(sec_options.keys())
-            inv_security = st.selectbox(
-                "Security",
-                options=sec_ids,
-                format_func=lambda x: sec_options.get(x, "— none —"),
-                key=f"inv_sec_{rc}",
-                help="Only securities in the account currency are shown.",
-            )
+        sec_ids = [None] + list(sec_options.keys())
+        inv_security = st.selectbox(
+            "Security",
+            options=sec_ids,
+            format_func=lambda x: sec_options.get(x, "— none —"),
+            key=f"inv_sec_{rc}",
+            help="Only securities in the account currency are shown.",
+        )
 
-        with col2:
-            inv_qty = st.number_input(
-                "Quantity", min_value=0.0, value=0.0, step=0.0001, format="%.8f",
-                key=f"inv_qty_{rc}",
-            )
-            inv_price = st.number_input(
-                "Price Per Share", min_value=0.0, value=0.0, step=0.0001, format="%.4f",
-                key=f"inv_price_{rc}",
-            )
-            inv_comm = st.number_input(
-                "Commission", min_value=0.0, value=0.0, step=0.01, format="%.4f",
-                key=f"inv_comm_{rc}",
-            )
-            inv_total_override = st.number_input(
-                "Total Amount (leave 0 to auto-calculate)",
-                value=0.0, step=0.01, format="%.4f",
-                key=f"inv_total_{rc}",
-                help="Buy = qty×price + commission | Sell = qty×price − commission | others = qty×price",
-            )
-            inv_memo = st.text_input("Memo / Description", key=f"inv_memo_{rc}")
+    with col2:
+        inv_qty = st.number_input(
+            "Quantity", min_value=0.0, value=0.0, step=0.0001, format="%.8f",
+            key=f"inv_qty_{rc}",
+        )
+        inv_price = st.number_input(
+            "Price Per Share", min_value=0.0, value=0.0, step=0.0001, format="%.4f",
+            key=f"inv_price_{rc}",
+        )
+        inv_comm = st.number_input(
+            "Commission", min_value=0.0, value=0.0, step=0.01, format="%.4f",
+            key=f"inv_comm_{rc}",
+        )
+        inv_total_override = st.number_input(
+            "Total Amount (leave 0 to auto-calculate)",
+            value=0.0, step=0.01, format="%.4f",
+            key=f"inv_total_{rc}",
+            help="Buy = qty×price + commission | Sell = qty×price − commission | others = qty×price",
+        )
+        inv_memo = st.text_input("Memo / Description", key=f"inv_memo_{rc}")
 
-        # ── Linked account cross-currency target amount ────────────────────────
-        linked_target_amount = None
-        if enable_linked and linked_acc_id and linked_acc_curr and linked_acc_curr != acc_currencies_id:
-            st.divider()
-            st.caption(
-                f"Linked account is in a different currency. "
-                f"Target amount pre-calculated using FX rate **{fx_rate:.6f}** (editable)."
-            )
-            linked_target_amount = st.number_input(
-                "Target Amount in Linked Account Currency",
-                value=0.0,
-                step=0.01, format="%.4f",
-                key=f"inv_linked_target_{rc}",
-                help="Auto-filled after you set the total amount; override if needed.",
-            )
-        elif enable_linked and linked_acc_id:
-            st.caption("Linked account uses the same currency — no conversion needed.")
+    # ── Linked account cross-currency target amount ────────────────────────
+    linked_target_amount = None
+    if enable_linked and linked_acc_id and linked_acc_curr and linked_acc_curr != acc_currencies_id:
+        st.divider()
+        st.caption(
+            f"Linked account is in a different currency. "
+            f"Target amount pre-calculated using FX rate **{fx_rate:.6f}** (editable)."
+        )
+        linked_target_amount = st.number_input(
+            "Target Amount in Linked Account Currency",
+            value=0.0,
+            step=0.01, format="%.4f",
+            key=f"inv_linked_target_{rc}",
+            help="Auto-filled after you set the total amount; override if needed.",
+        )
+    elif enable_linked and linked_acc_id:
+        st.caption("Linked account uses the same currency — no conversion needed.")
 
-        if enable_linked and linked_acc_id and inv_action not in LINKED_CAPABLE:
-            st.warning(f"**{inv_action}** does not support a linked cash transfer.")
+    if enable_linked and linked_acc_id and inv_action not in LINKED_CAPABLE:
+        st.warning(f"**{inv_action}** does not support a linked cash transfer.")
 
-        submitted = st.form_submit_button("💾 Save Investment Transaction")
+    submitted = st.button("💾 Save Investment Transaction", key=f"inv_submit_{rc}")
 
     # ── Validation & save ──────────────────────────────────────────────────────
     if submitted:
@@ -1046,6 +1046,8 @@ def render_register():
                     key=f"tx_transaction_mode_{st.session_state.reset_counter}"
                 )
 
+                date = st.date_input("Date", datetime.now().date(), key=f"tx_date_{st.session_state.reset_counter}", format="DD/MM/YYYY")
+
                 # ── Payee selector OUTSIDE the form so selecting a payee
                 # triggers an immediate rerun and the category list rebuilds.
                 _payee_sk = f"tx_payee_select_{st.session_state.reset_counter}"
@@ -1173,13 +1175,8 @@ def render_register():
                 else:
                     st.info("Enter a non-zero amount above to save.")
 
-                # ── Form starts here — no amount input inside, so Enter never submits ──
-                with st.form("tx_form_with_splits"):
-                    c1, c2 = st.columns(2)
-                    date = c1.date_input("Date", datetime.now().date(), key=f"tx_date_{st.session_state.reset_counter}", format="DD/MM/YYYY")
-                    # Show the resolved payee name as read-only info inside the form
-                    c2.text_input("Payee (selected above)", value=payee_name or "", disabled=True)
-
+                # ── Container (not st.form) so Enter key never triggers a save ──────
+                with st.container():
                     desc = st.text_input("Description", key=f"tx_description_{st.session_state.reset_counter}")
 
                     st.write("---")
@@ -1286,7 +1283,7 @@ def render_register():
                         recurrence_installments = None
                         recurrence_end_date = None
                     
-                    if st.form_submit_button("🔥 Save Transaction & Splits"):
+                    if st.button("🔥 Save Transaction & Splits", key=f"tx_submit_{st.session_state.reset_counter}"):
                         try:
                             val_total_amount = float(st.session_state.get(_total_key, 0.0))
                             if val_total_amount == 0:
@@ -1386,7 +1383,7 @@ def render_register():
 
                 recurring_transfer = st.checkbox("Recurring transfer", key=f"transfer_recurring_{st.session_state.reset_counter}")
 
-                with st.form("tx_form_transfer"):
+                with st.container():  # not st.form — Enter key must not trigger save
                     date = st.date_input("Date", datetime.now().date(), key=f"transfer_date_{st.session_state.reset_counter}", format="DD/MM/YYYY")
                     
                     direction = st.radio(
@@ -1488,7 +1485,7 @@ def render_register():
                         transfer_installments = None
                         transfer_end_date = None
 
-                    if st.form_submit_button("🔥 Save Transfer"):
+                    if st.button("🔥 Save Transfer", key=f"transfer_submit_{st.session_state.reset_counter}"):
                         try:
                             if t_amount <= 0:
                                 st.error("Transfer amount must be greater than zero.")
