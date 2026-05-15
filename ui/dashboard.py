@@ -267,7 +267,7 @@ def render_dashboard(conn):
                 showlegend=True,
                 legend=dict(orientation='h', yanchor='bottom', y=-0.15, xanchor='center', x=0.5),
             )
-            st.plotly_chart(fig_pie, use_container_width=True)
+            st.plotly_chart(fig_pie, width="stretch")
 
         # ── Summary metrics ───────────────────────────────────────────────
         m1, m2, m3, m4, m5 = st.columns(5)

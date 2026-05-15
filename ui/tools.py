@@ -6,8 +6,6 @@ from data.transfer_issues import render_transfer_issues
 from data.capitalcom_importer import render_capitalcom_importer
 from data.fxpro_importer import render_fxpro_importer
 from database.backup import render_backup_restore
-from database.backup import render_backup_restore_simple
-from database.backup import render_backup_restore_quick
 from database.connection import get_connection
 from database.queries import get_price_anomalies, get_missing_tx_prices, get_investments_with_dummy_prices
 from database.crud import delete_historical_prices, insert_prices_from_transactions, normalize_investment_prices
@@ -25,6 +23,311 @@ _DML_PATTERN = re.compile(
     r"^\s*(INSERT|UPDATE|DELETE)\b",
     re.IGNORECASE,
 )
+
+
+def _run_maintenance(sql: str, label: str):
+    """Execute a maintenance command (VACUUM / REINDEX / ANALYZE) with autocommit."""
+    conn = get_connection()
+    try:
+        conn.autocommit = True          # required — these cannot run inside a transaction
+        with conn.cursor() as cur:
+            cur.execute(sql)
+        st.success(f"✅ {label} completed successfully.")
+    except Exception as e:
+        st.error(f"❌ {label} failed: {e}")
+    finally:
+        conn.close()
+
+
+def _render_db_maintenance():
+    st.subheader("🔧 Database Maintenance")
+    st.caption(
+        "VACUUM reclaims storage from dead tuples. "
+        "ANALYZE updates planner statistics. "
+        "REINDEX rebuilds indexes to remove bloat. "
+        "All operations run with autocommit — no transaction wrapper needed."
+    )
+
+    # ── Table health overview ──────────────────────────────────────────────────
+    st.markdown("#### 📊 Table Health")
+    conn = get_connection()
+    df_health = pd.read_sql("""
+        SELECT
+            relname                                         AS table_name,
+            pg_size_pretty(pg_total_relation_size(relid))  AS total_size,
+            pg_size_pretty(pg_relation_size(relid))        AS table_size,
+            pg_size_pretty(pg_total_relation_size(relid)
+                         - pg_relation_size(relid))        AS index_size,
+            n_live_tup                                     AS live_rows,
+            n_dead_tup                                     AS dead_rows,
+            CASE WHEN n_live_tup > 0
+                 THEN ROUND(n_dead_tup::numeric / n_live_tup * 100, 1)
+                 ELSE 0 END                                AS dead_pct,
+            last_vacuum,
+            last_autovacuum,
+            last_analyze,
+            last_autoanalyze
+        FROM pg_stat_user_tables
+        ORDER BY n_dead_tup DESC, pg_total_relation_size(relid) DESC
+    """, conn)
+    conn.close()
+
+    if not df_health.empty:
+        for col in ['last_vacuum', 'last_autovacuum', 'last_analyze', 'last_autoanalyze']:
+            df_health[col] = pd.to_datetime(df_health[col]).dt.strftime('%Y-%m-%d %H:%M').fillna('—')
+
+        bloat_tables = df_health[df_health['dead_pct'] > 10]
+        if not bloat_tables.empty:
+            st.warning(
+                f"⚠️ {len(bloat_tables)} table(s) have >10 % dead rows — consider running VACUUM ANALYZE."
+            )
+
+        st.dataframe(
+            df_health,
+            hide_index=True,
+            width='stretch',
+            column_config={
+                'table_name':      st.column_config.TextColumn('Table'),
+                'total_size':      'Total Size',
+                'table_size':      'Table Size',
+                'index_size':      'Index Size',
+                'live_rows':       st.column_config.NumberColumn('Live Rows',  format='%,d'),
+                'dead_rows':       st.column_config.NumberColumn('Dead Rows',  format='%,d'),
+                'dead_pct':        st.column_config.NumberColumn('Dead %',     format='%.1f%%'),
+                'last_vacuum':     'Last Vacuum',
+                'last_autovacuum': 'Last Auto-Vacuum',
+                'last_analyze':    'Last Analyze',
+                'last_autoanalyze':'Last Auto-Analyze',
+            },
+        )
+        copy_df_button(df_health, key="dl_tools_health")
+
+    # ── Index health ───────────────────────────────────────────────────────────
+    with st.expander("🗂 Index Usage"):
+        conn = get_connection()
+        df_idx = pd.read_sql("""
+            SELECT
+                relname                                         AS table_name,
+                indexrelname                                    AS index_name,
+                pg_size_pretty(pg_relation_size(indexrelid))   AS index_size,
+                idx_scan                                        AS scans,
+                idx_tup_read                                    AS tuples_read,
+                idx_tup_fetch                                   AS tuples_fetched
+            FROM pg_stat_user_indexes
+            ORDER BY idx_scan ASC, pg_relation_size(indexrelid) DESC
+        """, conn)
+        conn.close()
+        st.caption("Indexes sorted by scan count ascending — low-scan large indexes may be candidates for review.")
+        st.dataframe(
+            df_idx, hide_index=True, width='stretch',
+            column_config={
+                'table_name':     'Table',
+                'index_name':     'Index',
+                'index_size':     'Size',
+                'scans':          st.column_config.NumberColumn('Scans',           format='%,d'),
+                'tuples_read':    st.column_config.NumberColumn('Tuples Read',     format='%,d'),
+                'tuples_fetched': st.column_config.NumberColumn('Tuples Fetched',  format='%,d'),
+            },
+        )
+
+    st.divider()
+
+    # ── Database-wide operations ───────────────────────────────────────────────
+    st.markdown("#### ⚡ Database-Wide Operations")
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.markdown("**ANALYZE**")
+        st.caption("Updates planner statistics for all tables. Fast, safe, no locking.")
+        if st.button("▶ Run ANALYZE", key="maint_analyze", width='stretch'):
+            _run_maintenance("ANALYZE;", "ANALYZE")
+            st.rerun()
+
+    with col2:
+        st.markdown("**VACUUM ANALYZE**")
+        st.caption("Reclaims dead rows and updates statistics. Safe to run on a live database.")
+        if st.button("▶ Run VACUUM ANALYZE", key="maint_vacuum_analyze", width='stretch'):
+            _run_maintenance("VACUUM ANALYZE;", "VACUUM ANALYZE")
+            st.rerun()
+
+    with col3:
+        st.markdown("**REINDEX DATABASE**")
+        st.caption("Rebuilds all indexes. May take minutes on large databases.")
+        if st.button("▶ Run REINDEX DATABASE", key="maint_reindex_db", width='stretch'):
+            from config.settings import ENV_CONFIG
+            _run_maintenance(
+                f'REINDEX DATABASE "{ENV_CONFIG["db_name"]}";',
+                "REINDEX DATABASE"
+            )
+            st.rerun()
+
+    st.divider()
+
+    # ── Per-table operations ───────────────────────────────────────────────────
+    st.markdown("#### 🎯 Per-Table Operations")
+
+    if not df_health.empty:
+        table_names = df_health['table_name'].tolist()
+        sel_col, op_col, run_col = st.columns([3, 2, 1])
+
+        with sel_col:
+            sel_table = st.selectbox(
+                "Table", table_names, key="maint_table_sel",
+                label_visibility="collapsed",
+            )
+        with op_col:
+            sel_op = st.selectbox(
+                "Operation",
+                ["VACUUM ANALYZE", "VACUUM", "ANALYZE", "REINDEX TABLE", "VACUUM FULL"],
+                key="maint_op_sel",
+                label_visibility="collapsed",
+            )
+        with run_col:
+            run_btn = st.button("▶ Run", key="maint_run_table", type="primary", width='stretch')
+
+        if sel_op == "VACUUM FULL":
+            st.warning(
+                "⚠️ **VACUUM FULL** rewrites the entire table and holds an exclusive lock "
+                "for the duration — no reads or writes are possible during this time. "
+                "Only use it when dead-row bloat is severe and downtime is acceptable."
+            )
+
+        if run_btn:
+            if sel_op == "REINDEX TABLE":
+                sql = f'REINDEX TABLE "{sel_table}";'
+            else:
+                sql = f'{sel_op} "{sel_table}";'
+            _run_maintenance(sql, f"{sel_op} on {sel_table}")
+            st.rerun()
+    else:
+        st.info("No table statistics available.")
+
+    st.divider()
+
+    # ── Referential integrity check ────────────────────────────────────────────
+    st.markdown("#### 🔗 Referential Integrity Check")
+    st.caption(
+        "Scans every foreign-key constraint in the public schema and counts orphaned rows "
+        "(child rows whose referenced parent row no longer exists)."
+    )
+
+    ri_col, _ = st.columns([1, 4])
+    with ri_col:
+        run_ri = st.button("🔍 Run Integrity Check", key="maint_ri_check", width='stretch')
+
+    if run_ri:
+        conn = get_connection()
+        try:
+            # Discover all FK constraints (single-column FKs — covers all standard cases)
+            df_fks = pd.read_sql("""
+                SELECT
+                    tc.constraint_name,
+                    tc.table_name        AS child_table,
+                    kcu.column_name      AS child_col,
+                    ccu.table_name       AS parent_table,
+                    ccu.column_name      AS parent_col
+                FROM information_schema.table_constraints        tc
+                JOIN information_schema.key_column_usage         kcu
+                    ON  kcu.constraint_name = tc.constraint_name
+                    AND kcu.table_schema    = tc.table_schema
+                JOIN information_schema.constraint_column_usage  ccu
+                    ON  ccu.constraint_name = tc.constraint_name
+                    AND ccu.table_schema    = tc.table_schema
+                WHERE tc.constraint_type = 'FOREIGN KEY'
+                  AND tc.table_schema    = 'public'
+                ORDER BY tc.table_name, tc.constraint_name
+            """, conn)
+
+            results = []
+            cur = conn.cursor()
+            for _, fk in df_fks.iterrows():
+                child_t  = fk['child_table']
+                child_c  = fk['child_col']
+                parent_t = fk['parent_table']
+                parent_c = fk['parent_col']
+                try:
+                    cur.execute(f"""
+                        SELECT COUNT(*) FROM "{child_t}" c
+                        WHERE c."{child_c}" IS NOT NULL
+                          AND NOT EXISTS (
+                              SELECT 1 FROM "{parent_t}" p
+                              WHERE p."{parent_c}" = c."{child_c}"
+                          )
+                    """)
+                    orphan_count = cur.fetchone()[0]
+                except Exception as e:
+                    orphan_count = f"error: {e}"
+
+                results.append({
+                    'constraint':   fk['constraint_name'],
+                    'child_table':  child_t,
+                    'child_col':    child_c,
+                    'parent_table': parent_t,
+                    'parent_col':   parent_c,
+                    'orphaned_rows': orphan_count,
+                })
+            cur.close()
+        finally:
+            conn.close()
+
+        df_ri = pd.DataFrame(results)
+
+        # Separate issues from clean constraints
+        df_issues = df_ri[df_ri['orphaned_rows'].apply(
+            lambda x: isinstance(x, int) and x > 0
+        )]
+        df_errors = df_ri[df_ri['orphaned_rows'].apply(
+            lambda x: isinstance(x, str)
+        )]
+        df_clean  = df_ri[df_ri['orphaned_rows'].apply(
+            lambda x: isinstance(x, int) and x == 0
+        )]
+
+        if df_issues.empty and df_errors.empty:
+            st.success(
+                f"✅ All {len(df_clean)} foreign-key constraints are satisfied — no orphaned rows found."
+            )
+        else:
+            if not df_issues.empty:
+                st.error(
+                    f"❌ {len(df_issues)} constraint(s) have orphaned rows:"
+                )
+                st.dataframe(
+                    df_issues,
+                    hide_index=True,
+                    width='stretch',
+                    column_config={
+                        'constraint':    'Constraint',
+                        'child_table':   'Child Table',
+                        'child_col':     'Child Column',
+                        'parent_table':  'Parent Table',
+                        'parent_col':    'Parent Column',
+                        'orphaned_rows': st.column_config.NumberColumn(
+                            'Orphaned Rows', format='%,d'
+                        ),
+                    },
+                )
+                copy_df_button(df_issues, key="dl_tools_ri_issues")
+
+            if not df_errors.empty:
+                st.warning(f"⚠️ {len(df_errors)} constraint(s) could not be checked (see below):")
+                st.dataframe(df_errors, hide_index=True, width='stretch')
+
+        if not df_clean.empty:
+            with st.expander(f"✅ {len(df_clean)} clean constraint(s)"):
+                st.dataframe(
+                    df_clean,
+                    hide_index=True,
+                    width='stretch',
+                    column_config={
+                        'constraint':    'Constraint',
+                        'child_table':   'Child Table',
+                        'child_col':     'Child Column',
+                        'parent_table':  'Parent Table',
+                        'parent_col':    'Parent Column',
+                        'orphaned_rows': 'Orphaned Rows',
+                    },
+                )
 
 
 def _render_sql_interface():
@@ -243,7 +546,7 @@ def _render_fill_missing_prices():
 
     col_refresh, col_spacer = st.columns([1, 5])
     with col_refresh:
-        if st.button("🔄 Refresh", key="fmp_refresh", use_container_width=True):
+        if st.button("🔄 Refresh", key="fmp_refresh", width="stretch"):
             get_missing_tx_prices.clear()
             st.rerun()
 
@@ -284,7 +587,7 @@ def _render_fill_missing_prices():
             'tx_count':       st.column_config.NumberColumn('Tx Count', format='%d'),
         },
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
     )
     copy_df_button(df_display, key="dl_tools_missing_prices")
 
@@ -294,7 +597,7 @@ def _render_fill_missing_prices():
         if st.button(
             f"📥 Insert for filtered ({len(df_view):,})" if selected_secs else "📥 Insert all",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             key="fmp_insert_btn",
         ):
             rows = df_view[['securities_id', 'date', 'price']].to_dict('records')
@@ -308,7 +611,7 @@ def _render_fill_missing_prices():
         if selected_secs and st.button(
             f"📥 Insert all ({len(df):,})",
             type="secondary",
-            use_container_width=True,
+            width="stretch",
             key="fmp_insert_all_btn",
         ):
             rows = df[['securities_id', 'date', 'price']].to_dict('records')
@@ -335,7 +638,7 @@ def _render_normalize_investments():
 
     col_refresh, _ = st.columns([1, 5])
     with col_refresh:
-        if st.button("🔄 Refresh", key="ni_refresh", use_container_width=True):
+        if st.button("🔄 Refresh", key="ni_refresh", width="stretch"):
             get_investments_with_dummy_prices.clear()
             st.rerun()
 
@@ -421,7 +724,7 @@ def _render_normalize_investments():
                                    help='Buys: hist close  •  Sells: effective realised price (total/qty)'),
         },
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
     )
     copy_df_button(df_display, key="dl_tools_norm_prices")
     st.caption(
@@ -436,7 +739,7 @@ def _render_normalize_investments():
         label = (
             f"⚖ Normalize filtered ({len(df_view):,})" if is_filtered else "⚖ Normalize all"
         )
-        if st.button(label, type="primary", use_container_width=True, key="ni_norm_btn"):
+        if st.button(label, type="primary", width="stretch", key="ni_norm_btn"):
             ids = df_view['investments_id'].tolist()
             updated = normalize_investment_prices(ids)
             get_investments_with_dummy_prices.clear()
@@ -447,7 +750,7 @@ def _render_normalize_investments():
         if is_filtered and st.button(
             f"⚖ Normalize all ({len(df):,})",
             type="secondary",
-            use_container_width=True,
+            width="stretch",
             key="ni_norm_all_btn",
         ):
             ids = df['investments_id'].tolist()
@@ -465,7 +768,7 @@ def _render_normalize_investments():
     st.divider()
     col_rh, col_rh_info = st.columns([1, 4])
     with col_rh:
-        if st.button("🔄 Refresh Holdings", use_container_width=True, key="ni_refresh_holdings"):
+        if st.button("🔄 Refresh Holdings", width="stretch", key="ni_refresh_holdings"):
             _update_holdings()
             st.success("Holdings recalculated.")
     with col_rh_info:
@@ -481,8 +784,7 @@ _CATEGORIES = {
     ],
     "💾 Database": [
         "💾 Backup & Restore",
-        "💾 Backup & Restore Simple",
-        "💾 Quick Backup & Restore",
+        "🔧 DB Maintenance",        
         "🛢 SQL Interface",
     ],
     "📊 Market Data & Prices": [
@@ -498,9 +800,8 @@ _TOOL_RENDERERS = {
     "📈 Capital.com Importer":   render_capitalcom_importer,
     "📈 FxPro Importer":         render_fxpro_importer,
     "💾 Backup & Restore":       render_backup_restore,
-    "💾 Backup & Restore Simple": render_backup_restore_simple,
-    "💾 Quick Backup & Restore": render_backup_restore_quick,
     "🛢 SQL Interface":          _render_sql_interface,
+    "🔧 DB Maintenance":         _render_db_maintenance,
     "🔍 Price Quality":          _render_price_quality,
     "📥 Fill Missing Prices":    _render_fill_missing_prices,
     "⚖ Normalize Investments":  _render_normalize_investments,
@@ -509,7 +810,7 @@ _TOOL_RENDERERS = {
 
 def render_tools(conn):
     """Render the Tools page. Only the selected tool is rendered to keep it fast."""
-    st.title("System Tools")
+    st.title("Tools")
 
     category = st.radio(
         "category",
@@ -521,12 +822,19 @@ def render_tools(conn):
     st.divider()
 
     tools_in_category = _CATEGORIES[category]
-    tool = st.selectbox(
-        "Tool",
-        tools_in_category,
-        label_visibility="collapsed",
-        key="tools_tool",
-    )
-    st.divider()
 
-    _TOOL_RENDERERS[tool]()
+    # Categories with few tools get tabs; larger categories use a selectbox.
+    if len(tools_in_category) <= 3:
+        tabs = st.tabs(tools_in_category)
+        for tab, tool in zip(tabs, tools_in_category):
+            with tab:
+                _TOOL_RENDERERS[tool]()
+    else:
+        tool = st.selectbox(
+            "Tool",
+            tools_in_category,
+            label_visibility="collapsed",
+            key="tools_tool",
+        )
+        st.divider()
+        _TOOL_RENDERERS[tool]()

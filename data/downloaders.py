@@ -17,20 +17,39 @@ from psycopg2.extras import execute_batch
 
 
 
-def download_historical_fx(tsperiod=None):
-    """Download historical FX rates from Yahoo Finance."""
+def download_historical_fx(tsperiod=None, currencies_id=None):
+    """Download historical FX rates from Yahoo Finance.
+
+    Parameters
+    ----------
+    tsperiod : str, optional
+        Yahoo Finance period string (e.g. "1mo", "1y"). Defaults to "1m".
+    currencies_id : int, optional
+        When provided, only download rates for this single Currencies_Id.
+        When omitted (None), download rates for every non-EUR currency.
+    """
     conn = get_connection()
     cur = conn.cursor()
     custom_session = get_custom_session()
-    
+
     if not tsperiod:
         tsperiod="1m"
-        
+
     try:
         cur.execute("SELECT Currencies_Id FROM Currencies WHERE Currencies_ShortName = 'EUR'")
         target_id = cur.fetchone()[0]
-        
-        cur.execute("SELECT Currencies_Id, Currencies_ShortName FROM Currencies WHERE Currencies_ShortName != 'EUR'")
+
+        if currencies_id is not None:
+            cur.execute(
+                "SELECT Currencies_Id, Currencies_ShortName FROM Currencies "
+                "WHERE Currencies_Id = %s AND Currencies_ShortName != 'EUR'",
+                (int(currencies_id),),
+            )
+        else:
+            cur.execute(
+                "SELECT Currencies_Id, Currencies_ShortName FROM Currencies "
+                "WHERE Currencies_ShortName != 'EUR'"
+            )
         currencies = cur.fetchall()
         
         for base_id, symbol in currencies:

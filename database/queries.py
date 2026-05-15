@@ -1785,14 +1785,17 @@ def get_income_expense_data(start_date, end_date, category_id=None, cash_account
 # ======================================================
 
 @st.cache_data(ttl=300)
-def get_cash_flow_forecast():
+def get_cash_flow_forecast(months_back: int = 3):
     """
     Returns two DataFrames:
-      - df_future: explicitly scheduled future transactions (Date > today)
-      - df_recurring: detected recurring payees with projected next amount & date
+      - df_future   : explicitly scheduled future transactions (Date > today)
+      - df_recurring: payees present in EVERY one of the last `months_back`
+                      complete calendar months, with average amount and interval.
     All amounts in EUR.
+    `months_back` is treated as a trusted integer (sidebar slider, range 2-6).
     """
     conn = get_connection()
+    mb   = int(months_back)   # guard against accidental float
 
     # 1. Explicitly entered future transactions
     df_future = pd.read_sql("""
@@ -1817,61 +1820,66 @@ def get_cash_flow_forecast():
         LEFT JOIN Categories cat ON s.Categories_Id = cat.Categories_Id
         LEFT JOIN LatestFX fx ON fx.Currencies_Id_1 = c.Currencies_Id
         WHERE t.Date > CURRENT_DATE
+          AND t.Transfers_Id IS NULL       -- exclude internal transfers
         ORDER BY t.Date ASC
     """, conn)
 
-    # 2. Recurring pattern detection: payees with >= 2 transactions in last 90 days
-    df_recurring = pd.read_sql("""
-        WITH recent AS (
-            -- Payee-based: transactions with a known payee
+    # 2. Recurring detection — payees present in ALL last mb complete months.
+    #    One row per (payee, transaction_date) aggregating all splits so that
+    #    the LAG-based interval reflects actual payment cadence.
+    df_recurring = pd.read_sql(f"""
+        WITH
+        -- All payee transactions within the last mb complete calendar months
+        recent AS (
             SELECT
-                'p_' || t.Payees_Id::text  AS group_key,
-                p.Payees_Name              AS group_label,
+                t.Payees_Id,
+                p.Payees_Name,
+                DATE_TRUNC('month', t.Date)::date   AS month_start,
                 t.Date,
-                SUM(s.Amount)              AS amount,
+                SUM(s.Amount)                        AS amount,
                 a.Currencies_Id
             FROM Transactions t
-            JOIN Accounts a   ON t.Accounts_Id   = a.Accounts_Id
-            LEFT JOIN Payees p ON t.Payees_Id    = p.Payees_Id
-            LEFT JOIN Splits s ON t.Transactions_Id = s.Transactions_Id
-            WHERE t.Date >= CURRENT_DATE - INTERVAL '120 days'
+            JOIN  Accounts a  ON a.Accounts_Id  = t.Accounts_Id
+            LEFT JOIN Payees p ON p.Payees_Id   = t.Payees_Id
+            LEFT JOIN Splits s ON s.Transactions_Id = t.Transactions_Id
+            WHERE t.Date >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '{mb} months'
+              AND t.Date <  DATE_TRUNC('month', CURRENT_DATE)   -- exclude partial current month
               AND t.Payees_Id IS NOT NULL
-            GROUP BY t.Payees_Id, p.Payees_Name, t.Date, a.Currencies_Id
-            UNION ALL
-            -- Category-based: transactions without a payee, grouped by category
-            SELECT
-                'c_' || MIN(s2.Categories_Id)::text  AS group_key,
-                MIN(cat.Categories_Name)             AS group_label,
-                t.Date,
-                SUM(s2.Amount)                       AS amount,
-                a.Currencies_Id
-            FROM Transactions t
-            JOIN Accounts a   ON t.Accounts_Id      = a.Accounts_Id
-            LEFT JOIN Splits s2  ON t.Transactions_Id = s2.Transactions_Id
-            LEFT JOIN Categories cat ON s2.Categories_Id = cat.Categories_Id
-            WHERE t.Date >= CURRENT_DATE - INTERVAL '120 days'
-              AND t.Payees_Id IS NULL
-              AND s2.Categories_Id IS NOT NULL
-            GROUP BY t.Transactions_Id, t.Date, a.Currencies_Id
+              AND t.Transfers_Id IS NULL                        -- exclude internal transfers
+            GROUP BY t.Payees_Id, p.Payees_Name, t.Date,
+                     DATE_TRUNC('month', t.Date)::date, a.Currencies_Id
         ),
+        -- Keep only payees that appear in EVERY one of the mb months
+        qualified AS (
+            SELECT Payees_Id, Currencies_Id
+            FROM   recent
+            GROUP  BY Payees_Id, Currencies_Id
+            HAVING COUNT(DISTINCT month_start) = {mb}
+        ),
+        -- Add inter-transaction lag for avg-interval calculation
         with_lag AS (
-            SELECT *,
-                (Date - LAG(Date) OVER (PARTITION BY group_key ORDER BY Date))::float AS days_since_prev
-            FROM recent
+            SELECT r.*,
+                   (r.Date - LAG(r.Date) OVER (
+                       PARTITION BY r.Payees_Id, r.Currencies_Id
+                       ORDER BY r.Date
+                   ))::float AS days_since_prev
+            FROM   recent r
+            JOIN   qualified q
+                   ON  q.Payees_Id     = r.Payees_Id
+                   AND q.Currencies_Id = r.Currencies_Id
         ),
         stats AS (
             SELECT
-                group_key,
-                group_label                         AS Payees_Name,
-                COUNT(*)                            AS tx_count,
-                AVG(amount)                         AS avg_amount,
-                STDDEV(amount)                      AS std_amount,
-                AVG(days_since_prev)                AS avg_days_between,
-                MAX(Date)                           AS last_date,
+                Payees_Id,
+                Payees_Name,
+                COUNT(*)                                    AS tx_count,
+                AVG(amount)                                 AS avg_amount,
+                STDDEV(amount)                              AS std_amount,
+                COALESCE(AVG(days_since_prev), 30)          AS avg_days_between,
+                MAX(Date)                                   AS last_date,
                 Currencies_Id
-            FROM with_lag
-            GROUP BY group_key, group_label, Currencies_Id
-            HAVING COUNT(*) >= 2
+            FROM   with_lag
+            GROUP  BY Payees_Id, Payees_Name, Currencies_Id
         ),
         fx AS (
             SELECT DISTINCT ON (Currencies_Id_1) Currencies_Id_1, FX_Rate
@@ -1880,24 +1888,24 @@ def get_cash_flow_forecast():
         SELECT
             s.Payees_Name,
             s.tx_count,
-            ROUND(s.avg_amount::numeric, 2)         AS avg_amount,
-            ROUND(s.std_amount::numeric, 2)         AS std_amount,
+            ROUND(s.avg_amount::numeric,       2)   AS avg_amount,
+            ROUND(s.std_amount::numeric,       2)   AS std_amount,
             ROUND(s.avg_days_between::numeric, 0)   AS avg_days_between,
             s.last_date,
             (s.last_date + ROUND(s.avg_days_between)::int)::date AS next_expected_date,
             c.Currencies_ShortName                  AS currency,
             ROUND((s.avg_amount * COALESCE(fx.FX_Rate, 1))::numeric, 2) AS avg_amount_eur
-        FROM stats s
-        JOIN Currencies c ON s.Currencies_Id = c.Currencies_Id
-        LEFT JOIN fx      ON fx.Currencies_Id_1 = s.Currencies_Id
-        ORDER BY next_expected_date ASC
+        FROM   stats s
+        JOIN   Currencies c ON c.Currencies_Id    = s.Currencies_Id
+        LEFT   JOIN fx      ON fx.Currencies_Id_1 = s.Currencies_Id
+        ORDER  BY next_expected_date ASC
     """, conn)
 
     conn.close()
     if not df_future.empty:
         df_future['date'] = pd.to_datetime(df_future['date'])
     if not df_recurring.empty:
-        df_recurring['last_date'] = pd.to_datetime(df_recurring['last_date'])
+        df_recurring['last_date']          = pd.to_datetime(df_recurring['last_date'])
         df_recurring['next_expected_date'] = pd.to_datetime(df_recurring['next_expected_date'])
     return df_future, df_recurring
 

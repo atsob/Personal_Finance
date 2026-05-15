@@ -16,7 +16,7 @@ from ui.reports import render_reports
 from ui.market_data import render_market_data
 from ui.ai_assistant import render_ai_assistant
 from ui.tools import render_tools
-from ui.settings import render_settings
+from ui.static_data import render_static_data
 
 @st.cache_resource
 def startup_db_maintenance():
@@ -87,16 +87,16 @@ def main():
     st.sidebar.title("💰 Personal Finance")
     
     menu = st.sidebar.radio(
-        "Menu", 
+        "Menu",
         [
             "🏛️ Dashboard",
             "📝 Register",
         #    "🥧 Investments (DEPRECIATED)",
             "⏳ Reports",
+            "📋 Static Data",
             "🌍 Market Data",
-            "🧠 AI Assistant",
-            "🛠️ Tools",   
-            "🔧 Settings"
+            "🛠️ Tools",  
+            "🧠 AI Assistant",                      
         ]
     )
     
@@ -114,15 +114,14 @@ def main():
         elif menu == "⏳ Reports":
     #        render_reports(conn)
             render_reports()
+        elif menu == "📋 Static Data":
+            render_static_data()
         elif menu == "🌍 Market Data":
-            render_market_data(conn)
-        elif menu == "🧠 AI Assistant":
-            render_ai_assistant(llm, agent_with_history, rag_engine, db=db)
+            render_market_data()
         elif menu == "🛠️ Tools":
-            render_tools(conn)
-        elif menu == "🔧 Settings":
-        #    render_settings(conn)
-            render_settings()
+            render_tools(conn)       
+        elif menu == "🧠 AI Assistant":
+            render_ai_assistant(llm, agent_with_history, rag_engine, db=db)            
 
     finally:
         conn.close()

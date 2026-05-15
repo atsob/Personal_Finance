@@ -930,7 +930,7 @@ def _render_security_mapping(symbols: list, db_df: pd.DataFrame) -> tuple:
             ),
         },
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         key='fxp_sec_mapping',
     )
 

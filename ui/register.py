@@ -204,8 +204,10 @@ def _render_transaction_table(acc_id, payee_options, acc_options, cat_options, t
         edited_reg.get("_selected", False) == True, "transactions_id"
     ].dropna().astype(int).tolist()
 
+    _all_ids = df["transactions_id"].dropna().astype(int).tolist()
+
     _move_targets = {k: v for k, v in acc_options.items() if k != acc_id}
-    _m1, _m2 = st.columns([3, 1])
+    _m1, _m2, _m3 = st.columns([3, 1, 1])
     with _m1:
         _move_target_id = st.selectbox(
             "Move to account",
@@ -217,11 +219,77 @@ def _render_transaction_table(acc_id, payee_options, acc_options, cat_options, t
         st.write("")
         st.write("")
         _move_btn = st.button(
-            f"▶️ Move {len(_selected_ids)} transaction(s)",
+            f"▶️ Move {len(_selected_ids)} selected",
             key=f"move_btn_{acc_id}_{tab_key}",
             type="primary",
             disabled=len(_selected_ids) == 0
         )
+    with _m3:
+        st.write("")
+        st.write("")
+        _move_all_btn = st.button(
+            f"⏩ Move All ({len(_all_ids)})",
+            key=f"move_all_btn_{acc_id}_{tab_key}",
+            disabled=len(_all_ids) == 0,
+        )
+
+    # Confirmation state key for "Move All"
+    _confirm_key = f"confirm_move_all_{acc_id}_{tab_key}"
+    if _move_all_btn:
+        st.session_state[_confirm_key] = True
+
+    if st.session_state.get(_confirm_key):
+        _target_name = _move_targets.get(_move_target_id, "selected account")
+        st.warning(
+            f"⚠️ You are about to move **all {len(_all_ids)} transaction(s)** from this account "
+            f"to **{_target_name}**. This cannot be undone automatically. Are you sure?"
+        )
+        _ca, _cb = st.columns(2)
+        _confirm_ok  = _ca.button("✅ Yes, move all", key=f"confirm_ok_{acc_id}_{tab_key}", type="primary")
+        _confirm_cancel = _cb.button("❌ Cancel",      key=f"confirm_cancel_{acc_id}_{tab_key}")
+
+        if _confirm_cancel:
+            st.session_state.pop(_confirm_key, None)
+            st.rerun()
+
+        if _confirm_ok:
+            st.session_state.pop(_confirm_key, None)
+            _move_btn = False          # don't double-execute
+            _ids_to_move = _all_ids
+            with get_db() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    "UPDATE Transactions SET Accounts_Id = %s WHERE Transactions_Id = ANY(%s)",
+                    (_move_target_id, _ids_to_move)
+                )
+                cur.execute(
+                    """
+                    SELECT DISTINCT t2.Transactions_Id
+                    FROM Transactions t1
+                    JOIN Transactions t2 ON t2.Transfers_Id = t1.Transfers_Id
+                    WHERE t1.Transactions_Id = ANY(%s)
+                      AND t1.Transfers_Id IS NOT NULL
+                      AND t2.Transactions_Id != ALL(%s)
+                      AND t2.Accounts_Id NOT IN (%s, %s)
+                      AND t2.Accounts_Id_Target = %s
+                    """,
+                    (_ids_to_move, _ids_to_move, acc_id, _move_target_id, acc_id)
+                )
+                counterpart_ids = [r[0] for r in cur.fetchall()]
+                if counterpart_ids:
+                    cur.execute(
+                        "UPDATE Transactions SET Accounts_Id_Target = %s WHERE Transactions_Id = ANY(%s)",
+                        (_move_target_id, counterpart_ids)
+                    )
+            update_accounts_balances(acc_id)
+            update_accounts_balances(_move_target_id)
+            st.success(
+                f"✅ Moved all {len(_ids_to_move)} transaction(s) to "
+                f"**{_target_name}**."
+            )
+            for _k in ["df_accs", "register_df"]:
+                st.session_state.pop(_k, None)
+            st.rerun()
 
     if _move_btn and _selected_ids:
         with get_db() as conn:
@@ -894,7 +962,7 @@ def _render_security_transactions(acc_id: int, sec_options: dict, key_suffix: st
     st.dataframe(
         styled,
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         column_config={
             'date':            st.column_config.DateColumn('Date', format='DD/MM/YYYY'),
             'action':          st.column_config.TextColumn('Action'),
@@ -1160,7 +1228,7 @@ def render_register():
                                 f"→ Apply {_calc_result:,.2f} to Total Amount",
                                 key=f"calc_apply_{st.session_state.reset_counter}",
                                 type="primary",
-                                use_container_width=True,
+                                width="stretch",
                             ):
                                 # Write to the PENDING key, not the widget key.
                                 # On the next run the pending value is promoted

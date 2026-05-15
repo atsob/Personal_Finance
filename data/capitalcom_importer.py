@@ -585,7 +585,7 @@ def render_capitalcom_importer():
             lambda r: _classify_security(r['Instrument Symbol'], r['Instrument Name'], r['Currency']),
             axis=1,
         )
-        st.dataframe(instr, hide_index=True, use_container_width=True)
+        st.dataframe(instr, hide_index=True, width="stretch")
 
     # ── Import ────────────────────────────────────────────────────────────────
     if st.button("⬆ Import", type="primary", key="cap_import_btn"):

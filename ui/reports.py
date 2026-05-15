@@ -28,9 +28,8 @@ def render_reports():
             "Income & Expense",
             "Cash Flow Forecast",
             "Historical Investment Positions",
-            "P&L Reports",
+            "Investments Performance",
             "Asset Allocation",
-            "Dividend Tracker",
             "Securities & Portfolio Analysis",
             "FX Exposure",
             "Bond Schedule",
@@ -159,8 +158,8 @@ def render_reports():
             )
             copy_df_button(df_snapshot, key="dl_rpt_hist_inv_detail")
     
-    elif hist_sub_menu == "P&L Reports":
-        tab_report, tab_movers, tab_savings = st.tabs(["📊 P&L Report", "🚀 Top Movers", "💰 Savings"])
+    elif hist_sub_menu == "Investments Performance":
+        tab_report, tab_movers, tab_savings, tab_dividends = st.tabs(["📊 P&L Report", "🚀 Top Movers", "💰 Savings", "💸 Dividend Tracker"])
         
         with tab_report:
             st.subheader("📈 Investments Profit & Loss")
@@ -450,7 +449,7 @@ def render_reports():
                 with col2:
                     show_realized_unrealized_split = st.checkbox("Show Realized/Unrealized Split", value=False)
                 with col3:
-                    show_pnl_percent = st.checkbox("Show P&L % Columns", value=False)
+                    show_pnl_percent = st.checkbox("Show P&L %", value=True)
                     
                 if not show_market_fx_split:
                     df_acc = df_acc.drop(columns=['pnl_dtd_market_eur','pnl_dtd_fx_eur', 'pnl_ytd_market_eur', 'pnl_ytd_fx_eur'])
@@ -666,11 +665,12 @@ def render_reports():
 
                     if not show_market_fx_split:
                         df_to_show = df_to_show.drop(columns=['Daily Market P&L','Daily FX P&L', 'YTD Market P&L', 'YTD FX P&L'])
-                    #    pnl_cols = ['Daily P&L', 'Weekly P&L', 'Monthly P&L', 'Quarterly P&L', 'YTD Realized P&L', 'YTD Unrealized P&L', 'YTD P&L', 'Realized P&L', 'Unrealized P&L', 'Total Net P&L', 'Annual YOC %']
 
                     if not show_realized_unrealized_split:
                         df_to_show = df_to_show.drop(columns=['YTD Realized P&L', 'YTD Unrealized P&L', 'Realized P&L', 'Unrealized P&L'])
-                    #    pnl_cols = ['Daily Market P&L', 'Daily FX P&L', 'Daily P&L', 'Weekly P&L', 'Monthly P&L', 'Quarterly P&L', 'YTD Market P&L', 'YTD FX P&L', 'YTD P&L', 'Total Net P&L', 'Annual YOC %']
+
+                    if not show_pnl_percent:
+                        df_to_show = df_to_show.drop(columns=['Daily P&L %', 'YTD P&L %', 'ROI %']) 
 
                     existing_pnl_cols = [col for col in pnl_cols if col in df_to_show.columns]
 
@@ -1169,6 +1169,8 @@ def render_reports():
                 )
                 copy_df_button(df_display2, key="dl_rpt_savings_detail2")
 
+        with tab_dividends:
+            render_dividend_tracker()
 
     elif hist_sub_menu == "Securities & Portfolio Analysis":
         # 1. Tabs
@@ -1518,9 +1520,6 @@ def render_reports():
  
     elif hist_sub_menu == "Income & Expense":
         render_income_expense_reports()
-
-    elif hist_sub_menu == "Dividend Tracker":
-        render_dividend_tracker()
 
     elif hist_sub_menu == "Cash Flow Forecast":
         render_cash_flow_forecast()
@@ -1922,43 +1921,90 @@ def render_income_expense_reports():
                     # 1. Slider για το Top N
                     top_n = st.slider("Show Top N Categories", 5, 20, 10, key="ie_top_n")
                     
-                    # --- ENIAIO GROUPED BAR CHART ----
+                    # --- STACKED BAR CHART: Income column + Expenses column ---
                     st.subheader("Income vs Expenses Comparison")
-                    
-                    # Προετοιμασία δεδομένων για το Bar Chart (Ομαδοποίηση ανά τύπο και περίοδο)
+
+                    # Classify every categories_type into Income or Expenses group
+                    INCOME_TYPES_ORDER = ['Income', 'Dividend', 'Interest']
+                    EXPENSE_TYPES_ORDER = ['Expense', 'Tax']
+
+                    # Colors: greens for income types, reds for expense types
+                    TYPE_COLORS = {
+                        'Income':   '#27AE60',
+                        'Dividend': '#1ABC9C',
+                        'Interest': '#2980B9',
+                        'Expense':  '#E74C3C',
+                        'Tax':      '#8E44AD',
+                    }
+                    # Fallback palettes for any unlisted types
+                    _income_fallbacks = ['#16A085', '#1E8449', '#117A65', '#0E6655']
+                    _expense_fallbacks = ['#922B21', '#6E2FBF', '#1A5276', '#784212']
+
+                    # Prepare data: sum each categories_type across period columns, take abs
                     bar_data = aggregated_df.groupby('categories_type')[period_columns].sum().reset_index()
                     bar_melted = bar_data.melt(id_vars=['categories_type'], var_name='Period', value_name='Amount')
-                    
-                    # Μετατροπή σε απόλυτες τιμές για να είναι συγκρίσιμα
                     bar_melted['Amount'] = bar_melted['Amount'].abs()
-
-                    # 1. Ταξινόμηση των δεδομένων ανά ημερομηνία για να είναι σωστός ο άξονας Χ
-                    # Υποθέτουμε ότι το period_columns περιέχει ημερομηνίες ή strings που ταξινομούνται
-                    bar_melted['Period'] = bar_melted['Period'].astype(str) 
+                    bar_melted['Period'] = bar_melted['Period'].astype(str)
                     bar_melted = bar_melted.sort_values(by='Period')
 
-                    fig_bar = px.bar(
-                        bar_melted,
-                        x='Period',
-                        y='Amount',
-                        color='categories_type',
-                        barmode='group',
-                        # ΕΠΙΒΟΛΗ ΣΕΙΡΑΣ: Income πρώτα, μετά Expense
-                        category_orders={"categories_type": ["Income", "Dividend", "Interest", "Expense", "Tax"]}, 
-                        color_discrete_map={'Income': '#FFA500', 'Expense': '#808000'},
-                        labels={'Amount': 'Amount (€)', 'categories_type': 'Type'},
-                        height=450
-                    )
-                    
-                    # 2. Ρύθμιση του άξονα Χ ώστε να δείχνει τις περιόδους στη σωστή σειρά
-                    fig_bar.update_xaxes(type='category') # Αντιμετωπίζει τις ημερομηνίες ως ετικέτες
-                    
+                    # Determine which types actually exist in the data
+                    existing_types = bar_melted['categories_type'].unique().tolist()
+
+                    # Build ordered lists for income/expense, then catch any unknowns
+                    income_types = [t for t in INCOME_TYPES_ORDER if t in existing_types]
+                    expense_types = [t for t in EXPENSE_TYPES_ORDER if t in existing_types]
+                    # Unknown types: assign to income or expense by exclusion
+                    known = set(INCOME_TYPES_ORDER + EXPENSE_TYPES_ORDER)
+                    for t in existing_types:
+                        if t not in known:
+                            income_types.append(t)   # treat unknowns as income by default
+
+                    fig_bar = go.Figure()
+
+                    # Income traces — stacked in the "Income" offset group
+                    for i, cat_type in enumerate(income_types):
+                        df_sub = bar_melted[bar_melted['categories_type'] == cat_type]
+                        if df_sub.empty:
+                            continue
+                        color = TYPE_COLORS.get(cat_type, _income_fallbacks[i % len(_income_fallbacks)])
+                        fig_bar.add_trace(go.Bar(
+                            x=df_sub['Period'],
+                            y=df_sub['Amount'],
+                            name=cat_type,
+                            marker_color=color,
+                            offsetgroup='Income',
+                            legendgroup='Income',
+                            legendgrouptitle_text='Income' if i == 0 else None,
+                            hovertemplate='%{x}<br>' + cat_type + ': %{y:,.2f}<extra></extra>',
+                        ))
+
+                    # Expense traces — stacked in the "Expenses" offset group
+                    for i, cat_type in enumerate(expense_types):
+                        df_sub = bar_melted[bar_melted['categories_type'] == cat_type]
+                        if df_sub.empty:
+                            continue
+                        color = TYPE_COLORS.get(cat_type, _expense_fallbacks[i % len(_expense_fallbacks)])
+                        fig_bar.add_trace(go.Bar(
+                            x=df_sub['Period'],
+                            y=df_sub['Amount'],
+                            name=cat_type,
+                            marker_color=color,
+                            offsetgroup='Expenses',
+                            legendgroup='Expenses',
+                            legendgrouptitle_text='Expenses' if i == 0 else None,
+                            hovertemplate='%{x}<br>' + cat_type + ': %{y:,.2f}<extra></extra>',
+                        ))
+
                     fig_bar.update_layout(
-                        xaxis_tickangle=-45, 
+                        barmode='stack',
+                        xaxis_type='category',
+                        xaxis_tickangle=-45,
+                        yaxis_title='Amount (€)',
                         hovermode='x unified',
-                        legend_traceorder="normal" # Διατηρεί τη σειρά και στο legend
+                        height=450,
+                        legend=dict(groupclick='toggleitem'),
                     )
-                    st.plotly_chart(fig_bar, width='stretch')
+                    st.plotly_chart(fig_bar, use_container_width=True)
 
                     st.markdown("---")
 
@@ -1966,46 +2012,49 @@ def render_income_expense_reports():
                     st.subheader("Distribution Analysis")
                     col_inc, col_exp = st.columns(2)
 
-                    # Λογική για τα Pie Charts
-                    for c_type, column in [("Income", col_inc), ("Expense", col_exp)]:
+                    pie_groups = [
+                        ("Income", income_types, col_inc, px.colors.qualitative.Pastel),
+                        ("Expenses", expense_types, col_exp, px.colors.qualitative.Safe),
+                    ]
+
+                    for group_label, group_types, column, color_seq in pie_groups:
                         with column:
-                            type_df = aggregated_df[aggregated_df['categories_type'] == c_type].copy()
-                            
+                            # Combine all category types in this group
+                            type_df = aggregated_df[
+                                aggregated_df['categories_type'].isin(group_types)
+                            ].copy()
+
                             if not type_df.empty:
-                                # 1. Μετατρέπουμε το Total σε απόλυτη τιμή ΠΡΙΝ βρούμε τα Top N
                                 type_df['Total_Abs'] = type_df['Total'].abs()
-                                
-                                # 2. Χρησιμοποιούμε το Total_Abs για να βρούμε τις σημαντικότερες κατηγορίες
                                 top_cats = type_df.nlargest(top_n, 'Total_Abs')['category_full_path'].tolist()
-                                
                                 type_df['Category'] = type_df['category_full_path'].apply(
                                     lambda x: x if x in top_cats else "Other"
                                 )
-                                
-                                # 3. Ομαδοποίηση και υπολογισμός Pie χρησιμοποιώντας απόλυτες τιμές
                                 pie_agg = type_df.groupby('Category')['Total_Abs'].sum().reset_index()
 
                                 fig_pie = px.pie(
                                     pie_agg,
                                     values='Total_Abs',
                                     names='Category',
-                                    title=f"{c_type} Breakdown",
+                                    title=f"{group_label} Breakdown",
                                     hole=0.4,
-                                    height=400,
-                                    # Προσθήκη χρωμάτων για να μην είναι όλα μπλε
-                                    color_discrete_sequence=px.colors.qualitative.Pastel if c_type == "Income" else px.colors.qualitative.Safe
+                                    height=550,
+                                    color_discrete_sequence=color_seq,
                                 )
-                                
-                                # Βελτίωση εμφάνισης κειμένου
                                 fig_pie.update_traces(
-                                    textposition='inside', 
+                                    textposition='inside',
                                     textinfo='percent+label',
-                                    insidetextorientation='radial' # Βοηθάει στην ανάγνωση αν είναι πολλά τα slices
+                                    insidetextorientation='radial',
+                                    textfont=dict(size=14),
                                 )
-                                fig_pie.update_layout(showlegend=False)
-                                st.plotly_chart(fig_pie, width='stretch')
+                                fig_pie.update_layout(
+                                    showlegend=False,
+                                    title_font=dict(size=18),
+                                    margin=dict(t=60, b=20, l=20, r=20),
+                                )
+                                st.plotly_chart(fig_pie, use_container_width=True)
                             else:
-                                st.info(f"No {c_type} data available.")
+                                st.info(f"No {group_label} data available.")
                 
                 with tab_table:
                     st.subheader(f"{report_type} - {period_type} Breakdown")
@@ -2121,29 +2170,32 @@ def render_income_expense_reports():
 def render_dividend_tracker():
     st.subheader("💸 Dividend & Interest Income Tracker")
 
-    # ── Sidebar period controls ───────────────────────────────────────────────
+    # ── Inline period controls (sidebar is shared across all P&L tabs) ────────
+    import datetime as _dt
     today = pd.Timestamp.now().date()
 
-    period_opt = st.sidebar.radio(
-        "Period:",
-        ["YTD", "Previous Year", "1 Year", "2 Years", "3 Years", "5 Years", "All Time", "Custom"],
-        index=0,
-        key="div_period",
-    )
+    ctrl_col1, ctrl_col2, ctrl_col3 = st.columns([2, 2, 1])
+    with ctrl_col1:
+        period_opt = st.radio(
+            "Period:",
+            ["YTD", "Previous Year", "1 Year", "2 Years", "3 Years", "5 Years", "All Time", "Custom"],
+            index=0,
+            key="div_period",
+            horizontal=True,
+        )
 
     _period_days = {"1 Year": 365, "2 Years": 730, "3 Years": 1095, "5 Years": 1825}
     if period_opt == "Custom":
-        start_date = st.sidebar.date_input("From", value=today - pd.Timedelta(days=365), key="div_from")
-        end_date   = st.sidebar.date_input("To",   value=today,                          key="div_to")
+        with ctrl_col2:
+            start_date = st.date_input("From", value=today - pd.Timedelta(days=365), min_value=pd.Timestamp("1900-01-01").date(), key="div_from")
+            end_date   = st.date_input("To",   value=today,                          key="div_to")
     elif period_opt == "All Time":
         start_date = pd.Timestamp("1900-01-01").date()
         end_date   = today
     elif period_opt == "YTD":
-        import datetime as _dt
         start_date = _dt.date(today.year, 1, 1)
         end_date   = today
     elif period_opt == "Previous Year":
-        import datetime as _dt
         start_date = _dt.date(today.year - 1, 1, 1)
         end_date   = _dt.date(today.year - 1, 12, 31)
     else:
@@ -2156,9 +2208,11 @@ def render_dividend_tracker():
         "Previous Year": str(today.year - 1),
     }.get(period_opt, f"Last {period_opt}")
 
-    if st.sidebar.button("🔄 Refresh", key="div_refresh"):
-        get_dividend_tracker_data.clear()
-        st.rerun()
+    with ctrl_col3:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("🔄 Refresh", key="div_refresh"):
+            get_dividend_tracker_data.clear()
+            st.rerun()
 
     df = get_dividend_tracker_data(str(start_date), str(end_date))
 
@@ -2344,74 +2398,185 @@ def render_dividend_tracker():
 def render_cash_flow_forecast():
     st.subheader("🔮 Cash Flow Forecast")
 
-    horizon = st.sidebar.radio("Forecast horizon:", ["30 days", "60 days", "90 days"], index=1, key="cf_horizon")
-    days = int(horizon.split()[0])
+    horizon     = st.sidebar.radio("Forecast horizon:", ["30 days", "60 days", "90 days"], index=1, key="cf_horizon")
+    days        = int(horizon.split()[0])
+    months_back = st.sidebar.slider(
+        "Recurring detection window (months):",
+        min_value=2, max_value=6, value=3, step=1,
+        key="cf_months_back",
+        help="A payee must appear in every one of these last complete calendar months to be flagged as recurring.",
+    )
 
     if st.sidebar.button("🔄 Refresh", key="cf_refresh"):
         get_cash_flow_forecast.clear()
         st.rerun()
 
-    df_future, df_recurring = get_cash_flow_forecast()
+    df_future, df_recurring = get_cash_flow_forecast(months_back=months_back)
 
-    st.markdown("#### Explicitly Scheduled Future Transactions")
-    if df_future.empty:
-        st.info("No future-dated transactions found.")
+    today  = pd.Timestamp.now().normalize()
+    cutoff = today + pd.Timedelta(days=days)
+
+    # ── Filter scheduled transactions to the horizon ──────────────────────────
+    df_f = (
+        df_future[df_future['date'] <= cutoff].copy()
+        if not df_future.empty else pd.DataFrame()
+    )
+
+    # ── Deduplicate: drop recurring patterns whose payee already has explicit
+    #    future transactions — the scheduled entries take precedence.
+    if not df_recurring.empty and not df_f.empty:
+        _scheduled_payees = set(
+            df_f['payees_name'].dropna().str.strip().str.lower().unique()
+        )
+        df_recurring = df_recurring[
+            ~df_recurring['payees_name'].str.strip().str.lower().isin(_scheduled_payees)
+        ].copy()
+
+    # ── Project recurring patterns as concrete future occurrences ─────────────
+    # Start from next_expected_date; if it is today-or-earlier, step forward
+    # until it lands strictly in the future, then emit every occurrence up to cutoff.
+    recur_rows = []
+    if not df_recurring.empty:
+        for _, row in df_recurring.iterrows():
+            avg_days = (
+                float(row['avg_days_between'])
+                if pd.notna(row['avg_days_between']) else None
+            )
+            if not avg_days or avg_days < 1:
+                continue
+
+            next_dt = pd.Timestamp(row['next_expected_date'])
+            while next_dt <= today:
+                next_dt += pd.Timedelta(days=avg_days)
+
+            while next_dt <= cutoff:
+                recur_rows.append({
+                    'date':             next_dt,
+                    'amount_eur':       float(row['avg_amount_eur']),
+                    'payees_name':      row['payees_name'],
+                    'avg_days_between': avg_days,
+                    'currency':         row['currency'],
+                })
+                next_dt += pd.Timedelta(days=avg_days)
+
+    df_recur_proj = (
+        pd.DataFrame(recur_rows).sort_values('date').reset_index(drop=True)
+        if recur_rows else pd.DataFrame()
+    )
+
+    # ── Build combined rows then aggregate by month for the chart ─────────────
+    chart_rows = []
+    if not df_f.empty:
+        for _, row in df_f.iterrows():
+            chart_rows.append({
+                'date':       row['date'],
+                'amount_eur': row['amount_eur'],
+                'source':     'Scheduled',
+                'flow':       'Income' if row['amount_eur'] >= 0 else 'Expense',
+            })
+    if not df_recur_proj.empty:
+        for _, row in df_recur_proj.iterrows():
+            chart_rows.append({
+                'date':       row['date'],
+                'amount_eur': row['amount_eur'],
+                'source':     'Recurring (est.)',
+                'flow':       'Income' if row['amount_eur'] >= 0 else 'Expense',
+            })
+
+    # ── Combined chart + metrics ──────────────────────────────────────────────
+    if chart_rows:
+        df_combined = pd.DataFrame(chart_rows)
+        df_combined['series'] = df_combined['flow'] + ' · ' + df_combined['source']
+
+        # Aggregate to calendar month
+        df_combined['month'] = (
+            pd.to_datetime(df_combined['date'])
+            .dt.to_period('M')
+            .dt.to_timestamp()          # first day of each month — sorts correctly
+        )
+        df_monthly = (
+            df_combined
+            .groupby(['month', 'series'], sort=True)['amount_eur']
+            .sum()
+            .reset_index()
+        )
+
+        _COLOR_MAP = {
+            'Income · Scheduled':          '#2ECC71',
+            'Expense · Scheduled':         '#E74C3C',
+            'Income · Recurring (est.)':   '#82E0AA',
+            'Expense · Recurring (est.)':  '#F1948A',
+        }
+
+        sched_in  = df_f['amount_eur'][df_f['amount_eur'] > 0].sum()                   if not df_f.empty          else 0.0
+        sched_out = df_f['amount_eur'][df_f['amount_eur'] < 0].sum()                   if not df_f.empty          else 0.0
+        recur_in  = df_recur_proj['amount_eur'][df_recur_proj['amount_eur'] > 0].sum() if not df_recur_proj.empty else 0.0
+        recur_out = df_recur_proj['amount_eur'][df_recur_proj['amount_eur'] < 0].sum() if not df_recur_proj.empty else 0.0
+        net_total = sched_in + sched_out + recur_in + recur_out
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Scheduled In",  f"€ {sched_in:,.2f}")
+        c2.metric("Scheduled Out", f"€ {sched_out:,.2f}")
+        c3.metric("Recurring In",  f"€ {recur_in:,.2f}")
+        c4.metric("Recurring Out", f"€ {recur_out:,.2f}")
+        c5.metric("Total Net",     f"€ {net_total:,.2f}")
+
+        fig = px.bar(
+            df_monthly,
+            x='month', y='amount_eur',
+            color='series',
+            color_discrete_map=_COLOR_MAP,
+            barmode='relative',
+            title=f"<b>Monthly cash flow forecast — next {days} days</b>",
+            labels={'amount_eur': 'Amount (€)', 'month': 'Month', 'series': ''},
+            template='plotly_dark',
+        )
+        fig.update_xaxes(tickformat='%b %Y', dtick='M1')
+        fig.update_layout(
+            margin=dict(l=0, r=0, t=50, b=0),
+            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+        )
+        st.plotly_chart(fig, width='stretch')
     else:
-        cutoff = pd.Timestamp.now() + pd.Timedelta(days=days)
-        df_f = df_future[df_future['date'] <= cutoff].copy()
-        if df_f.empty:
-            st.info(f"No transactions scheduled within {days} days.")
-        else:
-            total_in  = df_f[df_f['amount_eur'] > 0]['amount_eur'].sum()
-            total_out = df_f[df_f['amount_eur'] < 0]['amount_eur'].sum()
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Expected In",  f"€ {total_in:,.2f}")
-            c2.metric("Expected Out", f"€ {total_out:,.2f}")
-            c3.metric("Net",          f"€ {(total_in + total_out):,.2f}")
+        st.info(f"No cash flows found within the next {days} days.")
 
-            fig = px.bar(
-                df_f.sort_values('date'), x='date', y='amount_eur',
-                color=df_f['amount_eur'].apply(lambda x: 'Income' if x >= 0 else 'Expense'),
-                color_discrete_map={'Income': '#2ECC71', 'Expense': '#E74C3C'},
-                title=f"<b>Scheduled cash flows — next {days} days</b>",
-                labels={'amount_eur': 'Amount (€)', 'date': 'Date'},
-                hover_data=['payees_name', 'category'],
-                template='plotly_dark',
-            )
-            fig.update_layout(margin=dict(l=0, r=0, t=50, b=0), showlegend=False)
-            st.plotly_chart(fig, width='stretch')
-
-            st.dataframe(
-                df_f[['date', 'payees_name', 'accounts_name', 'category', 'amount_eur', 'currency']]
-                .style.format({'amount_eur': '{:,.2f} €'}),
-                hide_index=True, width='stretch',
-            )
-            copy_df_button(df_f, key="dl_rpt_cf_future")
-
-    st.markdown("#### Detected Recurring Payments")
-    st.caption("Payees with ≥ 2 transactions in the last 120 days, showing projected next occurrence.")
-    if df_recurring.empty:
-        st.info("No recurring patterns detected.")
+    # ── Detail: Scheduled transactions ───────────────────────────────────────
+    st.divider()
+    st.markdown("#### 📅 Explicitly Scheduled Future Transactions")
+    if df_f.empty:
+        st.info(f"No transactions scheduled within {days} days.")
     else:
-        cutoff2 = pd.Timestamp.now() + pd.Timedelta(days=days)
-        df_r = df_recurring[df_recurring['next_expected_date'] <= cutoff2].copy()
-        if df_r.empty:
-            st.info(f"No recurring payments expected within {days} days.")
-        else:
-            st.dataframe(
-                df_r[['next_expected_date', 'payees_name', 'avg_amount_eur', 'avg_days_between', 'tx_count', 'currency']]
-                .style.format({'avg_amount_eur': '{:,.2f} €', 'avg_days_between': '{:.0f} days'}),
-                hide_index=True, width='stretch',
-                column_config={
-                    'next_expected_date': 'Next Expected',
-                    'payees_name':        'Payee',
-                    'avg_amount_eur':     st.column_config.NumberColumn('Avg Amount (€)', format='%,.2f €'),
-                    'avg_days_between':   'Avg Frequency',
-                    'tx_count':           'Occurrences',
-                    'currency':           'Currency',
-                }
-            )
-            copy_df_button(df_r, key="dl_rpt_cf_recurring")
+        st.dataframe(
+            df_f[['date', 'payees_name', 'accounts_name', 'category', 'amount_eur', 'currency']]
+            .style.format({'amount_eur': '{:,.2f} €'}),
+            hide_index=True, width='stretch',
+        )
+        copy_df_button(df_f, key="dl_rpt_cf_future")
+
+    # ── Detail: Projected recurring occurrences ───────────────────────────────
+    st.divider()
+    st.markdown("#### 🔁 Projected Recurring Payments")
+    st.caption(
+        f"Payees detected in **every one** of the last **{months_back} complete months**, "
+        "projected forward at their average payment interval. "
+        "Payees with explicit scheduled entries are excluded to avoid double-counting."
+    )
+    if df_recur_proj.empty:
+        st.info(f"No recurring payments projected within {days} days.")
+    else:
+        st.dataframe(
+            df_recur_proj[['date', 'payees_name', 'amount_eur', 'avg_days_between', 'currency']]
+            .style.format({'amount_eur': '{:,.2f} €', 'avg_days_between': '{:.0f}'}),
+            hide_index=True, width='stretch',
+            column_config={
+                'date':             st.column_config.DateColumn('Projected Date', format='DD/MM/YYYY'),
+                'payees_name':      'Payee',
+                'amount_eur':       st.column_config.NumberColumn('Est. Amount (€)', format='%,.2f €'),
+                'avg_days_between': 'Interval (days)',
+                'currency':         'Currency',
+            }
+        )
+        copy_df_button(df_recur_proj, key="dl_rpt_cf_recurring")
 
 
 # ======================================================

@@ -11,7 +11,12 @@ import tempfile
 import os
 from datetime import datetime
 from database.connection import get_connection
-from database.crud import update_accounts_balances, update_db_stats, update_investment_balances, update_pension_balances, update_holdings
+from database.crud import (
+    update_accounts_balances, update_db_stats, update_investment_balances,
+    update_pension_balances, update_holdings,
+    save_nwr_account_selection,
+)
+from database.queries import get_nwr_account_selection
 
 class QIFImporter:
     """Handles QIF file import operations"""
@@ -232,11 +237,58 @@ class QIFImporter:
         except Exception as e:
             st.warning(f"Could not enable triggers (they may not exist): {e}")
     
-    def clear_tables(self, tables_to_clear):
-        """Clear specified tables"""
+    def clear_tables(self, tables_to_clear,
+                     exclude_bank_account_ids=None,
+                     exclude_inv_account_ids=None):
+        """Clear specified tables.
+
+        When account-exclusion lists are provided the relevant tables are
+        cleared with DELETE (preserving rows belonging to excluded accounts)
+        rather than TRUNCATE.  Tables that have no applicable exclusion list
+        (Categories, Holdings, …) are always TRUNCATEd.
+        """
+        _bank_excl = [int(i) for i in (exclude_bank_account_ids or [])]
+        _inv_excl  = [int(i) for i in (exclude_inv_account_ids  or [])]
+
         for table in tables_to_clear:
             st.write(f"  - Clearing {table}...")
-            self.cur.execute(f"TRUNCATE TABLE {table} RESTART IDENTITY CASCADE;")
+
+            if table == 'Transactions' and _bank_excl:
+                # NULL out Investments.Transactions_Id references that point to
+                # transactions we are about to delete, to avoid FK violations.
+                self.cur.execute("""
+                    UPDATE Investments
+                    SET Transactions_Id = NULL
+                    WHERE Transactions_Id IN (
+                        SELECT Transactions_Id FROM Transactions
+                        WHERE Accounts_Id NOT IN %s
+                    )
+                """, (tuple(_bank_excl),))
+                # Delete all bank transactions except those in excluded accounts
+                self.cur.execute(
+                    "DELETE FROM Transactions WHERE Accounts_Id NOT IN %s",
+                    (tuple(_bank_excl),)
+                )
+            elif table == 'Splits' and _bank_excl:
+                # Delete splits whose parent transaction belongs to a non-excluded account.
+                # (When Transactions is also being cleared, its CASCADE already handles
+                # most of these; this covers the case where only Splits is selected.)
+                self.cur.execute("""
+                    DELETE FROM Splits
+                    WHERE Transactions_Id IN (
+                        SELECT Transactions_Id FROM Transactions
+                        WHERE Accounts_Id NOT IN %s
+                    )
+                """, (tuple(_bank_excl),))
+            elif table == 'Investments' and _inv_excl:
+                # Delete investment transactions except those in excluded accounts
+                self.cur.execute(
+                    "DELETE FROM Investments WHERE Accounts_Id NOT IN %s",
+                    (tuple(_inv_excl),)
+                )
+            else:
+                self.cur.execute(f"TRUNCATE TABLE {table} RESTART IDENTITY CASCADE;")
+
         self.conn.commit()
         st.write("All specified tables cleared.")
         st.write("Resetting sequence transfers_id_seq...")
@@ -315,11 +367,13 @@ class QIFImporter:
                 else _QIF_TYPE_MAP.get(raw_type.lower(), 'Stock')
             )
             
-            # Check if security already exists
+            # Check if security already exists — by ticker first, then by name
             existing_id = self.get_id("Securities", "securities_id", "ticker", ticker)
             if not existing_id:
+                existing_id = self.get_id("Securities", "securities_id", "securities_name", name)
+            if not existing_id:
                 # Set EUR as the default Security Currency
-                self.cur.execute("SELECT Currencies_Id FROM Currencies WHERE Currencies_ShortName = %s", ("EUR",))                
+                self.cur.execute("SELECT Currencies_Id FROM Currencies WHERE Currencies_ShortName = %s", ("EUR",))
                 account_currency_id = self.cur.fetchone()[0]
 
                 self.get_or_create_id(
@@ -1134,20 +1188,26 @@ class QIFImporter:
         self.conn.commit()
         st.success(f"✅ Imported {price_count} historical prices!")
     
-    def import_full_qif(self, qif_file_path, tables_to_clear, import_options):
+    def import_full_qif(self, qif_file_path, tables_to_clear, import_options,
+                        exclude_bank_account_ids=None,
+                        exclude_inv_account_ids=None):
         """Complete QIF import process"""
         try:
             self.connect()
-            
+
             # Ensure Transfer_Issues table exists
             self.ensure_transfer_issues_table()
 
             # Disable triggers
             self.disable_triggers()
-            
-            # Clear selected tables
+
+            # Clear selected tables (honouring account exclusions)
             if tables_to_clear:
-                self.clear_tables(tables_to_clear)
+                self.clear_tables(
+                    tables_to_clear,
+                    exclude_bank_account_ids=exclude_bank_account_ids,
+                    exclude_inv_account_ids=exclude_inv_account_ids,
+                )
             
             # Parse QIF file
             st.info("📄 Parsing QIF file...")
@@ -1380,22 +1440,89 @@ def render_qif_importer():
             st.error(f"Failed to create temporary file: {str(e)}")
             return
         
-        # Table selection for clearing
+        # ── Fetch accounts for exclusion pickers ──────────────────────────────
+        try:
+            _conn_tmp = get_connection()
+            df_all_accs = pd.read_sql(
+                "SELECT Accounts_Id AS acc_id, Accounts_Name AS acc_name "
+                "FROM Accounts ORDER BY Accounts_Name",
+                _conn_tmp,
+            )
+            df_inv_accs = pd.read_sql(
+                """SELECT DISTINCT a.Accounts_Id AS acc_id, a.Accounts_Name AS acc_name
+                   FROM Accounts a
+                   JOIN Investments i ON i.Accounts_Id = a.Accounts_Id
+                   ORDER BY a.Accounts_Name""",
+                _conn_tmp,
+            )
+            _conn_tmp.close()
+        except Exception:
+            df_all_accs = pd.DataFrame(columns=['acc_id', 'acc_name'])
+            df_inv_accs = pd.DataFrame(columns=['acc_id', 'acc_name'])
+
+        _all_acc_map = dict(zip(df_all_accs['acc_id'], df_all_accs['acc_name']))
+        _inv_acc_map = dict(zip(df_inv_accs['acc_id'], df_inv_accs['acc_name']))
+
+        # ── Load saved exclusion settings ──────────────────────────────────────
+        _saved_bank_excl = get_nwr_account_selection('qif_exclude_bank_accs') or []
+        _saved_inv_excl  = get_nwr_account_selection('qif_exclude_inv_accs')  or []
+        # Guard: keep only IDs that still exist in the DB
+        _saved_bank_excl = [i for i in _saved_bank_excl if i in _all_acc_map]
+        _saved_inv_excl  = [i for i in _saved_inv_excl  if i in _inv_acc_map]
+
+        # ── Table selection for clearing ───────────────────────────────────────
         st.markdown("### 🗑️ Select Tables to Clear Before Import")
         st.warning("⚠️ Clearing tables will permanently delete existing data in selected tables")
-        
+
         col1, col2 = st.columns(2)
-        
+
         with col1:
-            clear_categories = st.checkbox("🗂️ Categories", value=False, key="clear_categories")
-            clear_bank_tx = st.checkbox("🏦 Bank Transactions", value=False, key="clear_bank_tx")
-            clear_bank_splits = st.checkbox("📊 Bank Transaction Splits", value=False, key="clear_bank_splits")
-        
+            clear_categories  = st.checkbox("🗂️ Categories",               value=False, key="clear_categories")
+            clear_bank_tx     = st.checkbox("🏦 Bank Transactions",          value=False, key="clear_bank_tx")
+            clear_bank_splits = st.checkbox("📊 Bank Transaction Splits",   value=False, key="clear_bank_splits")
+
         with col2:
-            clear_inv_tx = st.checkbox("📈 Investment Transactions", value=False, key="clear_inv_tx")
-            clear_holdings = st.checkbox("💼 Holdings", value=False, key="clear_holdings")
-        
-        # Build list of tables to clear
+            clear_inv_tx  = st.checkbox("📈 Investment Transactions", value=False, key="clear_inv_tx")
+            clear_holdings = st.checkbox("💼 Holdings",               value=False, key="clear_holdings")
+
+        # ── Account exclusion settings ─────────────────────────────────────────
+        st.markdown("### 🔒 Account Exclusion Settings")
+        st.caption(
+            "Select accounts whose data should be **preserved** when clearing. "
+            "The same bank-account selection applies to both Bank Transactions and Splits. "
+            "Settings are saved independently of the import and persist across sessions."
+        )
+
+        excl_col1, excl_col2 = st.columns(2)
+
+        with excl_col1:
+            excl_bank_accounts = st.multiselect(
+                "🏦 Preserve these accounts (Bank TX & Splits):",
+                options=list(_all_acc_map.keys()),
+                default=_saved_bank_excl,
+                format_func=lambda x: _all_acc_map.get(x, str(x)),
+                key="qif_excl_bank",
+                help="Bank Transactions and Splits for these accounts will NOT be deleted.",
+                disabled=not (clear_bank_tx or clear_bank_splits),
+            )
+
+        with excl_col2:
+            excl_inv_accounts = st.multiselect(
+                "📈 Preserve these accounts (Investment TX):",
+                options=list(_inv_acc_map.keys()),
+                default=_saved_inv_excl,
+                format_func=lambda x: _inv_acc_map.get(x, str(x)),
+                key="qif_excl_inv",
+                help="Investment Transactions for these accounts will NOT be deleted.",
+                disabled=not clear_inv_tx,
+            )
+
+        if st.button("💾 Save Exclusion Settings", key="qif_save_excl"):
+            save_nwr_account_selection(excl_bank_accounts, 'qif_exclude_bank_accs')
+            save_nwr_account_selection(excl_inv_accounts,  'qif_exclude_inv_accs')
+            st.success("✅ Exclusion settings saved.")
+
+        # ── Build list of tables to clear ─────────────────────────────────────
         tables_to_clear = []
         if clear_categories:
             tables_to_clear.append("Categories")
@@ -1442,6 +1569,13 @@ def render_qif_importer():
                     st.write(f"  - {table}")
             else:
                 st.write("  - No tables will be cleared (data will be appended)")
+
+            if excl_bank_accounts:
+                preserved = ", ".join(_all_acc_map.get(i, str(i)) for i in excl_bank_accounts)
+                st.markdown(f"**Bank TX / Splits — preserved accounts:** {preserved}")
+            if excl_inv_accounts:
+                preserved = ", ".join(_inv_acc_map.get(i, str(i)) for i in excl_inv_accounts)
+                st.markdown(f"**Investment TX — preserved accounts:** {preserved}")
             
             st.markdown("**Data to import:**")
             st.write(f"  - Categories: {'Yes' if import_categories else 'No'}")
@@ -1464,7 +1598,11 @@ def render_qif_importer():
             if st.button("🚀 Start QIF Import", type="primary", width='stretch'):
                 try:
                     importer = QIFImporter()
-                    importer.import_full_qif(temp_path, tables_to_clear, import_options)
+                    importer.import_full_qif(
+                        temp_path, tables_to_clear, import_options,
+                        exclude_bank_account_ids=excl_bank_accounts or None,
+                        exclude_inv_account_ids=excl_inv_accounts  or None,
+                    )
                     
                     st.balloons()
                     st.success("✅ QIF import completed successfully!")
