@@ -521,18 +521,41 @@ def _render_price_quality():
             st.info(f"{n_selected} row(s) checked — or use 'Delete all listed' to remove every visible row.")
 
     if del_btn and n_selected:
-        rows = to_delete[['securities_id', 'date']].to_dict('records')
-        deleted = delete_historical_prices(rows)
-        get_price_anomalies.clear()
-        st.success(f"Deleted {deleted} price record(s).")
-        st.rerun()
-
+        st.session_state['pq_del_confirm'] = True
     if del_all_btn:
-        rows = df[['securities_id', 'date']].to_dict('records')
-        deleted = delete_historical_prices(rows)
-        get_price_anomalies.clear()
-        st.success(f"Deleted {deleted} price record(s).")
-        st.rerun()
+        st.session_state['pq_del_all_confirm'] = True
+
+    if st.session_state.get('pq_del_confirm'):
+        st.warning(f"⚠️ Delete **{n_selected}** selected price record(s)? This cannot be undone.")
+        _cn, _cy, _ = st.columns([1, 1, 3])
+        with _cn:
+            if st.button("✖ Cancel", key="pq_del_cancel", width="stretch"):
+                st.session_state['pq_del_confirm'] = False
+                st.rerun()
+        with _cy:
+            if st.button("✔ Yes, delete", type="primary", key="pq_del_yes", width="stretch"):
+                rows = to_delete[['securities_id', 'date']].to_dict('records')
+                deleted = delete_historical_prices(rows)
+                get_price_anomalies.clear()
+                st.session_state['pq_del_confirm'] = False
+                st.success(f"Deleted {deleted} price record(s).")
+                st.rerun()
+
+    if st.session_state.get('pq_del_all_confirm'):
+        st.warning(f"⚠️ Delete **all {n_visible}** listed price record(s)? This cannot be undone.")
+        _cn, _cy, _ = st.columns([1, 1, 3])
+        with _cn:
+            if st.button("✖ Cancel", key="pq_del_all_cancel", width="stretch"):
+                st.session_state['pq_del_all_confirm'] = False
+                st.rerun()
+        with _cy:
+            if st.button("✔ Yes, delete all", type="primary", key="pq_del_all_yes", width="stretch"):
+                rows = df[['securities_id', 'date']].to_dict('records')
+                deleted = delete_historical_prices(rows)
+                get_price_anomalies.clear()
+                st.session_state['pq_del_all_confirm'] = False
+                st.success(f"Deleted {deleted} price record(s).")
+                st.rerun()
 
 
 def _render_fill_missing_prices():
@@ -600,12 +623,7 @@ def _render_fill_missing_prices():
             width="stretch",
             key="fmp_insert_btn",
         ):
-            rows = df_view[['securities_id', 'date', 'price']].to_dict('records')
-            inserted = insert_prices_from_transactions(rows)
-            get_missing_tx_prices.clear()
-            get_price_anomalies.clear()
-            st.success(f"Inserted {inserted} price record(s).")
-            st.rerun()
+            st.session_state['fmp_insert_confirm'] = True
 
     with col_ins_all:
         if selected_secs and st.button(
@@ -614,16 +632,47 @@ def _render_fill_missing_prices():
             width="stretch",
             key="fmp_insert_all_btn",
         ):
-            rows = df[['securities_id', 'date', 'price']].to_dict('records')
-            inserted = insert_prices_from_transactions(rows)
-            get_missing_tx_prices.clear()
-            get_price_anomalies.clear()
-            st.success(f"Inserted {inserted} price record(s).")
-            st.rerun()
+            st.session_state['fmp_insert_all_confirm'] = True
 
     with col_info:
         if selected_secs:
             st.caption("First button inserts only the filtered rows; second inserts all gaps regardless of filter.")
+
+    if st.session_state.get('fmp_insert_confirm'):
+        _n = len(df_view)
+        st.warning(f"⚠️ Insert **{_n:,}** missing price record(s) from transaction data? Existing prices will not be overwritten.")
+        _cn, _cy, _ = st.columns([1, 1, 3])
+        with _cn:
+            if st.button("✖ Cancel", key="fmp_insert_cancel", width="stretch"):
+                st.session_state['fmp_insert_confirm'] = False
+                st.rerun()
+        with _cy:
+            if st.button("✔ Yes, insert", type="primary", key="fmp_insert_yes", width="stretch"):
+                rows = df_view[['securities_id', 'date', 'price']].to_dict('records')
+                inserted = insert_prices_from_transactions(rows)
+                get_missing_tx_prices.clear()
+                get_price_anomalies.clear()
+                st.session_state['fmp_insert_confirm'] = False
+                st.success(f"Inserted {inserted} price record(s).")
+                st.rerun()
+
+    if st.session_state.get('fmp_insert_all_confirm'):
+        _n = len(df)
+        st.warning(f"⚠️ Insert **all {_n:,}** missing price records from transaction data? Existing prices will not be overwritten.")
+        _cn, _cy, _ = st.columns([1, 1, 3])
+        with _cn:
+            if st.button("✖ Cancel", key="fmp_insert_all_cancel", width="stretch"):
+                st.session_state['fmp_insert_all_confirm'] = False
+                st.rerun()
+        with _cy:
+            if st.button("✔ Yes, insert all", type="primary", key="fmp_insert_all_yes", width="stretch"):
+                rows = df[['securities_id', 'date', 'price']].to_dict('records')
+                inserted = insert_prices_from_transactions(rows)
+                get_missing_tx_prices.clear()
+                get_price_anomalies.clear()
+                st.session_state['fmp_insert_all_confirm'] = False
+                st.success(f"Inserted {inserted} price record(s).")
+                st.rerun()
 
 
 def _render_normalize_investments():
@@ -740,11 +789,7 @@ def _render_normalize_investments():
             f"⚖ Normalize filtered ({len(df_view):,})" if is_filtered else "⚖ Normalize all"
         )
         if st.button(label, type="primary", width="stretch", key="ni_norm_btn"):
-            ids = df_view['investments_id'].tolist()
-            updated = normalize_investment_prices(ids)
-            get_investments_with_dummy_prices.clear()
-            st.success(f"Updated {updated} investment row(s).")
-            st.rerun()
+            st.session_state['ni_norm_confirm'] = True
 
     with col_norm_all:
         if is_filtered and st.button(
@@ -753,15 +798,45 @@ def _render_normalize_investments():
             width="stretch",
             key="ni_norm_all_btn",
         ):
-            ids = df['investments_id'].tolist()
-            updated = normalize_investment_prices(ids)
-            get_investments_with_dummy_prices.clear()
-            st.success(f"Updated {updated} investment row(s).")
-            st.rerun()
+            st.session_state['ni_norm_all_confirm'] = True
 
     with col_info:
         if is_filtered:
             st.caption("First button normalizes only filtered rows; second normalizes all flagged rows.")
+
+    if st.session_state.get('ni_norm_confirm'):
+        _n = len(df_view)
+        st.warning(f"⚠️ This will overwrite prices and quantities for **{_n:,}** investment row(s). This cannot be undone.")
+        _cn, _cy, _ = st.columns([1, 1, 3])
+        with _cn:
+            if st.button("✖ Cancel", key="ni_norm_cancel", width="stretch"):
+                st.session_state['ni_norm_confirm'] = False
+                st.rerun()
+        with _cy:
+            if st.button("✔ Yes, normalize", type="primary", key="ni_norm_yes", width="stretch"):
+                ids = df_view['investments_id'].tolist()
+                updated = normalize_investment_prices(ids)
+                get_investments_with_dummy_prices.clear()
+                st.session_state['ni_norm_confirm'] = False
+                st.success(f"Updated {updated} investment row(s).")
+                st.rerun()
+
+    if st.session_state.get('ni_norm_all_confirm'):
+        _n = len(df)
+        st.warning(f"⚠️ This will overwrite prices and quantities for **{_n:,}** investment row(s) (all flagged). This cannot be undone.")
+        _cn, _cy, _ = st.columns([1, 1, 3])
+        with _cn:
+            if st.button("✖ Cancel", key="ni_norm_all_cancel", width="stretch"):
+                st.session_state['ni_norm_all_confirm'] = False
+                st.rerun()
+        with _cy:
+            if st.button("✔ Yes, normalize all", type="primary", key="ni_norm_all_yes", width="stretch"):
+                ids = df['investments_id'].tolist()
+                updated = normalize_investment_prices(ids)
+                get_investments_with_dummy_prices.clear()
+                st.session_state['ni_norm_all_confirm'] = False
+                st.success(f"Updated {updated} investment row(s).")
+                st.rerun()
 
     # Import here to avoid circular dependency at module level
     from database.crud import update_holdings as _update_holdings
@@ -788,8 +863,8 @@ _CATEGORIES = {
         "🛢 SQL Interface",
     ],
     "📊 Market Data & Prices": [
-        "🔍 Price Quality",
         "📥 Fill Missing Prices",
+        "🔍 Price Quality",
         "⚖ Normalize Investments",
     ],
 }
@@ -802,8 +877,8 @@ _TOOL_RENDERERS = {
     "💾 Backup & Restore":       render_backup_restore,
     "🛢 SQL Interface":          _render_sql_interface,
     "🔧 DB Maintenance":         _render_db_maintenance,
-    "🔍 Price Quality":          _render_price_quality,
     "📥 Fill Missing Prices":    _render_fill_missing_prices,
+    "🔍 Price Quality":          _render_price_quality,
     "⚖ Normalize Investments":  _render_normalize_investments,
 }
 

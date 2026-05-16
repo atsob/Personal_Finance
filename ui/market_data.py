@@ -736,16 +736,43 @@ def render_market_data():
                         if n_selected:
                             st.info(f"{n_selected} row(s) checked — or use 'Delete all listed' to remove every visible row.")
 
+                    _del_ck     = f"mkt_pq_del_confirm_{inv_sec_id}"
+                    _del_all_ck = f"mkt_pq_del_all_confirm_{inv_sec_id}"
+
                     if del_btn and n_selected:
-                        delete_historical_prices(to_delete[['securities_id', 'date']].to_dict('records'))
-                        get_price_anomalies.clear()
-                        st.success(f"Deleted {n_selected} price record(s).")
-                        st.rerun()
+                        st.session_state[_del_ck] = True
                     if del_all_btn:
-                        delete_historical_prices(df_anomalies[['securities_id', 'date']].to_dict('records'))
-                        get_price_anomalies.clear()
-                        st.success(f"Deleted {n_visible} price record(s).")
-                        st.rerun()
+                        st.session_state[_del_all_ck] = True
+
+                    if st.session_state.get(_del_ck):
+                        st.warning(f"⚠️ Delete **{n_selected}** selected price record(s)? This cannot be undone.")
+                        _cn, _cy, _ = st.columns([1, 1, 3])
+                        with _cn:
+                            if st.button("✖ Cancel", key=f"mkt_pq_del_cancel_{inv_sec_id}", width="stretch"):
+                                st.session_state[_del_ck] = False
+                                st.rerun()
+                        with _cy:
+                            if st.button("✔ Yes, delete", type="primary", key=f"mkt_pq_del_yes_{inv_sec_id}", width="stretch"):
+                                delete_historical_prices(to_delete[['securities_id', 'date']].to_dict('records'))
+                                get_price_anomalies.clear()
+                                st.session_state[_del_ck] = False
+                                st.success(f"Deleted {n_selected} price record(s).")
+                                st.rerun()
+
+                    if st.session_state.get(_del_all_ck):
+                        st.warning(f"⚠️ Delete **all {n_visible}** listed price record(s)? This cannot be undone.")
+                        _cn, _cy, _ = st.columns([1, 1, 3])
+                        with _cn:
+                            if st.button("✖ Cancel", key=f"mkt_pq_del_all_cancel_{inv_sec_id}", width="stretch"):
+                                st.session_state[_del_all_ck] = False
+                                st.rerun()
+                        with _cy:
+                            if st.button("✔ Yes, delete all", type="primary", key=f"mkt_pq_del_all_yes_{inv_sec_id}", width="stretch"):
+                                delete_historical_prices(df_anomalies[['securities_id', 'date']].to_dict('records'))
+                                get_price_anomalies.clear()
+                                st.session_state[_del_all_ck] = False
+                                st.success(f"Deleted {n_visible} price record(s).")
+                                st.rerun()
 
             # ─────────────────────────────────────────────────────────────────
             # SUB-TAB: Dummy Prices (scoped to the selected security)
@@ -829,18 +856,36 @@ def render_market_data():
                         "closes; Price is the effective realised price (Total ÷ Qty)."
                     )
 
+                    _norm_ck = f"mkt_ni_norm_confirm_{inv_sec_id}"
                     col_norm, col_info = st.columns([1, 4])
                     with col_norm:
                         if st.button(
                                 f"⚖ Normalize ({len(df_dummy):,})", type="primary",
                                 width="stretch", key=f"mkt_ni_norm_btn_{inv_sec_id}"):
-                            ids     = df_dummy['investments_id'].tolist()
-                            updated = normalize_investment_prices(ids)
-                            get_investments_with_dummy_prices.clear()
-                            st.success(f"Updated {updated} investment row(s).")
-                            st.rerun()
+                            st.session_state[_norm_ck] = True
                     with col_info:
                         st.caption("Normalizes only the rows shown above (for this security).")
+
+                    if st.session_state.get(_norm_ck):
+                        st.warning(
+                            f"⚠️ This will overwrite prices and quantities for "
+                            f"**{len(df_dummy):,}** investment row(s). This cannot be undone."
+                        )
+                        _cn, _cy, _ = st.columns([1, 1, 3])
+                        with _cn:
+                            if st.button("✖ Cancel", key=f"mkt_ni_norm_cancel_{inv_sec_id}",
+                                         width="stretch"):
+                                st.session_state[_norm_ck] = False
+                                st.rerun()
+                        with _cy:
+                            if st.button("✔ Yes, normalize", type="primary",
+                                         key=f"mkt_ni_norm_yes_{inv_sec_id}", width="stretch"):
+                                ids     = df_dummy['investments_id'].tolist()
+                                updated = normalize_investment_prices(ids)
+                                get_investments_with_dummy_prices.clear()
+                                st.session_state[_norm_ck] = False
+                                st.success(f"Updated {updated} investment row(s).")
+                                st.rerun()
 
                     st.divider()
                     col_rh, col_rh_info = st.columns([1, 4])

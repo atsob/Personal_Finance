@@ -3303,3 +3303,42 @@ def get_price_returns(lookback_days: int = 252, account_ids: tuple = None):
     df['date'] = pd.to_datetime(df['date'])
     wide = df.pivot_table(index='date', columns='ticker', values='close', aggfunc='mean')
     return wide
+
+
+# ======================================================
+# A8. BENCHMARK RETURNS
+# ======================================================
+
+@st.cache_data(ttl=3600)
+def get_benchmark_candidates(min_days: int = 30):
+    """Securities with enough price history to serve as a benchmark."""
+    conn = get_connection()
+    df = pd.read_sql("""
+        SELECT s.Securities_Id AS id, s.Securities_Name AS name, s.Ticker AS ticker,
+               COUNT(hp.Date) AS price_days
+        FROM Securities s
+        JOIN Historical_Prices hp ON hp.Securities_Id = s.Securities_Id
+        GROUP BY s.Securities_Id, s.Securities_Name, s.Ticker
+        HAVING COUNT(hp.Date) >= %(min_days)s
+        ORDER BY s.Securities_Name
+    """, conn, params={"min_days": min_days})
+    conn.close()
+    return df
+
+
+@st.cache_data(ttl=3600)
+def get_benchmark_returns(securities_id: int, lookback_days: int = 252):
+    """Daily close prices for a benchmark security as a date-indexed Series."""
+    conn = get_connection()
+    df = pd.read_sql("""
+        SELECT hp.Date AS date, hp.Close AS close
+        FROM Historical_Prices hp
+        WHERE hp.Securities_Id = %(sec_id)s
+          AND hp.Date >= CURRENT_DATE - (%(lookback)s || ' days')::INTERVAL
+        ORDER BY hp.Date
+    """, conn, params={"sec_id": securities_id, "lookback": lookback_days})
+    conn.close()
+    if df.empty:
+        return pd.Series(dtype=float)
+    df['date'] = pd.to_datetime(df['date'])
+    return df.set_index('date')['close']

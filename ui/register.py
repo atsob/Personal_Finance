@@ -282,7 +282,32 @@ def _render_transaction_table(acc_id, payee_options, acc_options, cat_options, t
             disabled=len(_all_ids) == 0,
         )
 
-    # Confirmation state key for "Move All"
+    # ── Confirmation: Move Selected ───────────────────────────────────────
+    _move_sel_ck = f"confirm_move_sel_{acc_id}_{tab_key}"
+    if _move_btn:
+        st.session_state[_move_sel_ck] = True
+
+    if st.session_state.get(_move_sel_ck) and _selected_ids:
+        _target_name = _move_targets.get(_move_target_id, "selected account")
+        st.warning(
+            f"⚠️ Move **{len(_selected_ids)} selected transaction(s)** to **{_target_name}**? "
+            "This cannot be undone automatically."
+        )
+        _ca, _cb, _ = st.columns([1, 1, 3])
+        with _ca:
+            if _ca.button("✖ Cancel", key=f"confirm_move_sel_cancel_{acc_id}_{tab_key}", width="stretch"):
+                st.session_state[_move_sel_ck] = False
+                st.rerun()
+        with _cb:
+            if _cb.button("✔ Yes, move", type="primary", key=f"confirm_move_sel_yes_{acc_id}_{tab_key}", width="stretch"):
+                st.session_state[_move_sel_ck] = False
+                _move_btn = True   # fall through to existing move logic below
+            else:
+                _move_btn = False  # keep armed but don't execute yet
+    else:
+        _move_btn = False
+
+    # ── Confirmation: Move All ────────────────────────────────────────────
     _confirm_key = f"confirm_move_all_{acc_id}_{tab_key}"
     if _move_all_btn:
         st.session_state[_confirm_key] = True
@@ -293,9 +318,9 @@ def _render_transaction_table(acc_id, payee_options, acc_options, cat_options, t
             f"⚠️ You are about to move **all {len(_all_ids)} transaction(s)** from this account "
             f"to **{_target_name}**. This cannot be undone automatically. Are you sure?"
         )
-        _ca, _cb = st.columns(2)
-        _confirm_ok  = _ca.button("✅ Yes, move all", key=f"confirm_ok_{acc_id}_{tab_key}")
-        _confirm_cancel = _cb.button("❌ Cancel",      key=f"confirm_cancel_{acc_id}_{tab_key}", type="primary")
+        _ca, _cb, _ = st.columns([1, 1, 3])
+        _confirm_cancel = _ca.button("✖ Cancel",       key=f"confirm_cancel_{acc_id}_{tab_key}", width="stretch")
+        _confirm_ok     = _cb.button("✔ Yes, move all", key=f"confirm_ok_{acc_id}_{tab_key}",    width="stretch", type="primary")
 
         if _confirm_cancel:
             st.session_state.pop(_confirm_key, None)

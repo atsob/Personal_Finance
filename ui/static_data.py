@@ -231,17 +231,28 @@ def render_static_data():
                 _from_cat_name = _from_cat_options.get(_cat_from_id, "")
                 _to_cat_name   = _to_cat_options.get(_cat_to_id, "")
                 _splits_count  = int(df_cats_with_splits.loc[df_cats_with_splits["categories_id"] == _cat_from_id, "splits_count"].iloc[0])
-                st.warning(f"This will move **{_splits_count} split(s)** from **{_from_cat_name}** → **{_to_cat_name}**. This cannot be undone.")
                 if st.button("▶️ Merge Category Splits", type="primary", key="sd_merge_cat_btn"):
-                    with st.spinner(f"Moving {_splits_count} splits…"):
-                        try:
-                            with get_db() as conn:
-                                cur = conn.cursor()
-                                cur.execute("UPDATE Splits SET Categories_Id = %s WHERE Categories_Id = %s", (_cat_to_id, _cat_from_id))
-                            st.success(f"✅ {_splits_count} split(s) moved from **{_from_cat_name}** to **{_to_cat_name}** successfully.")
+                    st.session_state['sd_merge_cat_confirm'] = True
+
+                if st.session_state.get('sd_merge_cat_confirm'):
+                    st.warning(f"⚠️ This will move **{_splits_count} split(s)** from **{_from_cat_name}** → **{_to_cat_name}**. This cannot be undone.")
+                    _cn, _cy, _ = st.columns([1, 1, 3])
+                    with _cn:
+                        if st.button("✖ Cancel", key="sd_merge_cat_cancel", width="stretch"):
+                            st.session_state['sd_merge_cat_confirm'] = False
                             st.rerun()
-                        except Exception as e:
-                            st.error(f"❌ Error during merge: {e}")
+                    with _cy:
+                        if st.button("✔ Yes, merge", type="primary", key="sd_merge_cat_yes", width="stretch"):
+                            with st.spinner(f"Moving {_splits_count} splits…"):
+                                try:
+                                    with get_db() as conn:
+                                        cur = conn.cursor()
+                                        cur.execute("UPDATE Splits SET Categories_Id = %s WHERE Categories_Id = %s", (_cat_to_id, _cat_from_id))
+                                    st.session_state['sd_merge_cat_confirm'] = False
+                                    st.success(f"✅ {_splits_count} split(s) moved from **{_from_cat_name}** to **{_to_cat_name}** successfully.")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"❌ Error during merge: {e}")
 
     # ── Payees ────────────────────────────────────────────────────────────────
     with t3:
@@ -356,22 +367,33 @@ def render_static_data():
                 _to_payee_name   = _to_payee_options.get(_payee_to_id, "")
                 _transactions_count = int(df_payees_with_transactions.loc[
                     df_payees_with_transactions["payees_id"] == _payee_from_id, "transactions_count"].iloc[0])
-                st.warning(f"This will move **{_transactions_count} transaction(s)** from **{_from_payee_name}** → **{_to_payee_name}**. This cannot be undone.")
                 if st.button("▶️ Merge Payee Transactions", type="primary", key="sd_merge_payee_btn"):
-                    with st.spinner(f"Moving {_transactions_count} transactions…"):
-                        try:
-                            with get_db() as conn:
-                                cur = conn.cursor()
-                                cur.execute("ALTER TABLE Transactions DISABLE TRIGGER trg_update_balance;")
-                                conn.commit()
-                                cur.execute("UPDATE Transactions SET Payees_Id = %s WHERE Payees_Id = %s", (_payee_to_id, _payee_from_id))
-                                conn.commit()
-                                cur.execute("ALTER TABLE Transactions ENABLE TRIGGER trg_update_balance;")
-                                conn.commit()
-                            st.success(f"✅ {_transactions_count} transaction(s) moved from **{_from_payee_name}** to **{_to_payee_name}** successfully.")
+                    st.session_state['sd_merge_payee_confirm'] = True
+
+                if st.session_state.get('sd_merge_payee_confirm'):
+                    st.warning(f"⚠️ This will move **{_transactions_count} transaction(s)** from **{_from_payee_name}** → **{_to_payee_name}**. This cannot be undone.")
+                    _cn, _cy, _ = st.columns([1, 1, 3])
+                    with _cn:
+                        if st.button("✖ Cancel", key="sd_merge_payee_cancel", width="stretch"):
+                            st.session_state['sd_merge_payee_confirm'] = False
                             st.rerun()
-                        except Exception as e:
-                            st.error(f"❌ Error during merge: {e}")
+                    with _cy:
+                        if st.button("✔ Yes, merge", type="primary", key="sd_merge_payee_yes", width="stretch"):
+                            with st.spinner(f"Moving {_transactions_count} transactions…"):
+                                try:
+                                    with get_db() as conn:
+                                        cur = conn.cursor()
+                                        cur.execute("ALTER TABLE Transactions DISABLE TRIGGER trg_update_balance;")
+                                        conn.commit()
+                                        cur.execute("UPDATE Transactions SET Payees_Id = %s WHERE Payees_Id = %s", (_payee_to_id, _payee_from_id))
+                                        conn.commit()
+                                        cur.execute("ALTER TABLE Transactions ENABLE TRIGGER trg_update_balance;")
+                                        conn.commit()
+                                    st.session_state['sd_merge_payee_confirm'] = False
+                                    st.success(f"✅ {_transactions_count} transaction(s) moved from **{_from_payee_name}** to **{_to_payee_name}** successfully.")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"❌ Error during merge: {e}")
 
     # ── Accounts ──────────────────────────────────────────────────────────────
     with t4:

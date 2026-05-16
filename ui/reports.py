@@ -24,6 +24,8 @@ from database.queries import (
     get_portfolio_weights,
     get_investable_portfolio_value,
     get_investment_accounts,
+    get_benchmark_candidates,
+    get_benchmark_returns,
 )
 from data.downloaders import download_historical_fx, download_historical_prices_from_tradingview, download_historical_prices_from_yahoo, download_bond_prices_from_solidus, download_securities_info_from_yahoo
 from ui.components import color_negative_red, color_value, custom_metric, get_color, copy_df_button
@@ -111,6 +113,104 @@ def render_reports():
                 )
                 fig_dd.update_layout(yaxis_tickformat='.1f', margin=dict(l=0, r=0, t=50, b=0))
                 st.plotly_chart(fig_dd, width='stretch')
+
+                # ── Benchmark Comparison (price performance, indexed to 100) ───
+                st.markdown("#### 📊 Benchmark Comparison (Price Performance)")
+                df_bm_list = get_benchmark_candidates(min_days=30)
+                bm_idx_opts = {"— None —": None}
+                bm_idx_opts.update({row["name"]: int(row["id"]) for _, row in df_bm_list.iterrows()})
+
+                earliest_date = pd.to_datetime(min_inv_date)
+                lookback_bm   = max(60, (pd.Timestamp.today() - earliest_date).days + 30)
+
+                col_bm_sel, col_bm_lb = st.columns([3, 1])
+                with col_bm_sel:
+                    bm_idx_label = st.selectbox(
+                        "Overlay benchmark",
+                        list(bm_idx_opts.keys()),
+                        key="pos_chart_benchmark",
+                        help=(
+                            "Portfolio line shows **cumulative price return** of your holdings "
+                            "(value-weighted, daily prices) — cash flows like buys, sells and "
+                            "bond maturities are excluded so the comparison is apples-to-apples."
+                        ),
+                    )
+                with col_bm_lb:
+                    bm_smooth = st.selectbox(
+                        "Resample",
+                        ["Daily", "Weekly", "Monthly"],
+                        index=2,
+                        key="pos_chart_bm_resample",
+                        help="Resample frequency for the chart.",
+                    )
+                bm_idx_sec_id = bm_idx_opts[bm_idx_label]
+                resample_map  = {"Daily": "D", "Weekly": "W", "Monthly": "ME"}
+                resample_freq = resample_map[bm_smooth]
+
+                # Portfolio performance: cumulative return from daily price changes
+                # (value-weighted by current holdings; cash flows are invisible here)
+                df_px = get_price_returns(lookback_bm, None)
+                fig_idx = go.Figure()
+
+                if df_px is not None and not df_px.empty:
+                    df_w = get_portfolio_weights(None)
+                    if not df_w.empty:
+                        wmap  = dict(zip(df_w["ticker"], df_w["weight"]))
+                        avail = [c for c in df_px.columns if c in wmap]
+                        if avail:
+                            w = pd.Series([wmap[t] for t in avail], index=avail)
+                            w = w / w.sum()
+                            port_ret = df_px[avail].pct_change().dropna().dot(w)
+                        else:
+                            port_ret = df_px.pct_change().dropna().mean(axis=1)
+                    else:
+                        port_ret = df_px.pct_change().dropna().mean(axis=1)
+
+                    port_cum = (1 + port_ret).cumprod()
+                    port_cum = port_cum[port_cum.index >= earliest_date]
+                    port_cum = port_cum.resample(resample_freq).last().dropna()
+                    port_indexed = port_cum / port_cum.iloc[0] * 100
+
+                    fig_idx.add_trace(go.Scatter(
+                        x=port_indexed.index, y=port_indexed.values,
+                        name="Portfolio (price return)", line=dict(color="white", width=3),
+                    ))
+
+                if bm_idx_sec_id is not None:
+                    bm_prices = get_benchmark_returns(bm_idx_sec_id, lookback_bm)
+                    if not bm_prices.empty:
+                        # Align to portfolio date grid, forward-fill across calendar gaps
+                        if df_px is not None and not df_px.empty:
+                            all_dates  = port_ret.index.union(bm_prices.index).sort_values()
+                            bm_aligned = bm_prices.reindex(all_dates).ffill().reindex(port_ret.index)
+                            bm_ret     = bm_aligned.pct_change().dropna()
+                            bm_cum     = (1 + bm_ret).cumprod()
+                        else:
+                            bm_cum = (1 + bm_prices.pct_change().dropna()).cumprod()
+                        bm_cum     = bm_cum[bm_cum.index >= earliest_date]
+                        bm_cum     = bm_cum.resample(resample_freq).last().dropna()
+                        bm_indexed = bm_cum / bm_cum.iloc[0] * 100
+                        fig_idx.add_trace(go.Scatter(
+                            x=bm_indexed.index, y=bm_indexed.values,
+                            name=bm_idx_label, line=dict(dash="dash", width=2),
+                        ))
+                    else:
+                        st.caption(f"No price history found for {bm_idx_label} in the selected period.")
+
+                if fig_idx.data:
+                    fig_idx.update_layout(
+                        title="<b>Portfolio Price Return vs Benchmark (Indexed to 100)</b>",
+                        template="plotly_dark",
+                        yaxis_title="Cumulative return (start = 100)",
+                        margin=dict(l=0, r=0, t=50, b=0),
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    )
+                    st.plotly_chart(fig_idx, width='stretch')
+                    st.caption(
+                        "Portfolio return is the **daily price return** of your holdings, "
+                        "value-weighted by current position size. Buys, sells, dividends received as cash, "
+                        "and bond maturities do not affect this line — only price movements do."
+                    )
 
         with tab_data:
             st.subheader("📋 Monthly Summary per Account")
@@ -2048,7 +2148,7 @@ def render_income_expense_reports():
                         height=450,
                         legend=dict(groupclick='toggleitem'),
                     )
-                    st.plotly_chart(fig_bar, use_container_width=True)
+                    st.plotly_chart(fig_bar, width="stretch")
 
                     st.markdown("---")
 
@@ -2096,7 +2196,7 @@ def render_income_expense_reports():
                                     title_font=dict(size=18),
                                     margin=dict(t=60, b=20, l=20, r=20),
                                 )
-                                st.plotly_chart(fig_pie, use_container_width=True)
+                                st.plotly_chart(fig_pie, width="stretch")
                             else:
                                 st.info(f"No {group_label} data available.")
                 
@@ -2663,7 +2763,7 @@ def render_asset_allocation():
             },
             num_rows="dynamic",
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
             key="alloc_target_editor",
         )
 
@@ -4402,12 +4502,24 @@ def render_risk_metrics(account_ids: tuple = None):
         "- **Sortino Ratio** — like Sharpe but only penalises downside volatility. Preferred when returns are skewed.\n"
         "- **Max Drawdown** — largest peak-to-trough decline in the period; indicates the worst-case loss an investor would have suffered.\n"
         "- **VaR 95%** — on a typical day there is only a 5% chance the portfolio loses *more* than this percentage.\n"
-        "- **CVaR 95%** — average loss on the worst 5% of days (also called Expected Shortfall); a more conservative tail-risk measure.\n\n"
+        "- **CVaR 95%** — average loss on the worst 5% of days (also called Expected Shortfall); a more conservative tail-risk measure.\n"
+        "- **Beta** — sensitivity of portfolio returns to the chosen benchmark. Beta > 1 means more volatile than the market; < 1 means less.\n"
+        "- **Alpha (Jensen's)** — annualised excess return above what CAPM predicts given your Beta. Positive alpha means outperformance.\n\n"
         "The rolling Sharpe chart shows how risk-adjusted performance has changed over time — dips below zero indicate periods of underperformance vs. the risk-free rate."
     )
 
-    lookback  = st.slider("Lookback days", min_value=60, max_value=756, value=252, step=20, key="risk_lookback",
-                          help="Number of calendar days of price history to include. 252 ≈ 1 trading year.")
+    col_lb, col_bm = st.columns([2, 2])
+    with col_lb:
+        lookback = st.slider("Lookback days", min_value=60, max_value=756, value=252, step=20, key="risk_lookback",
+                             help="Number of calendar days of price history to include. 252 ≈ 1 trading year.")
+    with col_bm:
+        df_bm_cands = get_benchmark_candidates(min_days=30)
+        bm_options  = {"— None —": None}
+        bm_options.update({row["name"]: int(row["id"]) for _, row in df_bm_cands.iterrows()})
+        bench_label = st.selectbox("Benchmark for Beta / Alpha", list(bm_options.keys()), key="risk_benchmark",
+                                   help="Select any security with price history to compute Beta and Jensen's Alpha.")
+        bench_sec_id = bm_options[bench_label]
+
     df_prices = get_price_returns(lookback, account_ids)
 
     if df_prices is None or df_prices.empty or df_prices.shape[1] < 1:
@@ -4456,15 +4568,41 @@ def render_risk_metrics(account_ids: tuple = None):
         var_95_eur  = abs(var_95)  * portfolio_value
         cvar_95_eur = abs(cvar_95) * portfolio_value
 
+        # Beta & Alpha vs chosen benchmark
+        # Benchmark is forward-filled onto the portfolio's date grid so that
+        # different trading calendars (e.g. Greek vs US market holidays) don't
+        # produce an empty intersection.
+        beta  = None
+        alpha = None
+        if bench_sec_id is not None:
+            bench_prices = get_benchmark_returns(bench_sec_id, lookback)
+            if not bench_prices.empty:
+                all_dates     = port_returns.index.union(bench_prices.index).sort_values()
+                bench_aligned = bench_prices.reindex(all_dates).ffill().reindex(port_returns.index)
+                bench_ret     = bench_aligned.pct_change().dropna()
+                common_idx    = port_returns.index.intersection(bench_ret.index)
+                if len(common_idx) >= 30:
+                    p = port_returns.loc[common_idx].values
+                    b = bench_ret.loc[common_idx].values
+                    bench_var = np.var(b)
+                    if bench_var > 0:
+                        beta  = float(np.cov(p, b)[0, 1] / bench_var)
+                        bench_ann_ret = (1 + bench_ret.mean()) ** 252 - 1
+                        alpha = float(ann_return - (rf_rate + beta * (bench_ann_ret - rf_rate)))
+
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Ann. Volatility", f"{ann_vol * 100:.2f}%")
         m2.metric("Sharpe Ratio",    f"{sharpe:.2f}")
         m3.metric("Sortino Ratio",   f"{sortino:.2f}")
         m4.metric("Max Drawdown",    f"{max_dd * 100:.2f}%")
 
-        m5, m6, _c1, _c2 = st.columns(4)
+        m5, m6, m7, m8 = st.columns(4)
         m5.metric("VaR 95% (daily)",  f"{var_95 * 100:.2f}%  ·  € {var_95_eur:,.0f}")
         m6.metric("CVaR 95% (daily)", f"{cvar_95 * 100:.2f}%  ·  € {cvar_95_eur:,.0f}")
+        m7.metric("Beta",  f"{beta:.2f}"  if beta  is not None else "—",
+                  help=f"vs {bench_label}" if bench_sec_id else None)
+        m8.metric("Alpha (annualised)", f"{alpha * 100:.2f}%" if alpha is not None else "—",
+                  help=f"Jensen's Alpha vs {bench_label}" if bench_sec_id else None)
 
         rolling_sharpe = port_returns.rolling(30).apply(
             lambda x: (x.mean() * 252 - rf_rate) / (x.std() * np.sqrt(252)) if x.std() > 0 else 0,

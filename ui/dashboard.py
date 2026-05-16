@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 from ui.components import format_qty_display, color_negative_red, style_qty_display, copy_df_button
-from database.queries import get_hist_net_worth_data, get_transaction_anomalies, get_weekly_summaries, get_all_accounts_for_nwr, get_nwr_account_selection, get_savings_rate_data
+from database.queries import get_hist_net_worth_data, get_transaction_anomalies, get_weekly_summaries, get_all_accounts_for_nwr, get_nwr_account_selection, get_savings_rate_data, get_cash_flow_forecast, get_category_hierarchy
 from database.connection import get_connection
 from database.crud import update_accounts_balances, update_holdings, update_investment_balances, update_pension_balances, save_nwr_account_selection
 from datetime import datetime
@@ -271,21 +271,26 @@ def render_dashboard(conn):
             st.plotly_chart(fig_pie, width="stretch")
 
         # ── Summary metrics ───────────────────────────────────────────────
-        # Savings rate for current month vs previous month
+        # Savings rate: last complete month, bank/cash accounts only
         _sr_delta_str = ""
         _sr_income = _sr_expenses = 0.0
+        _sr_month_label = ""
         try:
             _sr_df = get_savings_rate_data(months=2)
             if len(_sr_df) >= 2:
-                _sr_cur       = _sr_df.iloc[-1]["savings_rate_pct"]
-                _sr_prev      = _sr_df.iloc[-2]["savings_rate_pct"]
-                _sr_delta_str = f"{_sr_cur - _sr_prev:+.1f}%"
-                _sr_income    = float(_sr_df.iloc[-1]["income_eur"])
-                _sr_expenses  = float(_sr_df.iloc[-1]["expenses_eur"])
+                _sr_cur         = _sr_df.iloc[-1]["savings_rate_pct"]
+                _sr_prev        = _sr_df.iloc[-2]["savings_rate_pct"]
+                _sr_prev_label  = pd.to_datetime(_sr_df.iloc[-2]["month"]).strftime("%b %Y")
+                _sr_delta_pp    = _sr_cur - _sr_prev
+                _sr_delta_str   = f"{_sr_delta_pp:+.1f} pp vs {_sr_prev_label}"
+                _sr_income      = float(_sr_df.iloc[-1]["income_eur"])
+                _sr_expenses    = float(_sr_df.iloc[-1]["expenses_eur"])
+                _sr_month_label = pd.to_datetime(_sr_df.iloc[-1]["month"]).strftime("%b %Y")
             elif len(_sr_df) == 1:
-                _sr_cur      = _sr_df.iloc[0]["savings_rate_pct"]
-                _sr_income   = float(_sr_df.iloc[0]["income_eur"])
-                _sr_expenses = float(_sr_df.iloc[0]["expenses_eur"])
+                _sr_cur         = _sr_df.iloc[0]["savings_rate_pct"]
+                _sr_income      = float(_sr_df.iloc[0]["income_eur"])
+                _sr_expenses    = float(_sr_df.iloc[0]["expenses_eur"])
+                _sr_month_label = pd.to_datetime(_sr_df.iloc[0]["month"]).strftime("%b %Y")
             else:
                 _sr_cur = 0.0
         except Exception:
@@ -305,13 +310,30 @@ def render_dashboard(conn):
         m4, m5, m6 = st.columns(3)
         m4.metric("Pension",      f"€ {_pension:,.2f}")
         m5.metric("Investments",  f"€ {_inv:,.2f}")
-        m6.metric("Savings Rate", f"{_sr_cur:.1f}%", delta=_sr_delta_str if _sr_delta_str else None)
+        _sr_label = f"Cash Savings Rate · {_sr_month_label}" if _sr_month_label else "Cash Savings Rate"
+        m6.metric(
+            _sr_label,
+            f"{_sr_cur:.1f}%",
+            delta=_sr_delta_str if _sr_delta_str else None,
+            help=(
+                f"Last complete month ({_sr_month_label}). "
+                "Covers bank & cash accounts only — excludes investment account dividends, "
+                "interest and realised P&L. Delta = change vs the prior month."
+            ),
+        )
         if _sr_income or _sr_expenses:
+            _sr_saved = _sr_income - _sr_expenses
             m6.markdown(
-                f'<div style="font-size:0.82em; margin-top:-8px">'
+                f'<div style="font-size:0.82em; margin-top:-8px; line-height:1.6">'
+                f'<span style="color:#888">% of income saved (bank accounts only)</span><br>'
                 f'<span style="color:#2ECC71">▲ € {_sr_income:,.0f}</span>'
-                f' &nbsp; '
+                f'&nbsp;<span style="color:#888; font-size:0.9em">income</span>'
+                f' &nbsp;&nbsp; '
                 f'<span style="color:#E74C3C">▼ € {_sr_expenses:,.0f}</span>'
+                f'&nbsp;<span style="color:#888; font-size:0.9em">expenses</span>'
+                f' &nbsp;&nbsp; '
+                f'<span style="color:#F39C12">€ {_sr_saved:,.0f}</span>'
+                f'&nbsp;<span style="color:#888; font-size:0.9em">saved</span>'
                 f'</div>',
                 unsafe_allow_html=True,
             )
@@ -344,37 +366,89 @@ def render_dashboard(conn):
         # ── Upcoming Bills widget ─────────────────────────────────────────
         st.markdown("#### \U0001f4c5 Upcoming Bills (Next 14 Days)")
         try:
+            _horizon = pd.Timestamp.today().normalize() + pd.Timedelta(days=14)
+
+            # Build full category-path lookup once (name → full_path)
+            _cat_hier   = get_category_hierarchy()
+            _cat_map    = dict(zip(_cat_hier['name'], _cat_hier['full_path']))
+
+            # 1. Confirmed: explicitly entered future transactions (recursive category path)
             _bills_conn = get_connection()
-            df_bills = pd.read_sql("""
+            df_confirmed = pd.read_sql("""
+                WITH RECURSIVE cat_path AS (
+                    SELECT Categories_Id,
+                           Categories_Name::TEXT AS full_path,
+                           Categories_Id_Parent
+                    FROM Categories
+                    WHERE Categories_Id_Parent IS NULL
+                    UNION ALL
+                    SELECT c.Categories_Id,
+                           cp.full_path || ' : ' || c.Categories_Name,
+                           c.Categories_Id_Parent
+                    FROM Categories c
+                    JOIN cat_path cp ON c.Categories_Id_Parent = cp.Categories_Id
+                )
                 SELECT
                     t.Date         AS date,
                     p.Payees_Name  AS payee,
-                    t.Total_Amount AS amount,
-                    STRING_AGG(DISTINCT c.Categories_Name, ', ') AS category
+                    t.Total_Amount AS amount_eur,
+                    STRING_AGG(DISTINCT cp.full_path, ', ') AS category
                 FROM Transactions t
-                LEFT JOIN Payees p      ON p.Payees_Id      = t.Payees_Id
-                LEFT JOIN Splits s      ON s.Transactions_Id = t.Transactions_Id
-                LEFT JOIN Categories c  ON c.Categories_Id   = s.Categories_Id
+                LEFT JOIN Payees p    ON p.Payees_Id       = t.Payees_Id
+                LEFT JOIN Splits s    ON s.Transactions_Id = t.Transactions_Id
+                LEFT JOIN cat_path cp ON cp.Categories_Id  = s.Categories_Id
                 WHERE t.Date > CURRENT_DATE
                   AND t.Date <= CURRENT_DATE + INTERVAL '14 days'
+                  AND t.Transfers_Id IS NULL
                 GROUP BY t.Transactions_Id, t.Date, p.Payees_Name, t.Total_Amount
                 ORDER BY t.Date
             """, _bills_conn)
             _bills_conn.close()
+
+            df_confirmed['date'] = pd.to_datetime(df_confirmed['date'])
+            df_confirmed['type'] = 'Confirmed'
+
+            # 2. Projected: recurring payees whose next expected date falls in the window
+            _df_future, _df_recurring = get_cash_flow_forecast(months_back=3)
+            if not _df_recurring.empty:
+                _df_recurring['next_expected_date'] = pd.to_datetime(_df_recurring['next_expected_date'])
+                _today = pd.Timestamp.today().normalize()
+                df_projected = _df_recurring[
+                    (_df_recurring['next_expected_date'] > _today) &
+                    (_df_recurring['next_expected_date'] <= _horizon)
+                ][['next_expected_date', 'payees_name', 'avg_amount_eur', 'category']].copy()
+                df_projected.columns = ['date', 'payee', 'amount_eur', 'category']
+                # Map leaf category name → full hierarchical path
+                df_projected['category'] = df_projected['category'].map(_cat_map).fillna(df_projected['category'])
+                df_projected['type'] = 'Projected'
+            else:
+                df_projected = pd.DataFrame(columns=['date', 'payee', 'amount_eur', 'category', 'type'])
+
+            # 3. Merge, sort, display
+            df_bills = pd.concat([df_confirmed, df_projected], ignore_index=True)
+            df_bills  = df_bills.sort_values('date').reset_index(drop=True)
+
             if df_bills.empty:
                 st.success("No bills due in the next 14 days ✅")
             else:
-                df_bills['date'] = pd.to_datetime(df_bills['date']).dt.strftime('%Y-%m-%d')
+                df_bills['date'] = df_bills['date'].dt.strftime('%Y-%m-%d')
                 st.dataframe(
-                    df_bills.style.format({"amount": "{:,.2f} €"}),
-                    hide_index=True, width="stretch",
+                    df_bills,
+                    hide_index=True,
+                    width="stretch",
                     column_config={
-                        "date":     "Date",
-                        "payee":    "Payee",
-                        "amount":   st.column_config.NumberColumn("Amount (€)", format="%.2f €"),
-                        "category": "Category",
+                        "date":      "Date",
+                        "payee":     "Payee",
+                        "amount_eur": st.column_config.NumberColumn("Amount (€)", format="%.2f €"),
+                        "category":  "Category",
+                        "type":      st.column_config.TextColumn("Type",
+                                         help="Confirmed = entered in the register · Projected = estimated from last 3 months of recurring patterns"),
                     },
+                    column_order=["date", "payee", "amount_eur", "category", "type"],
                 )
+                _n_proj = len(df_projected)
+                if _n_proj:
+                    st.caption(f"{_n_proj} projected payment(s) estimated from the last 3 months of recurring patterns.")
         except Exception as _e:
             st.info(f"Upcoming bills unavailable: {_e}")
 
