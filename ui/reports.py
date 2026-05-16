@@ -11,6 +11,7 @@ from database.queries import (
     get_nwr_security_detail,
     get_pnl_report_data, get_income_expense_data, get_portfolio_signals,
     get_cash_flow_forecast, get_dividend_tracker_data, get_asset_allocation_data,
+    get_sector_allocation_data, get_allocation_targets, save_allocation_targets,
     get_fx_exposure_data, get_bond_schedule_data,
 )
 from data.downloaders import download_historical_fx, download_historical_prices_from_tradingview, download_historical_prices_from_yahoo, download_bond_prices_from_solidus, download_securities_info_from_yahoo
@@ -27,12 +28,9 @@ def render_reports():
             "Net Worth Report",
             "Income & Expense",
             "Cash Flow Forecast",
-            "Historical Investment Positions",
-            "Investments Performance",
-            "Asset Allocation",
+            "Investment Positions",
+            "Investment Performance",
             "Securities & Portfolio Analysis",
-            "FX Exposure",
-            "Bond Schedule",
         ],
         key="hist_sub_nav"
     )
@@ -40,12 +38,9 @@ def render_reports():
     if hist_sub_menu == "Net Worth Report":
         render_net_worth_report()
 
-    elif hist_sub_menu == "Historical Investment Positions":
-        st.subheader("📈 Investments Position Progress (Monthly)")
-        
-        # ... (Start Date logic remains same) ...
+    elif hist_sub_menu == "Investment Positions":
         last_day_prev_month = pd.Timestamp.now().replace(day=1) - pd.Timedelta(days=1)
-        
+
         min_inv_date = st.sidebar.date_input(
             "📅 Start Date",
             value=st.session_state.inv_date_val,
@@ -61,108 +56,98 @@ def render_reports():
             st.rerun()
 
         df_raw = get_hist_inv_positions_data(min_inv_date)
-        
-        if df_raw.empty:
-            st.warning("No data found for the selected period.")
-            return
 
-        # 1. Προετοιμασία δεδομένων για το Γράφημα (Pivot by Account)
-        df_acc_daily = df_raw.groupby(['date', 'accounts_name'])['value_in_eur'].sum().reset_index()
-        
-        # Υπολογισμός Total για κάθε ημερομηνία
-        df_total = df_raw.groupby('date')['value_in_eur'].sum().reset_index()
-        df_total['accounts_name'] = 'TOTAL'
-        
-        # Ένωση για το γράφημα
-        df_plot = pd.concat([df_acc_daily, df_total])
-        df_pivot = df_plot.pivot(index='date', columns='accounts_name', values='value_in_eur').fillna(0).reset_index()
+        tab_graph, tab_data, tab_details, tab_alloc, tab_sector, tab_fx = st.tabs([
+            "📊 Graph", "📋 Summary per Account", "🔍 Detail Analysis",
+            "🥧 Asset Allocation", "🏭 Sector & Industry", "🌍 FX Exposure",
+        ])
 
-        tab_graph, tab_data, tab_details = st.tabs(["📊 Graph", "📋 Summary per Account", "🔍 Detail Analysis"])
+        # Pre-compute pivot only when data exists; the last two tabs have their own queries.
+        if not df_raw.empty:
+            df_acc_daily = df_raw.groupby(['date', 'accounts_name'])['value_in_eur'].sum().reset_index()
+            df_total = df_raw.groupby('date')['value_in_eur'].sum().reset_index()
+            df_total['accounts_name'] = 'TOTAL'
+            df_plot  = pd.concat([df_acc_daily, df_total])
+            df_pivot = df_plot.pivot(index='date', columns='accounts_name', values='value_in_eur').fillna(0).reset_index()
+        else:
+            df_pivot = pd.DataFrame()
         
         with tab_graph:
-            fig = px.line(df_pivot, x="date", y=[c for c in df_pivot.columns if c != 'date'],
-                         title="<b>Investment Value per Account</b>", template="plotly_dark")
-            fig.for_each_trace(lambda t: t.update(line=dict(color="white", width=4) if t.name == "TOTAL" else dict(width=2)))
-            st.plotly_chart(fig, width='stretch')
+            st.subheader("📈 Investment Position Progress (Monthly)")
+            if df_pivot.empty:
+                st.warning("No data found for the selected period.")
+            else:
+                fig = px.line(df_pivot, x="date", y=[c for c in df_pivot.columns if c != 'date'],
+                             title="<b>Investment Value per Account</b>", template="plotly_dark")
+                fig.for_each_trace(lambda t: t.update(line=dict(color="white", width=4) if t.name == "TOTAL" else dict(width=2)))
+                st.plotly_chart(fig, width='stretch')
 
-            # Drawdown chart
-            st.markdown("#### 📉 Portfolio Drawdown")
-            df_dd = df_total.copy().sort_values('date')
-            df_dd['peak'] = df_dd['value_in_eur'].cummax()
-            df_dd['drawdown_pct'] = (df_dd['value_in_eur'] - df_dd['peak']) / df_dd['peak'].replace(0, float('nan')) * 100
-            max_dd = df_dd['drawdown_pct'].min()
-            st.caption(f"Max drawdown over the selected period: **{max_dd:.2f}%**")
-            fig_dd = px.area(
-                df_dd, x='date', y='drawdown_pct',
-                title="<b>Drawdown from Peak (%)</b>",
-                template="plotly_dark",
-                color_discrete_sequence=["#E74C3C"],
-                labels={'drawdown_pct': 'Drawdown (%)', 'date': 'Date'}
-            )
-            fig_dd.update_layout(yaxis_tickformat='.1f', margin=dict(l=0, r=0, t=50, b=0))
-            st.plotly_chart(fig_dd, width='stretch')
-            
+                st.markdown("#### 📉 Portfolio Drawdown")
+                df_dd = df_total.copy().sort_values('date')
+                df_dd['peak'] = df_dd['value_in_eur'].cummax()
+                df_dd['drawdown_pct'] = (df_dd['value_in_eur'] - df_dd['peak']) / df_dd['peak'].replace(0, float('nan')) * 100
+                max_dd = df_dd['drawdown_pct'].min()
+                st.caption(f"Max drawdown over the selected period: **{max_dd:.2f}%**")
+                fig_dd = px.area(
+                    df_dd, x='date', y='drawdown_pct',
+                    title="<b>Drawdown from Peak (%)</b>",
+                    template="plotly_dark",
+                    color_discrete_sequence=["#E74C3C"],
+                    labels={'drawdown_pct': 'Drawdown (%)', 'date': 'Date'}
+                )
+                fig_dd.update_layout(yaxis_tickformat='.1f', margin=dict(l=0, r=0, t=50, b=0))
+                st.plotly_chart(fig_dd, width='stretch')
 
         with tab_data:
-            # 1. Προετοιμασία δεδομένων
-            df_summary = df_pivot.sort_values('date', ascending=False).copy()
-            df_summary['date'] = pd.to_datetime(df_summary['date']).dt.strftime('%Y-%m-%d')
-            
-            # 2. Δυναμικός εντοπισμός των αριθμητικών στηλών (όλες εκτός από την 'date')
-            numeric_cols = [col for col in df_summary.columns if col != 'date']
-
-            # 3. Δημιουργία του configuration
-            col_config = {
-                # Προσθήκη του "Date" header
-                "date": st.column_config.TextColumn("Date"),
-            }
-
-            # Προσθήκη των αριθμητικών στηλών στο υπάρχον dictionary
-            for col in numeric_cols:
-                col_config[col] = st.column_config.NumberColumn(
-                    label=col,
-                    format="%,.2f €"
-                )
-
-            df_summary = df_summary.set_index('date')
-           
-            # 4. Εμφάνιση του πίνακα με το config
-            st.dataframe(
-                df_summary,
-                hide_index=False,
-                width='stretch',
-                column_config=col_config,
-            )
-            copy_df_button(df_summary, key="dl_rpt_hist_inv_summary")
+            st.subheader("📋 Monthly Summary per Account")
+            if df_pivot.empty:
+                st.warning("No data found for the selected period.")
+            else:
+                df_summary = df_pivot.sort_values('date', ascending=False).copy()
+                df_summary['date'] = pd.to_datetime(df_summary['date']).dt.strftime('%Y-%m-%d')
+                numeric_cols = [col for col in df_summary.columns if col != 'date']
+                col_config = {"date": st.column_config.TextColumn("Date")}
+                for col in numeric_cols:
+                    col_config[col] = st.column_config.NumberColumn(label=col, format="%,.2f €")
+                df_summary = df_summary.set_index('date')
+                st.dataframe(df_summary, hide_index=False, width='stretch', column_config=col_config)
+                copy_df_button(df_summary, key="dl_rpt_hist_inv_summary")
 
         with tab_details:
-            st.markdown("### 🔍 Drill-down per Security")
-            
-            # Φίλτρο ημερομηνίας για τις λεπτομέρειες
-            available_dates = sorted(df_raw['date'].unique(), reverse=True)
-            selected_date = st.selectbox("Select Snapshot Date:", available_dates)
-            
-            df_snapshot = df_raw[df_raw['date'] == selected_date].copy()
-            
-            st.dataframe(
-                df_snapshot[['accounts_name', 'securities_name', 'qty_at_date', 'price_at_date', 'value_in_eur']],
-                column_config={
-                    "accounts_name": "Account",
-                    "securities_name": "Security",
-                    "qty_at_date": st.column_config.NumberColumn("Quantity", format="%,.8f"),
-                    "price_at_date": st.column_config.NumberColumn("Price", format="%,.2f"),
-                    "value_in_eur": st.column_config.NumberColumn("Value (€)", format="%,.2f €")
-                },
-                hide_index=True,
-                width="stretch"
-            )
-            copy_df_button(df_snapshot, key="dl_rpt_hist_inv_detail")
-    
-    elif hist_sub_menu == "Investments Performance":
-        tab_report, tab_movers, tab_savings, tab_dividends = st.tabs(["📊 P&L Report", "🚀 Top Movers", "💰 Savings", "💸 Dividend Tracker"])
+            st.subheader("🔍 Drill-down per Security")
+            if df_raw.empty:
+                st.warning("No data found for the selected period.")
+            else:
+                available_dates = sorted(df_raw['date'].unique(), reverse=True)
+                selected_date = st.selectbox("Select Snapshot Date:", available_dates)
+                df_snapshot = df_raw[df_raw['date'] == selected_date].copy()
+                st.dataframe(
+                    df_snapshot[['accounts_name', 'securities_name', 'qty_at_date', 'price_at_date', 'value_in_eur']],
+                    column_config={
+                        "accounts_name":  "Account",
+                        "securities_name": "Security",
+                        "qty_at_date":    st.column_config.NumberColumn("Quantity", format="%,.8f"),
+                        "price_at_date":  st.column_config.NumberColumn("Price",    format="%,.2f"),
+                        "value_in_eur":   st.column_config.NumberColumn("Value (€)", format="%,.2f €"),
+                    },
+                    hide_index=True, width="stretch"
+                )
+                copy_df_button(df_snapshot, key="dl_rpt_hist_inv_detail")
+
+        with tab_alloc:
+            render_asset_allocation()
+
+        with tab_sector:
+            render_sector_allocation()
+
+        with tab_fx:
+            render_fx_exposure()
+
+    elif hist_sub_menu == "Investment Performance":
+        tab_report, tab_movers, tab_savings, tab_dividends, tab_bonds = st.tabs(["📊 P&L Report", "🚀 Top Movers", "💰 Savings", "💸 Dividend Tracker", "📋 Bond Schedule"])
         
         with tab_report:
-            st.subheader("📈 Investments Profit & Loss")
+            st.subheader("📈 Profit & Loss")
          
             df_pnl = get_pnl_report_data()
             if df_pnl is not None:
@@ -1172,6 +1157,9 @@ def render_reports():
         with tab_dividends:
             render_dividend_tracker()
 
+        with tab_bonds:
+            render_bond_schedule()
+
     elif hist_sub_menu == "Securities & Portfolio Analysis":
         # 1. Tabs
         tab_change, tab_volat, tab_inv_signals, tab_port_signals = st.tabs(["📈 Price Change %", "🌊 Volatility", "🎯 Investment Signals", "📢 Portfolio Action Signals"])
@@ -1523,15 +1511,6 @@ def render_reports():
 
     elif hist_sub_menu == "Cash Flow Forecast":
         render_cash_flow_forecast()
-
-    elif hist_sub_menu == "Asset Allocation":
-        render_asset_allocation()
-
-    elif hist_sub_menu == "FX Exposure":
-        render_fx_exposure()
-
-    elif hist_sub_menu == "Bond Schedule":
-        render_bond_schedule()
 
 
 
@@ -2454,6 +2433,7 @@ def render_cash_flow_forecast():
                     'date':             next_dt,
                     'amount_eur':       float(row['avg_amount_eur']),
                     'payees_name':      row['payees_name'],
+                    'category':         row.get('category', ''),
                     'avg_days_between': avg_days,
                     'currency':         row['currency'],
                 })
@@ -2557,7 +2537,7 @@ def render_cash_flow_forecast():
     st.divider()
     st.markdown("#### 🔁 Projected Recurring Payments")
     st.caption(
-        f"Payees detected in **every one** of the last **{months_back} complete months**, "
+        f"Payee + Category combinations detected in **every one** of the last **{months_back} complete months**, "
         "projected forward at their average payment interval. "
         "Payees with explicit scheduled entries are excluded to avoid double-counting."
     )
@@ -2565,12 +2545,13 @@ def render_cash_flow_forecast():
         st.info(f"No recurring payments projected within {days} days.")
     else:
         st.dataframe(
-            df_recur_proj[['date', 'payees_name', 'amount_eur', 'avg_days_between', 'currency']]
+            df_recur_proj[['date', 'payees_name', 'category', 'amount_eur', 'avg_days_between', 'currency']]
             .style.format({'amount_eur': '{:,.2f} €', 'avg_days_between': '{:.0f}'}),
             hide_index=True, width='stretch',
             column_config={
                 'date':             st.column_config.DateColumn('Projected Date', format='DD/MM/YYYY'),
                 'payees_name':      'Payee',
+                'category':         'Category',
                 'amount_eur':       st.column_config.NumberColumn('Est. Amount (€)', format='%,.2f €'),
                 'avg_days_between': 'Interval (days)',
                 'currency':         'Currency',
@@ -2584,9 +2565,57 @@ def render_cash_flow_forecast():
 # ======================================================
 
 def render_asset_allocation():
-    st.subheader("🥧 Asset Allocation vs. Target")
+    # ── Target allocation editor ──────────────────────────────────────────────
+    with st.expander("⚙️ Edit Target Allocations", expanded=False):
+        st.caption(
+            "Rows are pre-filled from your current holdings and any previously saved targets. "
+            "Add new rows for asset types not yet in your portfolio. All changes are saved on click."
+        )
+        df_alloc      = get_asset_allocation_data()
+        df_targets_db = get_allocation_targets()
 
-    if st.sidebar.button("🔄 Refresh", key="alloc_refresh"):
+        # Build a complete picture: union of holding types and DB-saved types
+        actual_map = dict(zip(df_alloc['securities_type'], df_alloc['actual_pct'])) if not df_alloc.empty else {}
+        target_map = dict(zip(df_targets_db['securities_type'], df_targets_db['target_pct'])) if not df_targets_db.empty else {}
+        all_types  = sorted(set(actual_map) | set(target_map))
+
+        editor_rows = [
+            {
+                'Asset Type': t,
+                'Actual %':   float(actual_map.get(t, 0.0)),
+                'Target %':   float(target_map.get(t, 0.0)),
+            }
+            for t in all_types
+        ]
+        df_editor = pd.DataFrame(editor_rows) if editor_rows else pd.DataFrame(columns=['Asset Type', 'Actual %', 'Target %'])
+
+        edited = st.data_editor(
+            df_editor,
+            column_config={
+                'Asset Type': st.column_config.TextColumn('Asset Type'),
+                'Actual %':   st.column_config.NumberColumn('Actual %',  format='%.2f%%', disabled=True),
+                'Target %':   st.column_config.NumberColumn('Target %',  format='%.2f%%', min_value=0.0, max_value=100.0, step=0.5),
+            },
+            num_rows="dynamic",
+            hide_index=True,
+            use_container_width=True,
+            key="alloc_target_editor",
+        )
+
+        valid_rows = edited.dropna(subset=['Asset Type'])
+        valid_rows = valid_rows[valid_rows['Asset Type'].str.strip() != '']
+        total_target = valid_rows['Target %'].sum()
+        col_sum, col_btn = st.columns([3, 1])
+        col_sum.caption(f"Sum of targets: **{total_target:.1f}%** {'✅' if abs(total_target - 100) < 0.1 else '⚠️ should sum to 100%'}")
+        if col_btn.button("💾 Save Targets", key="alloc_save_btn", type="primary"):
+            targets_to_save = dict(zip(valid_rows['Asset Type'].str.strip(), valid_rows['Target %'].fillna(0.0)))
+            save_allocation_targets(targets_to_save)
+            get_asset_allocation_data.clear()
+            st.success("Target allocations saved.")
+            st.rerun()
+
+    # ── Refresh ───────────────────────────────────────────────────────────────
+    if st.button("🔄 Refresh", key="alloc_refresh"):
         get_asset_allocation_data.clear()
         st.rerun()
 
@@ -2599,7 +2628,7 @@ def render_asset_allocation():
     total_eur = df['value_eur'].sum()
     st.metric("Total Portfolio Value", f"€ {total_eur:,.2f}")
 
-    col_pie, col_table = st.columns([1, 1])
+    col_pie, col_bar = st.columns(2)
 
     with col_pie:
         fig = px.pie(
@@ -2612,7 +2641,7 @@ def render_asset_allocation():
         fig.update_layout(margin=dict(l=0, r=0, t=50, b=0), showlegend=False)
         st.plotly_chart(fig, width='stretch')
 
-    with col_table:
+    with col_bar:
         fig2 = px.bar(
             df, x='securities_type', y=['actual_pct', 'target_pct'],
             barmode='group',
@@ -2626,15 +2655,15 @@ def render_asset_allocation():
 
     st.markdown("#### Rebalancing Delta")
     df_display = df.copy()
-    df_display['delta_pct'] = df_display['target_pct'] - df_display['actual_pct']
+    df_display['delta_pct']     = df_display['target_pct'] - df_display['actual_pct']
     df_display['rebalance_eur'] = df_display['delta_pct'] / 100 * total_eur
 
     st.dataframe(
         df_display.style.format({
-            'value_eur':   '{:,.2f} €',
-            'actual_pct':  '{:.2f}%',
-            'target_pct':  '{:.2f}%',
-            'delta_pct':   '{:+.2f}%',
+            'value_eur':     '{:,.2f} €',
+            'actual_pct':    '{:.2f}%',
+            'target_pct':    '{:.2f}%',
+            'delta_pct':     '{:+.2f}%',
             'rebalance_eur': '{:+,.2f} €',
         }).map(color_negative_red, subset=['delta_pct', 'rebalance_eur']),
         hide_index=True, width='stretch',
@@ -2649,7 +2678,119 @@ def render_asset_allocation():
     )
     copy_df_button(df_display, key="dl_rpt_alloc")
 
-    st.caption("Set target allocations via SQL: `UPDATE Allocation_Targets SET Target_Pct = 40 WHERE Securities_Type = 'ETF';`")
+
+# ======================================================
+# SECTOR & INDUSTRY ALLOCATION
+# ======================================================
+
+def render_sector_allocation():
+    if st.button("🔄 Refresh", key="sector_alloc_refresh"):
+        get_sector_allocation_data.clear()
+        st.rerun()
+
+    df = get_sector_allocation_data()
+
+    if df.empty:
+        st.info("No holdings with sector/industry data found.")
+        return
+
+    total_eur = df['value_eur'].sum()
+    st.metric("Total Portfolio Value", f"€ {total_eur:,.2f}")
+
+    # ── Sector-level rollup ───────────────────────────────────────────────────
+    df_sector = (
+        df.groupby('sector', as_index=False)['value_eur'].sum()
+        .assign(actual_pct=lambda d: (d['value_eur'] / total_eur * 100).round(2))
+        .sort_values('value_eur', ascending=False)
+    )
+
+    st.markdown("#### By Sector")
+    col_pie, col_bar = st.columns(2)
+    with col_pie:
+        fig_s_pie = px.pie(
+            df_sector, names='sector', values='value_eur',
+            title="<b>Sector Allocation</b>",
+            template='plotly_dark', hole=0.4,
+        )
+        fig_s_pie.update_traces(textinfo='percent+label')
+        fig_s_pie.update_layout(margin=dict(l=0, r=0, t=50, b=0), showlegend=False)
+        st.plotly_chart(fig_s_pie, width='stretch')
+
+    with col_bar:
+        fig_s_bar = px.bar(
+            df_sector, x='sector', y='actual_pct',
+            title="<b>Sector Weight (%)</b>",
+            labels={'actual_pct': '%', 'sector': 'Sector'},
+            template='plotly_dark',
+            text=df_sector['actual_pct'].apply(lambda v: f"{v:.1f}%"),
+        )
+        fig_s_bar.update_traces(textposition='outside')
+        fig_s_bar.update_layout(margin=dict(l=0, r=0, t=50, b=0), yaxis_title='%')
+        st.plotly_chart(fig_s_bar, width='stretch')
+
+    st.dataframe(
+        df_sector.style.format({'value_eur': '{:,.2f} €', 'actual_pct': '{:.2f}%'}),
+        hide_index=True, width='stretch',
+        column_config={
+            'sector':     'Sector',
+            'value_eur':  st.column_config.NumberColumn('Value (€)',  format='%,.2f €'),
+            'actual_pct': st.column_config.NumberColumn('Weight %',   format='%.2f%%'),
+        }
+    )
+
+    # ── Industry-level detail ─────────────────────────────────────────────────
+    st.divider()
+    st.markdown("#### By Industry")
+
+    # Sector filter
+    all_sectors = sorted(df['sector'].unique())
+    selected_sector = st.selectbox(
+        "Filter by Sector:", ['All'] + all_sectors, key="sector_alloc_filter"
+    )
+    df_ind = df if selected_sector == 'All' else df[df['sector'] == selected_sector]
+    df_industry = (
+        df_ind.groupby(['sector', 'industry'], as_index=False)['value_eur'].sum()
+        .assign(actual_pct=lambda d: (d['value_eur'] / total_eur * 100).round(2))
+        .sort_values('value_eur', ascending=False)
+    )
+
+    col_ind_pie, col_ind_bar = st.columns(2)
+    with col_ind_pie:
+        fig_i_pie = px.pie(
+            df_industry, names='industry', values='value_eur',
+            title="<b>Industry Allocation</b>",
+            template='plotly_dark', hole=0.4,
+        )
+        fig_i_pie.update_traces(textinfo='percent+label')
+        fig_i_pie.update_layout(margin=dict(l=0, r=0, t=50, b=0), showlegend=False)
+        st.plotly_chart(fig_i_pie, width='stretch')
+
+    with col_ind_bar:
+        fig_i_bar = px.bar(
+            df_industry.head(20), x='industry', y='actual_pct',
+            color='sector',
+            title="<b>Top Industries by Weight (%)</b>",
+            labels={'actual_pct': '%', 'industry': 'Industry', 'sector': 'Sector'},
+            template='plotly_dark',
+        )
+        fig_i_bar.update_layout(
+            margin=dict(l=0, r=0, t=50, b=0),
+            xaxis_tickangle=-35,
+            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+        )
+        st.plotly_chart(fig_i_bar, width='stretch')
+
+    st.dataframe(
+        df_industry.style.format({'value_eur': '{:,.2f} €', 'actual_pct': '{:.2f}%'}),
+        hide_index=True, width='stretch',
+        column_config={
+            'sector':     'Sector',
+            'industry':   'Industry',
+            'value_eur':  st.column_config.NumberColumn('Value (€)',  format='%,.2f €'),
+            'actual_pct': st.column_config.NumberColumn('Weight %',   format='%.2f%%'),
+        }
+    )
+    copy_df_button(df_industry, key="dl_rpt_sector_alloc")
 
 
 # ======================================================
@@ -2659,7 +2800,7 @@ def render_asset_allocation():
 def render_fx_exposure():
     st.subheader("🌍 FX Exposure Report")
 
-    if st.sidebar.button("🔄 Refresh", key="fx_exp_refresh"):
+    if st.button("🔄 Refresh", key="fx_exp_refresh"):
         get_fx_exposure_data.clear()
         st.rerun()
 
@@ -2717,7 +2858,7 @@ def render_fx_exposure():
 def render_bond_schedule():
     st.subheader("📅 Bond Maturity & Coupon Schedule")
 
-    if st.sidebar.button("🔄 Refresh", key="bond_refresh"):
+    if st.button("🔄 Refresh", key="bond_refresh"):
         get_bond_schedule_data.clear()
         st.rerun()
 

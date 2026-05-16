@@ -1829,11 +1829,14 @@ def get_cash_flow_forecast(months_back: int = 3):
     #    the LAG-based interval reflects actual payment cadence.
     df_recurring = pd.read_sql(f"""
         WITH
-        -- All payee transactions within the last mb complete calendar months
+        -- One row per (payee, category, date): amount = sum of splits for that
+        -- category on that single transaction date.
         recent AS (
             SELECT
                 t.Payees_Id,
                 p.Payees_Name,
+                s.Categories_Id,
+                cat.Categories_Name,
                 DATE_TRUNC('month', t.Date)::date   AS month_start,
                 t.Date,
                 SUM(s.Amount)                        AS amount,
@@ -1842,44 +1845,124 @@ def get_cash_flow_forecast(months_back: int = 3):
             JOIN  Accounts a  ON a.Accounts_Id  = t.Accounts_Id
             LEFT JOIN Payees p ON p.Payees_Id   = t.Payees_Id
             LEFT JOIN Splits s ON s.Transactions_Id = t.Transactions_Id
+            LEFT JOIN Categories cat ON cat.Categories_Id = s.Categories_Id
             WHERE t.Date >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '{mb} months'
-              AND t.Date <  DATE_TRUNC('month', CURRENT_DATE)   -- exclude partial current month
+              AND t.Date <  DATE_TRUNC('month', CURRENT_DATE)
               AND t.Payees_Id IS NOT NULL
-              AND t.Transfers_Id IS NULL                        -- exclude internal transfers
-            GROUP BY t.Payees_Id, p.Payees_Name, t.Date,
-                     DATE_TRUNC('month', t.Date)::date, a.Currencies_Id
+              AND t.Transfers_Id IS NULL
+            GROUP BY t.Payees_Id, p.Payees_Name, s.Categories_Id, cat.Categories_Name,
+                     t.Date, DATE_TRUNC('month', t.Date)::date, a.Currencies_Id
         ),
-        -- Keep only payees that appear in EVERY one of the mb months
+        -- Keep only (payee, category) pairs present in EVERY one of the mb months
         qualified AS (
-            SELECT Payees_Id, Currencies_Id
+            SELECT Payees_Id, Categories_Id, Currencies_Id
             FROM   recent
-            GROUP  BY Payees_Id, Currencies_Id
+            GROUP  BY Payees_Id, Categories_Id, Currencies_Id
             HAVING COUNT(DISTINCT month_start) = {mb}
         ),
-        -- Add inter-transaction lag for avg-interval calculation
-        with_lag AS (
-            SELECT r.*,
+        -- Average transactions per month — drives interval strategy selection
+        tx_freq AS (
+            SELECT r.Payees_Id, r.Categories_Id, r.Currencies_Id,
+                   COUNT(*)::float / {mb} AS avg_tx_per_month
+            FROM recent r
+            JOIN qualified q
+                 ON  q.Payees_Id     = r.Payees_Id
+                 AND q.Categories_Id = r.Categories_Id
+                 AND q.Currencies_Id = r.Currencies_Id
+            GROUP BY r.Payees_Id, r.Categories_Id, r.Currencies_Id
+        ),
+        -- Strategy A — transaction-level LAG.
+        -- Correct for high-frequency payees (e.g. 3-4 supermarket visits/month).
+        tx_lag AS (
+            SELECT r.Payees_Id, r.Categories_Id, r.Currencies_Id,
                    (r.Date - LAG(r.Date) OVER (
-                       PARTITION BY r.Payees_Id, r.Currencies_Id
+                       PARTITION BY r.Payees_Id, r.Categories_Id, r.Currencies_Id
                        ORDER BY r.Date
                    ))::float AS days_since_prev
-            FROM   recent r
-            JOIN   qualified q
-                   ON  q.Payees_Id     = r.Payees_Id
-                   AND q.Currencies_Id = r.Currencies_Id
+            FROM recent r
+            JOIN qualified q
+                 ON  q.Payees_Id     = r.Payees_Id
+                 AND q.Categories_Id = r.Categories_Id
+                 AND q.Currencies_Id = r.Currencies_Id
+        ),
+        interval_tx AS (
+            SELECT Payees_Id, Categories_Id, Currencies_Id,
+                   COALESCE(AVG(days_since_prev), 30) AS avg_interval
+            FROM   tx_lag
+            GROUP  BY Payees_Id, Categories_Id, Currencies_Id
+        ),
+        -- Strategy B — monthly-repr LAG.
+        -- Collapse to the earliest date per month so sporadic bonus entries
+        -- (e.g. Christmas bonus on top of regular salary) don't create false
+        -- short intra-month intervals.
+        monthly_repr AS (
+            SELECT r.Payees_Id, r.Payees_Name, r.Categories_Id, r.Categories_Name,
+                   r.month_start, r.Currencies_Id,
+                   MIN(r.Date) AS repr_date
+            FROM recent r
+            JOIN qualified q
+                 ON  q.Payees_Id     = r.Payees_Id
+                 AND q.Categories_Id = r.Categories_Id
+                 AND q.Currencies_Id = r.Currencies_Id
+            GROUP BY r.Payees_Id, r.Payees_Name, r.Categories_Id, r.Categories_Name,
+                     r.month_start, r.Currencies_Id
+        ),
+        monthly_lag AS (
+            SELECT *,
+                   (repr_date - LAG(repr_date) OVER (
+                       PARTITION BY Payees_Id, Categories_Id, Currencies_Id
+                       ORDER BY month_start
+                   ))::float AS days_since_prev
+            FROM monthly_repr
+        ),
+        interval_monthly AS (
+            SELECT Payees_Id, Categories_Id, Currencies_Id,
+                   COALESCE(AVG(days_since_prev), 30) AS avg_interval
+            FROM   monthly_lag
+            GROUP  BY Payees_Id, Categories_Id, Currencies_Id
+        ),
+        -- Median single-transaction amount — robust against bonus outliers
+        amount_stats AS (
+            SELECT r.Payees_Id, r.Categories_Id, r.Currencies_Id,
+                   PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY r.amount) AS median_amount,
+                   STDDEV(r.amount)                                        AS std_amount,
+                   MAX(r.Date)                                             AS last_date
+            FROM recent r
+            JOIN qualified q
+                 ON  q.Payees_Id     = r.Payees_Id
+                 AND q.Categories_Id = r.Categories_Id
+                 AND q.Currencies_Id = r.Currencies_Id
+            GROUP BY r.Payees_Id, r.Categories_Id, r.Currencies_Id
+        ),
+        -- Distinct names (one row per key from monthly_repr)
+        names AS (
+            SELECT DISTINCT ON (Payees_Id, Categories_Id, Currencies_Id)
+                   Payees_Id, Payees_Name, Categories_Id, Categories_Name, Currencies_Id
+            FROM   monthly_repr
         ),
         stats AS (
             SELECT
-                Payees_Id,
-                Payees_Name,
-                COUNT(*)                                    AS tx_count,
-                AVG(amount)                                 AS avg_amount,
-                STDDEV(amount)                              AS std_amount,
-                COALESCE(AVG(days_since_prev), 30)          AS avg_days_between,
-                MAX(Date)                                   AS last_date,
-                Currencies_Id
-            FROM   with_lag
-            GROUP  BY Payees_Id, Payees_Name, Currencies_Id
+                n.Payees_Id,
+                n.Payees_Name,
+                n.Categories_Id,
+                n.Categories_Name,
+                am.median_amount                            AS avg_amount,
+                am.std_amount,
+                -- Use transaction-level intervals when avg > 1.5 tx/month
+                -- (genuine high-frequency payees like supermarkets); use
+                -- month-level intervals for low-frequency payees to suppress
+                -- bonus-entry noise.
+                CASE WHEN tf.avg_tx_per_month > 1.5
+                     THEN it.avg_interval
+                     ELSE im.avg_interval
+                END                                         AS avg_days_between,
+                am.last_date,
+                n.Currencies_Id
+            FROM names n
+            JOIN amount_stats  am ON am.Payees_Id = n.Payees_Id AND am.Categories_Id = n.Categories_Id AND am.Currencies_Id = n.Currencies_Id
+            JOIN tx_freq       tf ON tf.Payees_Id = n.Payees_Id AND tf.Categories_Id = n.Categories_Id AND tf.Currencies_Id = n.Currencies_Id
+            JOIN interval_tx   it ON it.Payees_Id = n.Payees_Id AND it.Categories_Id = n.Categories_Id AND it.Currencies_Id = n.Currencies_Id
+            JOIN interval_monthly im ON im.Payees_Id = n.Payees_Id AND im.Categories_Id = n.Categories_Id AND im.Currencies_Id = n.Currencies_Id
         ),
         fx AS (
             SELECT DISTINCT ON (Currencies_Id_1) Currencies_Id_1, FX_Rate
@@ -1887,7 +1970,7 @@ def get_cash_flow_forecast(months_back: int = 3):
         )
         SELECT
             s.Payees_Name,
-            s.tx_count,
+            s.Categories_Name                       AS category,
             ROUND(s.avg_amount::numeric,       2)   AS avg_amount,
             ROUND(s.std_amount::numeric,       2)   AS std_amount,
             ROUND(s.avg_days_between::numeric, 0)   AS avg_days_between,
@@ -2019,6 +2102,82 @@ def get_dividend_tracker_data(start_date: str, end_date: str):
 # ======================================================
 # ASSET ALLOCATION VS TARGET
 # ======================================================
+
+def get_allocation_targets():
+    """Return all rows from Allocation_Targets as a DataFrame."""
+    conn = get_connection()
+    df = pd.read_sql(
+        "SELECT Securities_Type, Target_Pct FROM Allocation_Targets ORDER BY Securities_Type",
+        conn,
+    )
+    conn.close()
+    return df
+
+
+def save_allocation_targets(targets: dict):
+    """Upsert {securities_type: target_pct} into Allocation_Targets."""
+    conn = get_connection()
+    cur = conn.cursor()
+    for sec_type, pct in targets.items():
+        cur.execute(
+            """
+            INSERT INTO Allocation_Targets (Securities_Type, Target_Pct)
+            VALUES (%s, %s)
+            ON CONFLICT (Securities_Type)
+            DO UPDATE SET Target_Pct = EXCLUDED.Target_Pct
+            """,
+            (sec_type, float(pct)),
+        )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+@st.cache_data(ttl=300)
+def get_sector_allocation_data():
+    """Current allocation by Sector and Industry in EUR."""
+    conn = get_connection()
+    df = pd.read_sql("""
+        WITH fx AS (
+            SELECT DISTINCT ON (Currencies_Id_1) Currencies_Id_1, FX_Rate
+            FROM Historical_FX ORDER BY Currencies_Id_1, Date DESC
+        ),
+        prices AS (
+            SELECT DISTINCT ON (Securities_Id) Securities_Id, Close
+            FROM Historical_Prices ORDER BY Securities_Id, Date DESC
+        ),
+        holdings_value AS (
+            SELECT
+                COALESCE(NULLIF(TRIM(s.Sector),   ''), 'Other / Unknown') AS sector,
+                COALESCE(NULLIF(TRIM(s.Industry), ''), 'Other / Unknown') AS industry,
+                s.Securities_Type::text                                    AS securities_type,
+                SUM(h.Quantity * COALESCE(p.Close, 0)
+                               * COALESCE(fx.FX_Rate, 1))                 AS value_eur
+            FROM Holdings h
+            JOIN  Securities s ON h.Securities_Id = s.Securities_Id
+            JOIN  Accounts   a ON h.Accounts_Id   = a.Accounts_Id
+            LEFT JOIN prices p ON p.Securities_Id  = h.Securities_Id
+            LEFT JOIN fx       ON fx.Currencies_Id_1 = s.Currencies_Id
+            WHERE h.Quantity > 0
+            GROUP BY
+                COALESCE(NULLIF(TRIM(s.Sector),   ''), 'Other / Unknown'),
+                COALESCE(NULLIF(TRIM(s.Industry), ''), 'Other / Unknown'),
+                s.Securities_Type::text
+        ),
+        total AS (SELECT SUM(value_eur) AS grand_total FROM holdings_value)
+        SELECT
+            hv.sector,
+            hv.industry,
+            hv.securities_type,
+            ROUND(hv.value_eur::numeric, 2)                                        AS value_eur,
+            ROUND((hv.value_eur / NULLIF(t.grand_total, 0) * 100)::numeric, 2)    AS actual_pct
+        FROM holdings_value hv
+        CROSS JOIN total t
+        ORDER BY hv.value_eur DESC
+    """, conn)
+    conn.close()
+    return df
+
 
 @st.cache_data(ttl=300)
 def get_asset_allocation_data():

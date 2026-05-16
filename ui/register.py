@@ -97,17 +97,49 @@ def _render_transaction_table(acc_id, payee_options, acc_options, cat_options, t
     if len(df) > 500:
         st.warning(f"⚠️ {len(df):,} transactions — consider narrowing the date range for better performance.")
 
+    # ── Sort controls ─────────────────────────────────────────────────────────
+    _sc1, _sc2 = st.columns([3, 1])
+    with _sc1:
+        _sort_col = st.selectbox(
+            "Sort by",
+            options=["Date", "Payee", "Amount", "Target Account"],
+            index=0,
+            key=f"{_sk}_sort_col",
+            label_visibility="collapsed",
+        )
+    with _sc2:
+        _sort_dir = st.radio(
+            "Direction",
+            options=["ASC", "DESC"],
+            index=0,
+            horizontal=True,
+            key=f"{_sk}_sort_dir",
+            label_visibility="collapsed",
+        )
+
+    _sort_asc = _sort_dir == "ASC"
+    if _sort_col == "Payee":
+        df["_sk"] = df["payees_id"].map(payee_options).fillna("")
+        df = df.sort_values("_sk", ascending=_sort_asc, kind="stable").drop(columns=["_sk"]).reset_index(drop=True)
+    elif _sort_col == "Target Account":
+        df["_sk"] = df["accounts_id_target"].map(acc_options).fillna("")
+        df = df.sort_values("_sk", ascending=_sort_asc, kind="stable").drop(columns=["_sk"]).reset_index(drop=True)
+    elif _sort_col == "Amount":
+        df = df.sort_values("total_amount", ascending=_sort_asc, kind="stable").reset_index(drop=True)
+    else:  # Date
+        df = df.sort_values("date", ascending=_sort_asc, kind="stable").reset_index(drop=True)
+
     # ── Data editor ───────────────────────────────────────────────────────────
     df.insert(0, "_selected", False)
 
-    # Stable editor key: changes only when filter changes, not on every rerun.
-    _filter_sig = (_period, _status, acc_id,
+    # Stable editor key: changes only when filter or sort changes, not on every rerun.
+    _filter_sig = (_period, _status, acc_id, _sort_col, _sort_dir,
                    str(_from_date) if _period == "Custom" else "",
                    str(_to_date)   if _period == "Custom" else "")
     unique_key = f"set_reg_{acc_id}_{tab_key}_{hash(str(_filter_sig)) % 10**8}"
     _orig_key  = f"{unique_key}_orig"
 
-    # Store the original df the first time this filter combination is seen.
+    # Store the original df the first time this filter+sort combination is seen.
     # This is the baseline for change detection — NOT the re-fetched df,
     # which would always equal edited_reg after a rerun and hide pending edits.
     if _orig_key not in st.session_state:
@@ -160,6 +192,23 @@ def _render_transaction_table(acc_id, payee_options, acc_options, cat_options, t
     _copy_txns["accounts_id_target"] = _copy_txns["accounts_id_target"].map(acc_options).fillna("")
     _copy_txns = _copy_txns.rename(columns={"payees_id": "Payee", "accounts_id_target": "Target Account"})
     copy_df_button(_copy_txns, key=f"dl_reg_txns_{unique_key}")
+
+    # Scroll the grid to the bottom on every sort change so the user lands
+    # at the end of the sorted list (newest entries for Date ASC, etc.).
+    _scroll_key = f"{unique_key}_scrolled"
+    if _scroll_key not in st.session_state:
+        st.session_state[_scroll_key] = True
+        st.components.v1.html(
+            "<script>"
+            "function _scrollBottom(){"
+            "var s=window.parent.document.querySelectorAll('.dvn-scroller');"
+            "if(s.length)s[s.length-1].scrollTop=s[s.length-1].scrollHeight;}"
+            "setTimeout(_scrollBottom,400);"
+            "setTimeout(_scrollBottom,900);"
+            "setTimeout(_scrollBottom,1600);"
+            "</script>",
+            height=1,
+        )
 
     # ── Change detection & Save ───────────────────────────────────────────────
     _orig_for_cmp   = df_original.drop(columns=["_selected"])
@@ -245,8 +294,8 @@ def _render_transaction_table(acc_id, payee_options, acc_options, cat_options, t
             f"to **{_target_name}**. This cannot be undone automatically. Are you sure?"
         )
         _ca, _cb = st.columns(2)
-        _confirm_ok  = _ca.button("✅ Yes, move all", key=f"confirm_ok_{acc_id}_{tab_key}", type="primary")
-        _confirm_cancel = _cb.button("❌ Cancel",      key=f"confirm_cancel_{acc_id}_{tab_key}")
+        _confirm_ok  = _ca.button("✅ Yes, move all", key=f"confirm_ok_{acc_id}_{tab_key}")
+        _confirm_cancel = _cb.button("❌ Cancel",      key=f"confirm_cancel_{acc_id}_{tab_key}", type="primary")
 
         if _confirm_cancel:
             st.session_state.pop(_confirm_key, None)
@@ -1659,9 +1708,9 @@ def render_register():
         with t_view:
             _render_transaction_table(acc_id, payee_options, acc_options, cat_options, "bank")
     else:
-        cash_view, tab_inv_view, tab_inv_new, tab_view_hold, tab_edit_hold = st.tabs([
-            "👁️ Cash Transaction Register", "📓 Investment Register",
-            "➕ New Investment Transaction", "📊 Current Holdings", "✏️ Edit Holdings"
+        tab_inv_view, tab_inv_new, tab_view_hold, tab_edit_hold, cash_view = st.tabs([
+            "📓 Investment Register", "➕ New Investment Transaction",
+            "📊 Current Holdings", "✏️ Edit Holdings", "👁️ Cash Transaction Register",
         ])
         with cash_view:
             _render_transaction_table(acc_id, payee_options, acc_options, cat_options, "cash")
@@ -1675,10 +1724,34 @@ def render_register():
 
         with tab_inv_view:
 
-            # ── Cache the investment data ──────────────────────────────────────
-            # Fetch from DB only on first render for this account, or after a save.
-            # This prevents re-querying on every cell edit (every Streamlit rerun).
-            _inv_orig_key = f"inv_reg_{acc_id}_orig"
+            # Build sec_options first — needed for Security sort below
+            _full_sec_options = df_securities.set_index('securities_id')['securities_name'].to_dict()
+
+            # ── Sort controls ──────────────────────────────────────────────────
+            _inv_sk = f"inv_sort_{acc_id}"
+            _isc1, _isc2 = st.columns([3, 1])
+            with _isc1:
+                _inv_sort_col = st.selectbox(
+                    "Sort by",
+                    options=["Date", "Security", "Total Amount"],
+                    index=0,
+                    key=f"{_inv_sk}_col",
+                    label_visibility="collapsed",
+                )
+            with _isc2:
+                _inv_sort_dir = st.radio(
+                    "Direction",
+                    options=["ASC", "DESC"],
+                    index=0,
+                    horizontal=True,
+                    key=f"{_inv_sk}_dir",
+                    label_visibility="collapsed",
+                )
+
+            _inv_sort_asc = _inv_sort_dir == "ASC"
+
+            # ── Cache the investment data (keyed by sort so a sort change refetches) ──
+            _inv_orig_key = f"inv_reg_{acc_id}_{_inv_sort_col}_{_inv_sort_dir}_orig"
             if _inv_orig_key not in st.session_state:
                 _column_order = [
                     "investments_id", "accounts_id", "date", "securities_id",
@@ -1687,21 +1760,26 @@ def render_register():
                 ]
                 with get_db() as conn:
                     _df_fresh = pd.read_sql(
-                        "SELECT * FROM Investments WHERE Accounts_Id = %(acc_id)s ORDER BY Date DESC",
+                        "SELECT * FROM Investments WHERE Accounts_Id = %(acc_id)s",
                         conn, params={'acc_id': acc_id}
                     )
                 _df_fresh = _df_fresh[[c for c in _column_order if c in _df_fresh.columns]]
+                # Apply sort
+                if _inv_sort_col == "Security":
+                    _df_fresh["_sk"] = _df_fresh["securities_id"].map(_full_sec_options).fillna("")
+                    _df_fresh = _df_fresh.sort_values("_sk", ascending=_inv_sort_asc, kind="stable").drop(columns=["_sk"]).reset_index(drop=True)
+                elif _inv_sort_col == "Total Amount":
+                    _df_fresh = _df_fresh.sort_values("total_amount", ascending=_inv_sort_asc, kind="stable").reset_index(drop=True)
+                else:  # Date
+                    _df_fresh = _df_fresh.sort_values("date", ascending=_inv_sort_asc, kind="stable").reset_index(drop=True)
                 st.session_state[_inv_orig_key] = _df_fresh
 
             df_inv_orig = st.session_state[_inv_orig_key]
 
-            # Build full sec_options from df_securities for the editor (all securities, not currency-filtered)
-            _full_sec_options = df_securities.set_index('securities_id')['securities_name'].to_dict()
-
             edited_df = st.data_editor(
                 df_inv_orig,           # always render from cached original so edits persist across reruns
                 num_rows="dynamic",
-                key=f"inv_reg_{acc_id}",  # per-account key so switching accounts resets the editor
+                key=f"inv_reg_{acc_id}_{_inv_sort_col}_{_inv_sort_dir}",  # reset editor when sort changes
                 width="stretch",
                 column_config={
                     "investments_id": st.column_config.NumberColumn(
@@ -1752,6 +1830,22 @@ def render_register():
             _copy_inv["securities_id"] = _copy_inv["securities_id"].map(_full_sec_options).fillna("")
             _copy_inv = _copy_inv.rename(columns={"securities_id": "Security"})
             copy_df_button(_copy_inv, key=f"dl_reg_inv_{acc_id}")
+
+            # Scroll to bottom on every sort change
+            _inv_scroll_key = f"{_inv_orig_key}_scrolled"
+            if _inv_scroll_key not in st.session_state:
+                st.session_state[_inv_scroll_key] = True
+                st.components.v1.html(
+                    "<script>"
+                    "function _scrollBottom(){"
+                    "var s=window.parent.document.querySelectorAll('.dvn-scroller');"
+                    "if(s.length)s[s.length-1].scrollTop=s[s.length-1].scrollHeight;}"
+                    "setTimeout(_scrollBottom,400);"
+                    "setTimeout(_scrollBottom,900);"
+                    "setTimeout(_scrollBottom,1600);"
+                    "</script>",
+                    height=1,
+                )
 
             # ── Change detection & Save ────────────────────────────────────────
             # Align dtypes before comparing — data_editor can return different
