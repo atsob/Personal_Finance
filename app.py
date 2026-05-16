@@ -7,7 +7,7 @@ from config.settings import ENV_CONFIG
 from utils.session_state import init_session_state
 from utils.helpers import configure_warnings_and_ssl
 from ai.llm import init_llm
-from ai.rag import init_rag_index
+from ai.rag import PgVectorRagEngine
 from ai.agent import create_ai_agent
 from database.connection import get_connection, get_sql_database
 from ui.dashboard import render_dashboard
@@ -51,29 +51,7 @@ def main():
     def get_session_history(session_id: str) -> BaseChatMessageHistory:
         return msgs
     
-    # Try to initialize RAG if available
-    rag_engine = None
-    try:
-        import os
-        from llama_index.core import StorageContext, load_index_from_storage
-        persist_dir=ENV_CONFIG['persist_dir']
-        docstore_path = os.path.join(persist_dir, "docstore.json")
-        if os.path.exists(docstore_path):
-            storage_context = StorageContext.from_defaults(persist_dir=persist_dir)
-            index = load_index_from_storage(storage_context)
-            rag_engine = index.as_query_engine()
-            st.session_state['rag_ready'] = True
-            st.session_state['rag_status'] = 'ready'
-    except Exception as e:
-        pass
-    
-    # Always use create_ai_agent (schema-injected, correct ReAct format).
-    # When RAG is unavailable pass a no-op so the tool is present but inert.
-    if not rag_engine:
-        class _NoOpRag:
-            def query(self, q):
-                return "RAG index not available."
-        rag_engine = _NoOpRag()
+    rag_engine = PgVectorRagEngine()
 
     agent_executor = create_ai_agent(llm, db, rag_engine)
     agent_with_history = RunnableWithMessageHistory(

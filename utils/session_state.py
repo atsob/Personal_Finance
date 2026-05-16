@@ -5,8 +5,6 @@ import datetime as dt_lib
 def init_session_state():
     """Initialize all session state variables."""
     defaults = {
-        'rag_ready': False,
-        'rag_status': 'idle',
         'current_tx_id': None,
         'selected_acc_index': 0,
         'account_id_internal': None,

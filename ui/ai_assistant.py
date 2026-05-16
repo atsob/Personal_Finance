@@ -1,16 +1,12 @@
-import os
 import re
 import decimal
 import datetime
-import threading
 import streamlit as st
 from ai.agent import _compact_schema
 from database.connection import get_connection
-from streamlit.runtime.scriptrunner import add_script_run_ctx
 from langchain_community.callbacks.streamlit import StreamlitCallbackHandler
 from langchain_community.chat_message_histories import StreamlitChatMessageHistory
-from langchain_core.messages import HumanMessage, AIMessage
-from ai.rag import run_indexing_thread
+from ai.rag import semantic_search
 from ai.web_search import web_search
 from ai.update_vector import update_all_embeddings
 from config.settings import ENV_CONFIG
@@ -143,7 +139,23 @@ def run_ai_assistant(user_input: str, llm, agent_with_history, rag_engine, db=No
         result = _run_sql(user_input, full_date, llm, db)
         if not result.startswith("I tried to query") and not result.startswith("Sorry"):
             return result
-        # Only fall back to the full agent if the simple path failed
+
+        # SQL failed → semantic search fallback
+        st.info("🔍 Trying semantic search...")
+        semantic_results = semantic_search(user_input)
+        if not semantic_results.startswith("No ") and not semantic_results.startswith("Could not") and not semantic_results.startswith("Semantic"):
+            synthesis_prompt = (
+                f"Today is {full_date}.\n"
+                f"The user asked: {user_input}\n\n"
+                f"Here are the most relevant transactions found:\n{semantic_results}\n\n"
+                f"Using only the transactions above, answer the user's question concisely."
+            )
+            try:
+                return llm.invoke(synthesis_prompt).content
+            except Exception:
+                return semantic_results  # Return raw results if LLM synthesis fails
+
+        # Last resort: full ReAct agent
         st.warning("Retrying with agent...")
         try:
             st_callback = StreamlitCallbackHandler(st.container())
@@ -196,29 +208,31 @@ def render_ai_assistant(llm, agent_with_history, rag_engine, db=None):
         - Give me financial advice based on my data
         """)
     
-    #persist_dir = "/app/storage_rag"
-    persist_dir=ENV_CONFIG['persist_dir']
-    docstore_path = os.path.join(persist_dir, "docstore.json")
-    
-    st.button("🔄 Update Vendor Embeddings (if you added new data)", on_click=update_all_embeddings)
+    # Embeddings status + update button
+    try:
+        from database.connection import get_connection as _gc
+        _conn = _gc()
+        _cur = _conn.cursor()
+        _cur.execute("SELECT COUNT(*) FROM Transactions")
+        _total = _cur.fetchone()[0]
+        _cur.execute("SELECT COUNT(*) FROM Transactions WHERE embedding IS NOT NULL")
+        _embedded = _cur.fetchone()[0]
+        _cur.close()
+        _conn.close()
+        if _embedded == 0:
+            st.warning(
+                f"⚠️ No transaction embeddings found ({_total} transactions total). "
+                "Click 'Update Embeddings' to enable semantic search fallback."
+            )
+        elif _embedded < _total:
+            st.info(f"🔍 Semantic search ready — {_embedded}/{_total} transactions indexed.")
+        else:
+            st.success(f"✅ Semantic search ready — all {_total} transactions indexed.")
+    except Exception:
+        pass
 
-    if not os.path.exists(docstore_path):
-        if st.session_state['rag_status'] == 'idle':
-            if st.button("🚀 Start Indexing (Background)"):
-                st.session_state['rag_status'] = 'running'
-
-                thread = threading.Thread(target=run_indexing_thread)
-                add_script_run_ctx(thread) # Αυτό επιτρέπει στο thread να βλέπει το st.session_state
-                thread.start()
-
-            #    thread = threading.Thread(target=run_indexing_thread)
-            #    thread.start()
-                st.rerun()
-        
-        if st.session_state['rag_status'] == 'running':
-            st.info("⏳ RAG Indexing running in background... You can use the rest of the application.")
-    elif st.session_state['rag_status'] == 'ready' or os.path.exists(docstore_path):
-        st.success("✅ RAG is ready!")
+    st.button("🔄 Update Embeddings", on_click=update_all_embeddings,
+              help="Run after importing new transactions to keep semantic search up to date.")
     
     col1, col2 = st.columns([6, 1])
     with col2:
