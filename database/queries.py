@@ -458,6 +458,21 @@ def get_all_accounts_for_nwr():
     return df
 
 
+def get_investment_accounts():
+    """Active brokerage / pension / investment accounts only (used for risk analytics)."""
+    conn = get_connection()
+    df = pd.read_sql("""
+        SELECT Accounts_Id AS accounts_id, Accounts_Name AS accounts_name,
+               Accounts_Type AS accounts_type
+        FROM Accounts
+        WHERE Is_Active = TRUE
+          AND Accounts_Type IN ('Brokerage', 'Margin', 'Pension', 'Other Investment')
+        ORDER BY Accounts_Type, Accounts_Name
+    """, conn)
+    conn.close()
+    return df
+
+
 @st.cache_data(ttl=300)
 def get_price_anomalies(threshold_pct: float = 100.0, securities_ids: tuple = None):
     """
@@ -2460,4 +2475,831 @@ def get_monthly_summaries(limit: int = 12) -> "pd.DataFrame":
     if not df.empty:
         df['month_start']    = pd.to_datetime(df['month_start'])
         df['generated_at']  = pd.to_datetime(df['generated_at'])
+
+
+# ======================================================
+# A1. SAVINGS RATE
+# ======================================================
+
+@st.cache_data(ttl=300)
+def get_savings_rate_data(months: int = 12):
+    """Monthly savings rate: income, expenses, savings, savings_rate_pct."""
+    conn = get_connection()
+    df = pd.read_sql("""
+        WITH fx AS (
+            SELECT DISTINCT ON (Currencies_Id_1) Currencies_Id_1, FX_Rate
+            FROM Historical_FX ORDER BY Currencies_Id_1, Date DESC
+        ),
+        splits_cat AS (
+            SELECT
+                DATE_TRUNC('month', t.Date)::date AS month,
+                c.Categories_Type,
+                s.Amount *
+                    CASE WHEN cur.Currencies_ShortName = 'EUR' THEN 1
+                         ELSE COALESCE(fx.FX_Rate, 1) END AS amount_eur
+            FROM Splits s
+            JOIN Transactions t ON t.Transactions_Id = s.Transactions_Id
+            JOIN Categories c   ON c.Categories_Id   = s.Categories_Id
+            JOIN Accounts a     ON a.Accounts_Id      = t.Accounts_Id
+            JOIN Currencies cur ON cur.Currencies_Id  = a.Currencies_Id
+            LEFT JOIN fx        ON fx.Currencies_Id_1 = a.Currencies_Id
+            WHERE t.Transfers_Id IS NULL
+              AND c.Categories_Type NOT IN ('Transfer', 'Trading', 'Investment')
+              AND t.Date < DATE_TRUNC('month', CURRENT_DATE)
+              AND t.Date >= DATE_TRUNC('month', CURRENT_DATE) - (%(months)s || ' months')::INTERVAL
+        )
+        SELECT
+            month,
+            SUM(CASE WHEN Categories_Type IN ('Income','Dividend','Interest') THEN amount_eur ELSE 0 END)        AS income_eur,
+            ABS(SUM(CASE WHEN Categories_Type NOT IN ('Income','Dividend','Interest') THEN amount_eur ELSE 0 END)) AS expenses_eur
+        FROM splits_cat
+        GROUP BY month
+        ORDER BY month
+    """, conn, params={"months": months})
+    conn.close()
+    if not df.empty:
+        df['month'] = pd.to_datetime(df['month'])
+        df['savings_eur'] = df['income_eur'] - df['expenses_eur']
+        df['savings_rate_pct'] = df.apply(
+            lambda r: (r['savings_eur'] / r['income_eur'] * 100) if r['income_eur'] > 0 else 0, axis=1
+        )
     return df
+
+
+# ======================================================
+# A2. ANNUAL BUDGETS TABLE + CRUD
+# ======================================================
+
+def ensure_budgets_table():
+    """Create Annual_Budgets table if it does not exist."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS Annual_Budgets (
+            Budget_Id       SERIAL PRIMARY KEY,
+            Year            INT NOT NULL,
+            Categories_Id   INT NOT NULL REFERENCES Categories(Categories_Id),
+            Budget_Amount   NUMERIC(15,2) NOT NULL,
+            UNIQUE(Year, Categories_Id)
+        )
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def upsert_budget(year: int, categories_id: int, amount: float):
+    """Insert or update an annual budget entry."""
+    ensure_budgets_table()
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO Annual_Budgets (Year, Categories_Id, Budget_Amount)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (Year, Categories_Id)
+        DO UPDATE SET Budget_Amount = EXCLUDED.Budget_Amount
+    """, (year, categories_id, amount))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def delete_budget(year: int, categories_id: int):
+    """Delete an annual budget entry."""
+    ensure_budgets_table()
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        DELETE FROM Annual_Budgets WHERE Year = %s AND Categories_Id = %s
+    """, (year, categories_id))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+@st.cache_data(ttl=300)
+def get_budget_vs_actual(year: int, ref_years: int = 2):
+    """Annual budget vs actual for the selected year.
+
+    Returns per expense category:
+      avg_annual_hist  – average annual spend over the last N full calendar years
+      budget_amount    – annual budget set by the user
+      actual_amount    – total spend in the selected year (YTD if current year)
+      variance_eur     – budget − actual
+      variance_pct     – actual as % of budget
+      over_budget      – bool
+    """
+    ensure_budgets_table()
+    conn = get_connection()
+    df = pd.read_sql("""
+        WITH RECURSIVE cat_path AS (
+            SELECT Categories_Id,
+                   Categories_Name::TEXT AS full_path,
+                   Categories_Type,
+                   Categories_Id_Parent
+            FROM Categories
+            WHERE Categories_Id_Parent IS NULL
+            UNION ALL
+            SELECT c.Categories_Id,
+                   cp.full_path || ' : ' || c.Categories_Name,
+                   c.Categories_Type,
+                   c.Categories_Id_Parent
+            FROM Categories c
+            JOIN cat_path cp ON c.Categories_Id_Parent = cp.Categories_Id
+        ),
+        fx AS (
+            SELECT DISTINCT ON (Currencies_Id_1) Currencies_Id_1, FX_Rate
+            FROM Historical_FX ORDER BY Currencies_Id_1, Date DESC
+        ),
+        -- Historical annual spend per category over last N full calendar years
+        hist_annual AS (
+            SELECT
+                s.Categories_Id,
+                EXTRACT(year FROM t.Date)::int AS yr,
+                ABS(SUM(s.Amount *
+                    CASE WHEN cur.Currencies_ShortName = 'EUR' THEN 1
+                         ELSE COALESCE(fx.FX_Rate, 1) END)) AS annual_spend
+            FROM Splits s
+            JOIN Transactions t ON t.Transactions_Id = s.Transactions_Id
+            JOIN Categories c   ON c.Categories_Id   = s.Categories_Id
+            JOIN Accounts a     ON a.Accounts_Id      = t.Accounts_Id
+            JOIN Currencies cur ON cur.Currencies_Id  = a.Currencies_Id
+            LEFT JOIN fx        ON fx.Currencies_Id_1 = a.Currencies_Id
+            WHERE t.Transfers_Id IS NULL
+              AND c.Categories_Type NOT IN ('Income', 'Transfer', 'Trading', 'Investment')
+              AND EXTRACT(year FROM t.Date) >= EXTRACT(year FROM CURRENT_DATE) - %(ref_years)s
+              AND EXTRACT(year FROM t.Date) <  EXTRACT(year FROM CURRENT_DATE)
+            GROUP BY s.Categories_Id, EXTRACT(year FROM t.Date)
+        ),
+        hist AS (
+            SELECT Categories_Id,
+                   AVG(annual_spend) AS avg_annual
+            FROM hist_annual
+            GROUP BY Categories_Id
+        ),
+        -- Actual spend for the selected year (full year or YTD)
+        actual_year AS (
+            SELECT s.Categories_Id,
+                   ABS(SUM(s.Amount *
+                       CASE WHEN cur.Currencies_ShortName = 'EUR' THEN 1
+                            ELSE COALESCE(fx.FX_Rate, 1) END)) AS actual_amount
+            FROM Splits s
+            JOIN Transactions t ON t.Transactions_Id = s.Transactions_Id
+            JOIN Categories c   ON c.Categories_Id   = s.Categories_Id
+            JOIN Accounts a     ON a.Accounts_Id      = t.Accounts_Id
+            JOIN Currencies cur ON cur.Currencies_Id  = a.Currencies_Id
+            LEFT JOIN fx        ON fx.Currencies_Id_1 = a.Currencies_Id
+            WHERE t.Transfers_Id IS NULL
+              AND c.Categories_Type NOT IN ('Income', 'Transfer', 'Trading', 'Investment')
+              AND EXTRACT(year FROM t.Date) = %(year)s
+            GROUP BY s.Categories_Id
+        ),
+        -- Prior year full spend (year - 1)
+        prior_year AS (
+            SELECT s.Categories_Id,
+                   ABS(SUM(s.Amount *
+                       CASE WHEN cur.Currencies_ShortName = 'EUR' THEN 1
+                            ELSE COALESCE(fx.FX_Rate, 1) END)) AS prior_amount
+            FROM Splits s
+            JOIN Transactions t ON t.Transactions_Id = s.Transactions_Id
+            JOIN Categories c   ON c.Categories_Id   = s.Categories_Id
+            JOIN Accounts a     ON a.Accounts_Id      = t.Accounts_Id
+            JOIN Currencies cur ON cur.Currencies_Id  = a.Currencies_Id
+            LEFT JOIN fx        ON fx.Currencies_Id_1 = a.Currencies_Id
+            WHERE t.Transfers_Id IS NULL
+              AND c.Categories_Type NOT IN ('Income', 'Transfer', 'Trading', 'Investment')
+              AND EXTRACT(year FROM t.Date) = %(year)s - 1
+            GROUP BY s.Categories_Id
+        ),
+        budgets AS (
+            SELECT Categories_Id, Budget_Amount
+            FROM Annual_Budgets
+            WHERE Year = %(year)s
+        )
+        SELECT
+            c.Categories_Id                                                  AS categories_id,
+            c.full_path                                                      AS categories_name,
+            ROUND(COALESCE(h.avg_annual,     0)::numeric, 2)                AS avg_annual_hist,
+            ROUND(COALESCE(py.prior_amount,  0)::numeric, 2)                AS prior_year_amount,
+            COALESCE(b.Budget_Amount, 0)                                     AS budget_amount,
+            ROUND(COALESCE(ay.actual_amount, 0)::numeric, 2)                AS actual_amount,
+            COALESCE(b.Budget_Amount, 0)
+                - ROUND(COALESCE(ay.actual_amount, 0)::numeric, 2)          AS variance_eur,
+            CASE WHEN COALESCE(b.Budget_Amount, 0) > 0
+                 THEN ROUND((COALESCE(ay.actual_amount, 0)
+                             / b.Budget_Amount * 100)::numeric, 1)
+                 ELSE NULL END                                               AS variance_pct,
+            COALESCE(ay.actual_amount, 0)
+                > COALESCE(b.Budget_Amount, 0)                              AS over_budget
+        FROM cat_path c
+        LEFT JOIN hist         h  ON h.Categories_Id  = c.Categories_Id
+        LEFT JOIN prior_year   py ON py.Categories_Id = c.Categories_Id
+        LEFT JOIN actual_year  ay ON ay.Categories_Id = c.Categories_Id
+        LEFT JOIN budgets       b  ON b.Categories_Id  = c.Categories_Id
+        WHERE (   h.Categories_Id  IS NOT NULL
+               OR ay.Categories_Id IS NOT NULL
+               OR py.Categories_Id IS NOT NULL
+               OR b.Categories_Id  IS NOT NULL)
+          AND c.Categories_Type NOT IN ('Income', 'Transfer', 'Trading', 'Investment')
+        ORDER BY c.full_path
+    """, conn, params={"year": year, "ref_years": ref_years})
+    conn.close()
+    return df
+
+
+@st.cache_data(ttl=300)
+def get_ytd_expense_transactions(year: int):
+    """All expense-category transactions for the selected year, with full category path."""
+    conn = get_connection()
+    df = pd.read_sql("""
+        WITH RECURSIVE cat_path AS (
+            SELECT Categories_Id,
+                   Categories_Name::TEXT AS full_path,
+                   Categories_Type,
+                   Categories_Id_Parent
+            FROM Categories
+            WHERE Categories_Id_Parent IS NULL
+            UNION ALL
+            SELECT c.Categories_Id,
+                   cp.full_path || ' : ' || c.Categories_Name,
+                   c.Categories_Type,
+                   c.Categories_Id_Parent
+            FROM Categories c
+            JOIN cat_path cp ON c.Categories_Id_Parent = cp.Categories_Id
+        ),
+        fx AS (
+            SELECT DISTINCT ON (Currencies_Id_1) Currencies_Id_1, FX_Rate
+            FROM Historical_FX ORDER BY Currencies_Id_1, Date DESC
+        )
+        SELECT
+            s.Splits_Id                                                       AS splits_id,
+            t.Transactions_Id                                                 AS transaction_id,
+            t.Date                                                            AS date,
+            p.Payees_Name                                                     AS payee,
+            cp.full_path                                                      AS category,
+            s.Categories_Id                                                   AS categories_id,
+            ABS(s.Amount *
+                CASE WHEN cur.Currencies_ShortName = 'EUR' THEN 1
+                     ELSE COALESCE(fx.FX_Rate, 1) END)                       AS amount_eur,
+            COALESCE(s.Memo, t.Description)                                   AS notes
+        FROM Splits s
+        JOIN Transactions t  ON t.Transactions_Id = s.Transactions_Id
+        JOIN cat_path cp     ON cp.Categories_Id  = s.Categories_Id
+        LEFT JOIN Payees p   ON p.Payees_Id       = t.Payees_Id
+        JOIN Accounts a      ON a.Accounts_Id     = t.Accounts_Id
+        JOIN Currencies cur  ON cur.Currencies_Id = a.Currencies_Id
+        LEFT JOIN fx         ON fx.Currencies_Id_1 = a.Currencies_Id
+        WHERE t.Transfers_Id IS NULL
+          AND cp.Categories_Type NOT IN ('Income', 'Transfer', 'Trading', 'Investment')
+          AND EXTRACT(year FROM t.Date) = %(year)s
+        ORDER BY cp.full_path, t.Date DESC
+    """, conn, params={"year": year})
+    conn.close()
+    if not df.empty:
+        df["date"] = pd.to_datetime(df["date"])
+    return df
+
+
+@st.cache_data(ttl=600)
+def get_portfolio_weights(account_ids: tuple = None):
+    """Position value and weight for each security in current holdings (ordered by value desc)."""
+    conn = get_connection()
+    acct_filter = (
+        f"AND h.Accounts_Id IN ({', '.join(str(int(i)) for i in account_ids)})"
+        if account_ids else ""
+    )
+    df = pd.read_sql(f"""
+        WITH Latest_FX AS (
+            SELECT DISTINCT ON (Currencies_Id_1) Currencies_Id_1, FX_Rate
+            FROM Historical_FX ORDER BY Currencies_Id_1, Date DESC
+        ),
+        Latest_Prices AS (
+            SELECT DISTINCT ON (Securities_Id) Securities_Id, Close
+            FROM Historical_Prices ORDER BY Securities_Id, Date DESC
+        ),
+        positions AS (
+            SELECT
+                s.Securities_Name AS ticker,
+                SUM(h.Quantity * COALESCE(lp.Close, 0) *
+                    CASE WHEN c.Currencies_ShortName = 'EUR' THEN 1
+                         ELSE COALESCE(fx.FX_Rate, 1) END) AS value_eur
+            FROM Holdings h
+            JOIN Securities s     ON s.Securities_Id  = h.Securities_Id
+            JOIN Currencies c     ON c.Currencies_Id  = s.Currencies_Id
+            JOIN Latest_Prices lp ON lp.Securities_Id = h.Securities_Id
+            LEFT JOIN Latest_FX fx ON fx.Currencies_Id_1 = s.Currencies_Id
+            WHERE h.Quantity > 0
+            {acct_filter}
+            GROUP BY s.Securities_Name
+        )
+        SELECT
+            ticker,
+            value_eur,
+            value_eur / NULLIF(SUM(value_eur) OVER (), 0) AS weight
+        FROM positions
+        WHERE value_eur > 0
+        ORDER BY value_eur DESC
+    """, conn)
+    conn.close()
+    return df
+
+
+@st.cache_data(ttl=600)
+def get_investable_portfolio_value(account_ids: tuple = None) -> float:
+    """Returns the total value in EUR of investable assets: holdings + pension + other investment cash.
+    When account_ids is provided only those accounts are included."""
+    conn = get_connection()
+    acct_filter_h = (
+        f"AND h.Accounts_Id IN ({', '.join(str(int(i)) for i in account_ids)})"
+        if account_ids else ""
+    )
+    acct_filter_a = (
+        f"AND a.Accounts_Id IN ({', '.join(str(int(i)) for i in account_ids)})"
+        if account_ids else ""
+    )
+    row = pd.read_sql(f"""
+        WITH Latest_FX AS (
+            SELECT DISTINCT ON (Currencies_Id_1) Currencies_Id_1, FX_Rate
+            FROM Historical_FX ORDER BY Currencies_Id_1, Date DESC
+        ),
+        Latest_Prices AS (
+            SELECT DISTINCT ON (Securities_Id) Securities_Id, Close
+            FROM Historical_Prices ORDER BY Securities_Id, Date DESC
+        ),
+        holdings_val AS (
+            SELECT SUM(
+                h.Quantity * COALESCE(lp.Close, 0) *
+                CASE WHEN c.Currencies_ShortName = 'EUR' THEN 1
+                     ELSE COALESCE(fx.FX_Rate, 1) END
+            ) AS val
+            FROM Holdings h
+            JOIN Securities s    ON s.Securities_Id  = h.Securities_Id
+            JOIN Currencies c    ON c.Currencies_Id  = s.Currencies_Id
+            JOIN Latest_Prices lp ON lp.Securities_Id = h.Securities_Id
+            LEFT JOIN Latest_FX fx ON fx.Currencies_Id_1 = s.Currencies_Id
+            WHERE h.Quantity <> 0
+            {acct_filter_h}
+        ),
+        acct_val AS (
+            SELECT SUM(
+                a.Accounts_Balance *
+                CASE WHEN c.Currencies_ShortName = 'EUR' THEN 1
+                     ELSE COALESCE(fx.FX_Rate, 1) END
+            ) AS val
+            FROM Accounts a
+            JOIN Currencies c    ON c.Currencies_Id  = a.Currencies_Id
+            LEFT JOIN Latest_FX fx ON fx.Currencies_Id_1 = a.Currencies_Id
+            WHERE a.Is_Active = TRUE
+              AND a.Accounts_Type IN ('Pension', 'Other Investment')
+            {acct_filter_a}
+        )
+        SELECT COALESCE(hv.val, 0) + COALESCE(av.val, 0) AS total
+        FROM holdings_val hv, acct_val av
+    """, conn)
+    conn.close()
+    if row.empty:
+        return 0.0
+    return float(row.iloc[0]["total"] or 0.0)
+
+
+# ======================================================
+# A3. SPENDING TRENDS
+# ======================================================
+
+@st.cache_data(ttl=300)
+def get_spending_trends(months: int = 24):
+    """Monthly spending per top-level expense category."""
+    conn = get_connection()
+    df = pd.read_sql("""
+        WITH fx AS (
+            SELECT DISTINCT ON (Currencies_Id_1) Currencies_Id_1, FX_Rate
+            FROM Historical_FX ORDER BY Currencies_Id_1, Date DESC
+        ),
+        root_cat AS (
+            SELECT c.Categories_Id,
+                   COALESCE(p.Categories_Name, c.Categories_Name) AS top_category
+            FROM Categories c
+            LEFT JOIN Categories p ON p.Categories_Id = c.Categories_Id_Parent
+            WHERE c.Categories_Type NOT IN ('Income', 'Transfer', 'Trading', 'Investment')
+        )
+        SELECT
+            DATE_TRUNC('month', t.Date)::date AS month,
+            rc.top_category AS category,
+            ABS(SUM(s.Amount *
+                CASE WHEN cur.Currencies_ShortName = 'EUR' THEN 1
+                     ELSE COALESCE(fx.FX_Rate, 1) END)) AS amount_eur
+        FROM Splits s
+        JOIN Transactions t ON t.Transactions_Id = s.Transactions_Id
+        JOIN Categories c   ON c.Categories_Id   = s.Categories_Id
+        JOIN root_cat rc    ON rc.Categories_Id   = s.Categories_Id
+        JOIN Accounts a     ON a.Accounts_Id      = t.Accounts_Id
+        JOIN Currencies cur ON cur.Currencies_Id  = a.Currencies_Id
+        LEFT JOIN fx        ON fx.Currencies_Id_1 = a.Currencies_Id
+        WHERE c.Categories_Type NOT IN ('Income', 'Transfer', 'Trading', 'Investment')
+          AND t.Transfers_Id IS NULL
+          AND t.Date >= DATE_TRUNC('month', CURRENT_DATE) - (%(months)s || ' months')::INTERVAL
+          AND t.Date < DATE_TRUNC('month', CURRENT_DATE)
+        GROUP BY DATE_TRUNC('month', t.Date), rc.top_category
+        ORDER BY month, category
+    """, conn, params={"months": months})
+    conn.close()
+    if not df.empty:
+        df['month'] = pd.to_datetime(df['month'])
+    return df
+
+
+# ======================================================
+# A3b. INVESTMENT INCOME REPORT (Dividend / Interest)
+# ======================================================
+
+@st.cache_data(ttl=300)
+def get_investment_income_report(tax_year: int):
+    """Per-transaction dividend and interest income for a tax year, converted to EUR.
+    Uses the linked EUR cash transaction when available, else historical FX."""
+    conn = get_connection()
+    df = pd.read_sql("""
+        SELECT
+            s.Securities_Name                                               AS securities_name,
+            a.Accounts_Name                                                 AS account_name,
+            i.Date                                                          AS date,
+            i.Action                                                        AS action,
+            CASE
+                WHEN i.Transactions_Id IS NOT NULL AND t_cash.Total_Amount IS NOT NULL
+                    THEN ABS(t_cash.Total_Amount)
+                WHEN c.Currencies_ShortName != 'EUR'
+                    THEN ABS(i.Total_Amount) * COALESCE(
+                        (SELECT fx.FX_Rate FROM Historical_FX fx
+                         WHERE fx.Currencies_Id_1 = c.Currencies_Id
+                           AND fx.Date <= i.Date
+                         ORDER BY fx.Date DESC LIMIT 1),
+                        (SELECT fx.FX_Rate FROM Historical_FX fx
+                         WHERE fx.Currencies_Id_1 = c.Currencies_Id
+                         ORDER BY fx.Date ASC LIMIT 1),
+                        1.0)
+                ELSE ABS(i.Total_Amount)
+            END                                                             AS amount_eur
+        FROM Investments i
+        JOIN Securities   s      ON s.Securities_Id      = i.Securities_Id
+        JOIN Accounts     a      ON a.Accounts_Id        = i.Accounts_Id
+        JOIN Currencies   c      ON c.Currencies_Id      = s.Currencies_Id
+        LEFT JOIN Transactions t_cash ON t_cash.Transactions_Id = i.Transactions_Id
+        WHERE i.Action IN ('Dividend', 'IntInc', 'RtrnCap')
+          AND EXTRACT(year FROM i.Date) = %(tax_year)s
+          AND i.Total_Amount > 0
+        ORDER BY i.Date DESC, s.Securities_Name
+    """, conn, params={"tax_year": tax_year})
+    conn.close()
+    if not df.empty:
+        df['date'] = pd.to_datetime(df['date'])
+    return df
+
+
+# ======================================================
+# A4. CAPITAL GAINS REPORT
+# ======================================================
+
+@st.cache_data(ttl=300)
+def get_capital_gains_report(tax_year: int):
+    """Capital gains report for a given tax year.
+
+    WAC cost basis is computed per-sell from buys that occurred on or before the sell
+    date, so partial-close scenarios are handled correctly. CashIn is included to cover
+    CD / money-market instruments that use that action for purchase.
+    """
+    conn = get_connection()
+    df = pd.read_sql("""
+        WITH
+        -- Per-transaction EUR amount: prefer the linked cash-side Transactions row
+        -- (recorded in the EUR account at the broker's actual FX rate, inclusive of
+        -- all fees), then fall back to native amount × closest historical FX rate.
+        txn_with_eur AS (
+            SELECT
+                i.Investments_Id,
+                i.Securities_Id,
+                i.Accounts_Id,
+                i.Date,
+                i.Action,
+                i.Quantity,
+                i.Total_Amount,
+                i.Price_Per_Share,
+                i.Transactions_Id,
+                CASE
+                    -- Linked EUR cash transaction: use its absolute amount directly.
+                    WHEN i.Transactions_Id IS NOT NULL
+                     AND t_cash.Total_Amount IS NOT NULL
+                    THEN ABS(t_cash.Total_Amount)
+                    -- No link: convert native amount at the closest historical FX rate.
+                    WHEN c.Currencies_ShortName != 'EUR'
+                    THEN ABS(i.Total_Amount) * COALESCE(
+                        (SELECT fx.FX_Rate
+                         FROM Historical_FX fx
+                         WHERE fx.Currencies_Id_1 = c.Currencies_Id
+                           AND fx.Date <= i.Date
+                         ORDER BY fx.Date DESC LIMIT 1),
+                        (SELECT fx.FX_Rate
+                         FROM Historical_FX fx
+                         WHERE fx.Currencies_Id_1 = c.Currencies_Id
+                         ORDER BY fx.Date ASC LIMIT 1),
+                        1.0
+                    )
+                    -- Already EUR.
+                    ELSE ABS(i.Total_Amount)
+                END AS amount_eur,
+                -- Store whether the linked cash tx was used (for transparency).
+                (i.Transactions_Id IS NOT NULL AND t_cash.Total_Amount IS NOT NULL) AS has_linked_tx
+            FROM Investments i
+            JOIN Securities   s      ON s.Securities_Id      = i.Securities_Id
+            JOIN Currencies   c      ON c.Currencies_Id      = s.Currencies_Id
+            LEFT JOIN Transactions t_cash ON t_cash.Transactions_Id = i.Transactions_Id
+        ),
+        -- Running net quantity after every transaction (for position tracking).
+        txn_running_pos AS (
+            SELECT
+                tf.*,
+                SUM(
+                    CASE
+                        WHEN tf.Action IN ('Buy','ShrIn','Reinvest','Vest','Grant','Exercise','CashIn')
+                             THEN  ABS(tf.Quantity)
+                        WHEN tf.Action IN ('Sell','ShrOut','Expire')
+                             THEN -ABS(tf.Quantity)
+                        ELSE 0
+                    END
+                ) OVER (
+                    PARTITION BY tf.Securities_Id, tf.Accounts_Id
+                    ORDER BY tf.Date, tf.Investments_Id
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                ) AS running_qty
+            FROM txn_with_eur tf
+        ),
+        -- For each sell in the tax year: the most recent date (strictly before the sell)
+        -- when the position was fully closed (running_qty = 0).  NULL = no prior close.
+        last_full_close AS (
+            SELECT
+                s.Investments_Id    AS sell_id,
+                MAX(b.Date)         AS last_close_date
+            FROM txn_running_pos s
+            JOIN txn_running_pos b
+                ON  b.Securities_Id = s.Securities_Id
+                AND b.Accounts_Id   = s.Accounts_Id
+                AND b.Date          < s.Date
+                AND b.running_qty   = 0
+            WHERE s.Action IN ('Sell', 'Expire')
+              AND EXTRACT(year FROM s.Date) = %(tax_year)s
+            GROUP BY s.Investments_Id
+        ),
+        -- WAC cost basis in EUR per share, using only buys in the current open position.
+        -- Each buy uses its linked EUR cash amount when available, else historical FX.
+        buy_basis_per_sell AS (
+            SELECT
+                sell.Investments_Id                                              AS sell_id,
+                SUM(buy.amount_eur) / NULLIF(SUM(ABS(buy.Quantity)), 0)         AS wac_per_share_eur
+            FROM txn_running_pos sell
+            LEFT JOIN last_full_close lfc ON lfc.sell_id = sell.Investments_Id
+            JOIN txn_running_pos buy
+                ON  buy.Securities_Id = sell.Securities_Id
+                AND buy.Accounts_Id   = sell.Accounts_Id
+                AND buy.Date         <= sell.Date
+                AND buy.Date          > COALESCE(lfc.last_close_date, '1900-01-01'::date)
+                AND buy.Action        IN ('Buy', 'Reinvest', 'ShrIn', 'CashIn')
+                AND buy.Quantity       > 0
+            WHERE sell.Action IN ('Sell', 'Expire')
+              AND EXTRACT(year FROM sell.Date) = %(tax_year)s
+            GROUP BY sell.Investments_Id
+        ),
+        -- Most recent buy in the current open position (for short/long-term classification)
+        last_buy_per_sell AS (
+            SELECT
+                sell.Investments_Id AS sell_id,
+                MAX(buy.Date)       AS last_buy_date
+            FROM txn_running_pos sell
+            LEFT JOIN last_full_close lfc ON lfc.sell_id = sell.Investments_Id
+            JOIN txn_running_pos buy
+                ON  buy.Securities_Id = sell.Securities_Id
+                AND buy.Accounts_Id   = sell.Accounts_Id
+                AND buy.Date         <= sell.Date
+                AND buy.Date          > COALESCE(lfc.last_close_date, '1900-01-01'::date)
+                AND buy.Action        IN ('Buy', 'Reinvest', 'ShrIn', 'CashIn')
+            WHERE sell.Action IN ('Sell', 'Expire')
+              AND EXTRACT(year FROM sell.Date) = %(tax_year)s
+            GROUP BY sell.Investments_Id
+        )
+        SELECT
+            s.Securities_Name                                               AS securities_name,
+            a.Accounts_Name                                                 AS account_name,
+            i.Date                                                          AS sell_date,
+            ABS(i.Quantity)                                                 AS quantity,
+            i.Price_Per_Share                                               AS sell_price,
+            -- Proceeds in EUR: linked cash tx if available, else historical FX conversion
+            itf.amount_eur                                                  AS sell_amount_eur,
+            -- Cost basis in EUR: WAC from buys (each already EUR via linked tx or FX)
+            ABS(i.Quantity) * COALESCE(
+                bb.wac_per_share_eur,
+                i.Price_Per_Share * (itf.amount_eur / NULLIF(ABS(i.Total_Amount), 0))
+            )                                                               AS cost_basis_eur,
+            -- Gain/Loss = EUR proceeds − EUR cost basis
+            itf.amount_eur
+                - ABS(i.Quantity) * COALESCE(
+                    bb.wac_per_share_eur,
+                    i.Price_Per_Share * (itf.amount_eur / NULLIF(ABS(i.Total_Amount), 0))
+                )                                                           AS gain_loss_eur,
+            CASE
+                WHEN lb.last_buy_date IS NULL
+                     OR (i.Date - lb.last_buy_date) < 365
+                THEN 'Short-term'
+                ELSE 'Long-term'
+            END                                                             AS holding_type
+        FROM Investments i
+        JOIN txn_with_eur        itf ON itf.Investments_Id = i.Investments_Id
+        JOIN Securities          s   ON s.Securities_Id    = i.Securities_Id
+        JOIN Accounts            a   ON a.Accounts_Id      = i.Accounts_Id
+        LEFT JOIN buy_basis_per_sell bb ON bb.sell_id      = i.Investments_Id
+        LEFT JOIN last_buy_per_sell  lb ON lb.sell_id      = i.Investments_Id
+        WHERE i.Action IN ('Sell', 'Expire')
+          AND EXTRACT(year FROM i.Date) = %(tax_year)s
+        ORDER BY i.Date
+    """, conn, params={"tax_year": tax_year})
+    conn.close()
+    if not df.empty:
+        df['sell_date'] = pd.to_datetime(df['sell_date'])
+    return df
+
+
+# ======================================================
+# A5. TAX-LOSS HARVESTING
+# ======================================================
+
+@st.cache_data(ttl=300)
+def get_tax_loss_opportunities():
+    """Current positions with unrealized losses (tax-loss harvesting candidates)."""
+    conn = get_connection()
+    df = pd.read_sql("""
+        WITH fx AS (
+            SELECT DISTINCT ON (Currencies_Id_1) Currencies_Id_1, FX_Rate
+            FROM Historical_FX ORDER BY Currencies_Id_1, Date DESC
+        ),
+        latest_price AS (
+            SELECT DISTINCT ON (Securities_Id) Securities_Id, Close
+            FROM Historical_Prices ORDER BY Securities_Id, Date DESC
+        )
+        SELECT
+            s.Securities_Name       AS securities_name,
+            s.Securities_Type       AS securities_type,
+            SUM(h.Quantity)         AS quantity,
+            lp.Close                AS current_price,
+            AVG(h.Fifo_Avg_Price)   AS cost_basis,
+            SUM(h.Quantity * lp.Close) *
+                CASE WHEN cur.Currencies_ShortName = 'EUR' THEN 1
+                     ELSE COALESCE(fx.FX_Rate, 1) END AS current_value_eur,
+            SUM(h.Quantity * h.Fifo_Avg_Price) *
+                CASE WHEN cur.Currencies_ShortName = 'EUR' THEN 1
+                     ELSE COALESCE(fx.FX_Rate, 1) END AS cost_basis_eur,
+            (SUM(h.Quantity * lp.Close) - SUM(h.Quantity * h.Fifo_Avg_Price)) *
+                CASE WHEN cur.Currencies_ShortName = 'EUR' THEN 1
+                     ELSE COALESCE(fx.FX_Rate, 1) END AS unrealized_loss_eur,
+            CASE WHEN SUM(h.Quantity * h.Fifo_Avg_Price) > 0
+                 THEN ROUND(((SUM(h.Quantity * lp.Close) - SUM(h.Quantity * h.Fifo_Avg_Price))
+                              / SUM(h.Quantity * h.Fifo_Avg_Price) * 100)::numeric, 2)
+                 ELSE 0 END AS loss_pct
+        FROM Holdings h
+        JOIN Securities s    ON s.Securities_Id   = h.Securities_Id
+        JOIN Currencies cur  ON cur.Currencies_Id = s.Currencies_Id
+        JOIN latest_price lp ON lp.Securities_Id  = h.Securities_Id
+        LEFT JOIN fx         ON fx.Currencies_Id_1 = s.Currencies_Id
+        WHERE h.Quantity > 0
+        GROUP BY s.Securities_Id, s.Securities_Name, s.Securities_Type,
+                 lp.Close, cur.Currencies_ShortName, fx.FX_Rate
+        HAVING (SUM(h.Quantity * lp.Close) - SUM(h.Quantity * h.Fifo_Avg_Price)) *
+               CASE WHEN cur.Currencies_ShortName = 'EUR' THEN 1
+                    ELSE COALESCE(fx.FX_Rate, 1) END < 0
+        ORDER BY unrealized_loss_eur ASC
+    """, conn)
+    conn.close()
+    return df
+
+
+# ======================================================
+# A6. GOALS TABLE + CRUD
+# ======================================================
+
+def ensure_goals_table():
+    """Create Goals table if it does not exist."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS Goals (
+            Goal_Id         SERIAL PRIMARY KEY,
+            Goal_Name       VARCHAR(200) NOT NULL,
+            Target_Amount   NUMERIC(15,2) NOT NULL,
+            Target_Date     DATE,
+            Current_Amount  NUMERIC(15,2) DEFAULT 0,
+            Notes           TEXT,
+            Is_Active       BOOLEAN DEFAULT TRUE,
+            Created_At      TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def get_goals():
+    """Return all active goals with progress_pct."""
+    ensure_goals_table()
+    conn = get_connection()
+    df = pd.read_sql("""
+        SELECT Goal_Id AS goal_id,
+               Goal_Name AS goal_name,
+               Target_Amount AS target_amount,
+               Target_Date AS target_date,
+               Current_Amount AS current_amount,
+               Notes AS notes,
+               Is_Active AS is_active,
+               Created_At AS created_at,
+               CASE WHEN Target_Amount > 0
+                    THEN ROUND((Current_Amount / Target_Amount * 100)::numeric, 1)
+                    ELSE 0 END AS progress_pct
+        FROM Goals
+        WHERE Is_Active = TRUE
+        ORDER BY Target_Date NULLS LAST, Goal_Name
+    """, conn)
+    conn.close()
+    if not df.empty:
+        df['target_date'] = pd.to_datetime(df['target_date'])
+        df['created_at'] = pd.to_datetime(df['created_at'])
+    return df
+
+
+def upsert_goal(goal_id, name, target_amount, target_date, current_amount, notes):
+    """Insert or update a goal."""
+    ensure_goals_table()
+    conn = get_connection()
+    cur = conn.cursor()
+    if goal_id is None:
+        cur.execute("""
+            INSERT INTO Goals (Goal_Name, Target_Amount, Target_Date, Current_Amount, Notes)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (name, target_amount, target_date if target_date else None, current_amount, notes))
+    else:
+        cur.execute("""
+            UPDATE Goals SET Goal_Name=%s, Target_Amount=%s, Target_Date=%s,
+                             Current_Amount=%s, Notes=%s
+            WHERE Goal_Id=%s
+        """, (name, target_amount, target_date if target_date else None, current_amount, notes, goal_id))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def delete_goal(goal_id: int):
+    """Soft-delete a goal."""
+    ensure_goals_table()
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE Goals SET Is_Active = FALSE WHERE Goal_Id = %s", (goal_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+# ======================================================
+# A7. PRICE RETURNS (CORRELATION MATRIX)
+# ======================================================
+
+@st.cache_data(ttl=3600)
+def get_price_returns(lookback_days: int = 252, account_ids: tuple = None):
+    """Wide DataFrame of daily close prices for current holdings."""
+    conn = get_connection()
+    acct_filter = (
+        f"AND h.Accounts_Id IN ({', '.join(str(int(i)) for i in account_ids)})"
+        if account_ids else ""
+    )
+    df = pd.read_sql(f"""
+        WITH held AS (
+            SELECT DISTINCT h.Securities_Id
+            FROM Holdings h
+            WHERE h.Quantity > 0
+            {acct_filter}
+        ),
+        price_counts AS (
+            SELECT hp.Securities_Id, COUNT(*) AS cnt
+            FROM Historical_Prices hp
+            JOIN held ON held.Securities_Id = hp.Securities_Id
+            GROUP BY hp.Securities_Id
+            HAVING COUNT(*) >= 30
+        )
+        SELECT
+            hp.Date                 AS date,
+            s.Securities_Name       AS ticker,
+            hp.Close                AS close
+        FROM Historical_Prices hp
+        JOIN price_counts pc ON pc.Securities_Id = hp.Securities_Id
+        JOIN Securities s   ON s.Securities_Id   = hp.Securities_Id
+        WHERE hp.Date >= CURRENT_DATE - (%(lookback)s || ' days')::INTERVAL
+        ORDER BY hp.Date
+    """, conn, params={"lookback": lookback_days})
+    conn.close()
+    if df.empty:
+        return df
+    df['date'] = pd.to_datetime(df['date'])
+    wide = df.pivot_table(index='date', columns='ticker', values='close', aggfunc='mean')
+    return wide

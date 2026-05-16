@@ -2,7 +2,8 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 from ui.components import format_qty_display, color_negative_red, style_qty_display, copy_df_button
-from database.queries import get_hist_net_worth_data, get_transaction_anomalies, get_weekly_summaries, get_all_accounts_for_nwr, get_nwr_account_selection
+from database.queries import get_hist_net_worth_data, get_transaction_anomalies, get_weekly_summaries, get_all_accounts_for_nwr, get_nwr_account_selection, get_savings_rate_data
+from database.connection import get_connection
 from database.crud import update_accounts_balances, update_holdings, update_investment_balances, update_pension_balances, save_nwr_account_selection
 from datetime import datetime
 from ai.weekly_summary import run as run_weekly_summary
@@ -270,12 +271,50 @@ def render_dashboard(conn):
             st.plotly_chart(fig_pie, width="stretch")
 
         # ── Summary metrics ───────────────────────────────────────────────
-        m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("Net Worth",   f"€ {df_net['value_eur'].sum():,.2f}")
-        m2.metric("Assets",      f"€ {df_net[df_net['type']=='Assets']['value_eur'].sum():,.2f}")
-        m3.metric("Cash",        f"€ {df_net[df_net['type']=='Cash']['value_eur'].sum():,.2f}")
-        m4.metric("Pension",     f"€ {df_net[df_net['type']=='Pension']['value_eur'].sum():,.2f}")
-        m5.metric("Investments", f"€ {df_net[df_net['type']=='Investment']['value_eur'].sum():,.2f}")
+        # Savings rate for current month vs previous month
+        _sr_delta_str = ""
+        _sr_income = _sr_expenses = 0.0
+        try:
+            _sr_df = get_savings_rate_data(months=2)
+            if len(_sr_df) >= 2:
+                _sr_cur       = _sr_df.iloc[-1]["savings_rate_pct"]
+                _sr_prev      = _sr_df.iloc[-2]["savings_rate_pct"]
+                _sr_delta_str = f"{_sr_cur - _sr_prev:+.1f}%"
+                _sr_income    = float(_sr_df.iloc[-1]["income_eur"])
+                _sr_expenses  = float(_sr_df.iloc[-1]["expenses_eur"])
+            elif len(_sr_df) == 1:
+                _sr_cur      = _sr_df.iloc[0]["savings_rate_pct"]
+                _sr_income   = float(_sr_df.iloc[0]["income_eur"])
+                _sr_expenses = float(_sr_df.iloc[0]["expenses_eur"])
+            else:
+                _sr_cur = 0.0
+        except Exception:
+            _sr_cur = 0.0
+
+        _nw        = df_net['value_eur'].sum()
+        _assets    = df_net[df_net['type'] == 'Assets']['value_eur'].sum()
+        _cash      = df_net[df_net['type'] == 'Cash']['value_eur'].sum()
+        _pension   = df_net[df_net['type'] == 'Pension']['value_eur'].sum()
+        _inv       = df_net[df_net['type'] == 'Investment']['value_eur'].sum()
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Net Worth",   f"€ {_nw:,.2f}")
+        m2.metric("Assets",      f"€ {_assets:,.2f}")
+        m3.metric("Cash",        f"€ {_cash:,.2f}")
+
+        m4, m5, m6 = st.columns(3)
+        m4.metric("Pension",      f"€ {_pension:,.2f}")
+        m5.metric("Investments",  f"€ {_inv:,.2f}")
+        m6.metric("Savings Rate", f"{_sr_cur:.1f}%", delta=_sr_delta_str if _sr_delta_str else None)
+        if _sr_income or _sr_expenses:
+            m6.markdown(
+                f'<div style="font-size:0.82em; margin-top:-8px">'
+                f'<span style="color:#2ECC71">▲ € {_sr_income:,.0f}</span>'
+                f' &nbsp; '
+                f'<span style="color:#E74C3C">▼ € {_sr_expenses:,.0f}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
 
         # ── Detail table ──────────────────────────────────────────────────
         new_order  = ['name', 'type', 'curr', 'qty', 'qty_display', 'value_eur']
@@ -301,6 +340,43 @@ def render_dashboard(conn):
             },
         )
         copy_df_button(styled_df, key="dl_dashboard_portfolio")
+
+        # ── Upcoming Bills widget ─────────────────────────────────────────
+        st.markdown("#### \U0001f4c5 Upcoming Bills (Next 14 Days)")
+        try:
+            _bills_conn = get_connection()
+            df_bills = pd.read_sql("""
+                SELECT
+                    t.Date         AS date,
+                    p.Payees_Name  AS payee,
+                    t.Total_Amount AS amount,
+                    STRING_AGG(DISTINCT c.Categories_Name, ', ') AS category
+                FROM Transactions t
+                LEFT JOIN Payees p      ON p.Payees_Id      = t.Payees_Id
+                LEFT JOIN Splits s      ON s.Transactions_Id = t.Transactions_Id
+                LEFT JOIN Categories c  ON c.Categories_Id   = s.Categories_Id
+                WHERE t.Date > CURRENT_DATE
+                  AND t.Date <= CURRENT_DATE + INTERVAL '14 days'
+                GROUP BY t.Transactions_Id, t.Date, p.Payees_Name, t.Total_Amount
+                ORDER BY t.Date
+            """, _bills_conn)
+            _bills_conn.close()
+            if df_bills.empty:
+                st.success("No bills due in the next 14 days ✅")
+            else:
+                df_bills['date'] = pd.to_datetime(df_bills['date']).dt.strftime('%Y-%m-%d')
+                st.dataframe(
+                    df_bills.style.format({"amount": "{:,.2f} €"}),
+                    hide_index=True, width="stretch",
+                    column_config={
+                        "date":     "Date",
+                        "payee":    "Payee",
+                        "amount":   st.column_config.NumberColumn("Amount (€)", format="%.2f €"),
+                        "category": "Category",
+                    },
+                )
+        except Exception as _e:
+            st.info(f"Upcoming bills unavailable: {_e}")
 
     # Update buttons
     # Custom CSS to center the "Update All" button row and add spacing

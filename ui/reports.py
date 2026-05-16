@@ -13,6 +13,17 @@ from database.queries import (
     get_cash_flow_forecast, get_dividend_tracker_data, get_asset_allocation_data,
     get_sector_allocation_data, get_allocation_targets, save_allocation_targets,
     get_fx_exposure_data, get_bond_schedule_data,
+    get_savings_rate_data,
+    upsert_budget, delete_budget, get_budget_vs_actual,
+    get_ytd_expense_transactions,
+    get_spending_trends,
+    get_investment_income_report,
+    get_capital_gains_report, get_tax_loss_opportunities,
+    get_goals, upsert_goal, delete_goal,
+    get_price_returns,
+    get_portfolio_weights,
+    get_investable_portfolio_value,
+    get_investment_accounts,
 )
 from data.downloaders import download_historical_fx, download_historical_prices_from_tradingview, download_historical_prices_from_yahoo, download_bond_prices_from_solidus, download_securities_info_from_yahoo
 from ui.components import color_negative_red, color_value, custom_metric, get_color, copy_df_button
@@ -30,7 +41,10 @@ def render_reports():
             "Cash Flow Forecast",
             "Investment Positions",
             "Investment Performance",
+            "Investment Tax Report",
             "Securities & Portfolio Analysis",
+            "Budget & Spending",
+            "Financial Planning",
         ],
         key="hist_sub_nav"
     )
@@ -144,7 +158,41 @@ def render_reports():
             render_fx_exposure()
 
     elif hist_sub_menu == "Investment Performance":
-        tab_report, tab_movers, tab_savings, tab_dividends, tab_bonds = st.tabs(["📊 P&L Report", "🚀 Top Movers", "💰 Savings", "💸 Dividend Tracker", "📋 Bond Schedule"])
+        # ── Investment account selection for Risk / Correlation / Monte Carlo ──
+        df_inv_accounts = get_investment_accounts()
+        inv_all_ids     = df_inv_accounts['accounts_id'].tolist()
+
+        saved_risk_ids  = get_nwr_account_selection('risk_metrics_account_ids')
+        init_risk_sel   = set(saved_risk_ids) if saved_risk_ids is not None else set(inv_all_ids)
+
+        df_inv_sel = df_inv_accounts.copy()
+        df_inv_sel.insert(0, 'Include', df_inv_sel['accounts_id'].isin(init_risk_sel))
+
+        risk_selected_ids = list(init_risk_sel)
+        with st.expander("⚙️ Investment Account Selection (Risk / Correlation / Monte Carlo)", expanded=False):
+            edited_inv_df = st.data_editor(
+                df_inv_sel.rename(columns={'accounts_name': 'Account', 'accounts_type': 'Type'}),
+                column_config={
+                    'Include':     st.column_config.CheckboxColumn('Include', default=True),
+                    'accounts_id': None,
+                },
+                hide_index=True,
+                width="stretch",
+                disabled=['Account', 'Type'],
+                key="risk_account_editor",
+            )
+            risk_selected_ids = edited_inv_df[edited_inv_df['Include']]['accounts_id'].tolist()
+            col_save_risk, _ = st.columns([1, 4])
+            if col_save_risk.button("💾 Save Selection", key="risk_acct_save"):
+                save_nwr_account_selection(risk_selected_ids, 'risk_metrics_account_ids')
+                st.success("Account selection saved!")
+
+        _risk_acct_ids = tuple(sorted(risk_selected_ids)) if risk_selected_ids else None
+
+        tab_report, tab_movers, tab_savings, tab_dividends, tab_bonds, tab_risk, tab_corr, tab_monte = st.tabs([
+            "📊 P&L Report", "🚀 Top Movers", "💰 Savings", "💸 Dividend Tracker",
+            "📋 Bond Schedule", "⚡ Risk Metrics", "🔗 Correlation", "🎲 Monte Carlo",
+        ])
         
         with tab_report:
             st.subheader("📈 Profit & Loss")
@@ -1160,6 +1208,15 @@ def render_reports():
         with tab_bonds:
             render_bond_schedule()
 
+        with tab_risk:
+            render_risk_metrics(account_ids=_risk_acct_ids)
+
+        with tab_corr:
+            render_correlation_matrix(account_ids=_risk_acct_ids)
+
+        with tab_monte:
+            render_monte_carlo(account_ids=_risk_acct_ids)
+
     elif hist_sub_menu == "Securities & Portfolio Analysis":
         # 1. Tabs
         tab_change, tab_volat, tab_inv_signals, tab_port_signals = st.tabs(["📈 Price Change %", "🌊 Volatility", "🎯 Investment Signals", "📢 Portfolio Action Signals"])
@@ -1512,6 +1569,14 @@ def render_reports():
     elif hist_sub_menu == "Cash Flow Forecast":
         render_cash_flow_forecast()
 
+    elif hist_sub_menu == "Budget & Spending":
+        render_budget_and_spending()
+
+    elif hist_sub_menu == "Investment Tax Report":
+        render_tax_report()
+
+    elif hist_sub_menu == "Financial Planning":
+        render_financial_planning()
 
 
 def render_income_expense_reports():
@@ -2381,7 +2446,7 @@ def render_cash_flow_forecast():
     days        = int(horizon.split()[0])
     months_back = st.sidebar.slider(
         "Recurring detection window (months):",
-        min_value=2, max_value=6, value=3, step=1,
+        min_value=2, max_value=6, value=2, step=1,
         key="cf_months_back",
         help="A payee must appear in every one of these last complete calendar months to be flagged as recurring.",
     )
@@ -3549,3 +3614,1120 @@ def render_net_worth_report():
                         column_config={'Security': st.column_config.TextColumn("Security", pinned=True)},
                     )
                     copy_df_button(detail_pivot_ab, key="dl_rpt_nwr_detail_ab")
+
+# ======================================================
+# B3. SAVINGS RATE
+# ======================================================
+
+def render_savings_rate():
+    """Render the Savings Rate report."""
+    st.subheader("\U0001f4b0 Savings Rate")
+    st.caption(
+        "**Savings Rate = (Income − Expenses) ÷ Income × 100.** "
+        "A rate above 20% is generally considered healthy; above 50% is excellent for building long-term wealth."
+    )
+
+    months = st.sidebar.slider(
+        "Months back", min_value=6, max_value=36, value=12, key="sr_months",
+        help="How many complete past calendar months to include in the chart.",
+    )
+    col_btn, _ = st.columns([1, 4])
+    if col_btn.button("\U0001f504 Refresh", key="sr_refresh"):
+        get_savings_rate_data.clear()
+        st.rerun()
+
+    df = get_savings_rate_data(months)
+    if df.empty:
+        st.info("No savings rate data available for the selected period.")
+        return
+
+    avg_income   = df["income_eur"].mean()
+    avg_expenses = df["expenses_eur"].mean()
+    avg_rate     = df["savings_rate_pct"].mean()
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Avg Monthly Income",   f"€ {avg_income:,.2f}")
+    m2.metric("Avg Monthly Expenses", f"€ {avg_expenses:,.2f}")
+    m3.metric("Avg Savings Rate",     f"{avg_rate:.1f}%")
+
+    df_plot = df.copy()
+    df_plot["month_str"] = df_plot["month"].dt.strftime("%b %Y")
+
+    fig = go.Figure()
+    fig.add_bar(x=df_plot["month_str"], y=df_plot["income_eur"],   name="Income",   marker_color="#2ECC71")
+    fig.add_bar(x=df_plot["month_str"], y=df_plot["expenses_eur"], name="Expenses", marker_color="#E74C3C")
+    fig.add_scatter(x=df_plot["month_str"], y=df_plot["savings_rate_pct"],
+                    name="Savings Rate %", yaxis="y2",
+                    mode="lines+markers", line=dict(color="#F39C12", width=2))
+    fig.update_layout(
+        template="plotly_dark",
+        barmode="group",
+        title="<b>Monthly Income vs Expenses & Savings Rate</b>",
+        yaxis=dict(title="Amount (€)"),
+        yaxis2=dict(title="Savings Rate (%)", overlaying="y", side="right", tickformat=".1f"),
+        legend=dict(orientation="h", yanchor="bottom", y=-0.25, xanchor="center", x=0.5),
+        margin=dict(l=0, r=0, t=50, b=0),
+    )
+    st.plotly_chart(fig, width="stretch")
+
+    df_display = df_plot[["month_str", "income_eur", "expenses_eur", "savings_eur", "savings_rate_pct"]].copy()
+    df_display.columns = ["Month", "Income (€)", "Expenses (€)", "Savings (€)", "Savings Rate (%)"]
+    st.dataframe(
+        df_display.style.format({
+            "Income (€)":      "€ {:,.2f}",
+            "Expenses (€)":    "€ {:,.2f}",
+            "Savings (€)":     "€ {:,.2f}",
+            "Savings Rate (%)": "{:.1f}%",
+        }).map(color_negative_red, subset=["Savings (€)"]),
+        hide_index=True, width="stretch",
+    )
+
+
+# ======================================================
+# B4. BUDGET VS ACTUAL
+# ======================================================
+
+def render_budget_vs_actual():
+    """Render the Annual Budget vs Actual report."""
+    st.subheader("\U0001f4ca Budget vs Actual")
+    now = datetime.now()
+
+    # ---- Controls (on-screen, not sidebar) ----
+    ctrl1, ctrl2 = st.columns([1, 2])
+    year = int(ctrl1.number_input(
+        "Year", min_value=2000, max_value=2100, value=now.year, step=1, key="bva_year",
+        help="Calendar year to display. For the current year, actuals are year-to-date.",
+    ))
+    ref_years = int(ctrl2.slider(
+        "Reference years (for historical avg)", min_value=1, max_value=5, value=2, key="bva_ref_years",
+        help="Number of full past calendar years used to compute the Avg/Year column.",
+    ))
+
+    ytd_label  = "YTD Actual (€)" if year == now.year else "Actual (€)"
+    prior_label = f"{year - 1} Actual (€)"
+    avg_col    = f"Avg/Year ({ref_years}y) €"
+
+    st.caption(
+        f"Annual budget vs actual for **{year}**. "
+        + ("Actuals are year-to-date. " if year == now.year else "")
+        + f"**{avg_col}** is the mean of your annual spend over {year - ref_years}–{year - 1}. "
+        "Edit **Budget (€)** and press **Save All Budgets** to persist."
+    )
+
+    df = get_budget_vs_actual(int(year), ref_years)
+    if df.empty:
+        st.info("No expense data found for this year or reference period.")
+        return
+
+    # ---- Summary metrics ----
+    total_avg    = df["avg_annual_hist"].sum()
+    total_prior  = df["prior_year_amount"].sum()
+    total_budget = df["budget_amount"].sum()
+    total_actual = df["actual_amount"].sum()
+    variance     = total_budget - total_actual
+
+    sm1, sm2, sm3, sm4, sm5 = st.columns(5)
+    sm1.metric(f"Avg/Year ({ref_years}y)", f"€ {total_avg:,.2f}")
+    sm2.metric(f"{year - 1} Total",        f"€ {total_prior:,.2f}")
+    sm3.metric("Annual Budget",            f"€ {total_budget:,.2f}")
+    sm4.metric(ytd_label,                  f"€ {total_actual:,.2f}")
+    sm5.metric("Variance",                 f"€ {variance:,.2f}", delta=f"{variance:+,.2f}")
+
+    # ---- Editable budget table ----
+    st.markdown("#### Set Annual Budgets")
+    df_editor = df[[
+        "categories_name", "avg_annual_hist", "prior_year_amount",
+        "budget_amount", "actual_amount", "variance_eur", "variance_pct",
+    ]].copy()
+    df_editor.columns = [
+        "Category", avg_col, prior_label,
+        "Budget (€)", ytd_label, "Variance (€)", "Variance %",
+    ]
+
+    edited = st.data_editor(
+        df_editor,
+        disabled=["Category", avg_col, prior_label, ytd_label, "Variance (€)", "Variance %"],
+        column_config={
+            avg_col:        st.column_config.NumberColumn(format="€ %,.2f"),
+            prior_label:    st.column_config.NumberColumn(format="€ %,.2f"),
+            "Budget (€)":   st.column_config.NumberColumn(format="€ %,.2f", min_value=0.0, step=100.0),
+            ytd_label:      st.column_config.NumberColumn(format="€ %,.2f"),
+            "Variance (€)": st.column_config.NumberColumn(format="€ %,.2f"),
+            "Variance %":   st.column_config.NumberColumn(format="%.1f%%"),
+        },
+        hide_index=True,
+        width="stretch",
+        key="bva_editor",
+    )
+
+    if st.button("\U0001f4be Save All Budgets", key="bva_save_all"):
+        cat_id_map = dict(zip(df["categories_name"], df["categories_id"]))
+        for _, row in edited.iterrows():
+            cat_id = cat_id_map.get(row["Category"])
+            if cat_id is not None:
+                upsert_budget(int(year), int(cat_id), float(row["Budget (€)"]))
+        get_budget_vs_actual.clear()
+        st.success("Budgets saved!")
+        st.rerun()
+
+    # ---- Grouped bar chart (budgeted categories only) ----
+    df_budgeted = df[df["budget_amount"] > 0]
+    if not df_budgeted.empty:
+        fig = go.Figure()
+        fig.add_bar(x=df_budgeted["categories_name"], y=df_budgeted["avg_annual_hist"],
+                    name=f"Avg ({ref_years}y)", marker_color="#95A5A6")
+        fig.add_bar(x=df_budgeted["categories_name"], y=df_budgeted["prior_year_amount"],
+                    name=f"{year - 1} Actual", marker_color="#F39C12")
+        fig.add_bar(x=df_budgeted["categories_name"], y=df_budgeted["budget_amount"],
+                    name="Budget", marker_color="#3498DB")
+        fig.add_bar(x=df_budgeted["categories_name"], y=df_budgeted["actual_amount"],
+                    name=ytd_label.replace(" (€)", ""), marker_color="#E74C3C")
+        fig.update_layout(
+            template="plotly_dark", barmode="group",
+            title=f"<b>Annual Budget vs Actual — {year}</b>",
+            xaxis_tickangle=-40,
+            margin=dict(l=0, r=0, t=50, b=130),
+        )
+        st.plotly_chart(fig, width="stretch")
+
+    # ---- Progress bars for budgeted categories ----
+    if not df_budgeted.empty:
+        st.markdown("#### Progress per Category")
+        pct_of_year = now.timetuple().tm_yday / 365.25 if year == now.year else 1.0
+        for _, row in df_budgeted.iterrows():
+            budget = float(row["budget_amount"])
+            actual = float(row["actual_amount"])
+            pct    = min(actual / budget, 1.0)
+            icon   = "\U0001f534" if row["over_budget"] else "\U0001f7e2"
+            pace_note = ""
+            if year == now.year and budget > 0:
+                expected = budget * pct_of_year
+                pace_note = f" · expected YTD € {expected:,.2f}"
+            st.write(
+                f"{icon} **{row['categories_name']}** — "
+                f"€ {actual:,.2f} / € {budget:,.2f}{pace_note}"
+            )
+            st.progress(pct)
+
+    # ---- Transactions drill-down by category ----
+    st.markdown(f"#### {year} Transactions by Category")
+    df_tx = get_ytd_expense_transactions(int(year))
+    if df_tx.empty:
+        st.info("No transactions found.")
+    else:
+        all_cats = sorted(df_tx["category"].unique())
+        # Build label with total so the user can see amounts in the dropdown
+        cat_totals = df_tx.groupby("category")["amount_eur"].sum()
+        cat_options = [
+            f"{cat}  —  € {cat_totals[cat]:,.2f}"
+            for cat in all_cats
+        ]
+        selected_label = st.selectbox(
+            "Select category", cat_options, key="bva_cat_drilldown",
+        )
+        selected_cat = all_cats[cat_options.index(selected_label)]
+        df_cat = df_tx[df_tx["category"] == selected_cat].copy()
+        df_cat["date"] = df_cat["date"].dt.strftime("%Y-%m-%d")
+        st.caption(f"{len(df_cat)} transaction(s) · total € {cat_totals[selected_cat]:,.2f}")
+        st.dataframe(
+            df_cat[["date", "payee", "amount_eur", "notes"]].style.format(
+                {"amount_eur": "€ {:,.2f}"}
+            ),
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "date":       "Date",
+                "payee":      "Payee",
+                "amount_eur": st.column_config.NumberColumn("Amount (€)", format="€ %,.2f"),
+                "notes":      "Notes / Memo",
+            },
+        )
+
+
+# ======================================================
+# B5. SPENDING TRENDS
+# ======================================================
+
+def render_spending_trends():
+    """Render the Spending Trends report."""
+    st.subheader("\U0001f4c8 Spending Trends")
+    st.caption(
+        "Visualise how your spending has evolved over time, broken down by top-level category. "
+        "The area chart shows the cumulative monthly total per category — a growing band means rising spend in that area. "
+        "Use the **Year-over-Year** section below to compare the same month across different years for a selected category."
+    )
+
+    months = st.sidebar.slider("Months back", min_value=6, max_value=48, value=24, key="st_months",
+                               help="Number of complete past calendar months to include.")
+
+    df = get_spending_trends(months)
+    if df.empty:
+        st.info("No spending data available.")
+        return
+
+    fig = px.area(
+        df, x="month", y="amount_eur", color="category",
+        title="<b>Monthly Spending by Category</b>",
+        template="plotly_dark",
+        labels={"amount_eur": "Amount (€)", "month": "Month", "category": "Category"},
+    )
+    fig.update_layout(margin=dict(l=0, r=0, t=50, b=0))
+    st.plotly_chart(fig, width="stretch")
+
+    st.markdown("#### Year-over-Year Comparison")
+    all_categories    = sorted(df["category"].unique().tolist())
+    selected_category = st.selectbox("Select Category for YoY", options=all_categories, key="st_yoy_cat")
+
+    df_cat = df[df["category"] == selected_category].copy()
+    df_cat["year"]      = df_cat["month"].dt.year
+    df_cat["month_num"] = df_cat["month"].dt.month
+    month_names = {1:"Jan",2:"Feb",3:"Mar",4:"Apr",5:"May",6:"Jun",
+                   7:"Jul",8:"Aug",9:"Sep",10:"Oct",11:"Nov",12:"Dec"}
+    df_cat["month_name"] = df_cat["month_num"].map(month_names)
+
+    fig_yoy = px.bar(
+        df_cat, x="month_name", y="amount_eur", color="year",
+        barmode="group",
+        title=f"<b>{selected_category} — Year-over-Year</b>",
+        template="plotly_dark",
+        labels={"amount_eur": "Amount (€)", "month_name": "Month", "year": "Year"},
+        category_orders={"month_name": list(month_names.values())},
+    )
+    fig_yoy.update_layout(margin=dict(l=0, r=0, t=50, b=0))
+    st.plotly_chart(fig_yoy, width="stretch")
+
+
+# ======================================================
+# B6. BUDGET & SPENDING PAGE
+# ======================================================
+
+def render_budget_and_spending():
+    """Budget & Spending page with 3 tabs."""
+    st.subheader("Budget & Spending")
+    tab_budget, tab_trends, tab_savings = st.tabs([
+        "\U0001f4ca Budget vs Actual",
+        "\U0001f4c8 Spending Trends",
+        "\U0001f4b0 Savings Rate",
+    ])
+    with tab_budget:
+        render_budget_vs_actual()
+    with tab_trends:
+        render_spending_trends()
+    with tab_savings:
+        render_savings_rate()
+
+
+# ======================================================
+# B7. CAPITAL GAINS
+# ======================================================
+
+def render_capital_gains():
+    """Render the Capital Gains report."""
+    st.subheader("\U0001f4cb Capital Gains Report")
+    st.caption(
+        "Lists all sell transactions for the selected tax year, showing the realised gain or loss per position. "
+        "**Short-term** gains (held ≤ 1 year) are typically taxed at a higher rate than **Long-term** gains (held > 1 year) — "
+        "check the applicable rules for your jurisdiction. "
+        "Cost basis is computed using the Weighted Average Cost method from your buy history; "
+        "for T-Bills, CDs, and bonds it falls back to the recorded purchase price."
+    )
+
+    current_year = datetime.now().year
+    year_options = list(range(current_year, current_year - 5, -1))
+    tax_year     = st.selectbox("Tax Year", options=year_options, key="cg_tax_year",
+                                help="Select the tax year for which to report realised gains and losses.")
+
+    df = get_capital_gains_report(int(tax_year))
+    if df.empty:
+        st.info(f"No sell transactions found for {tax_year}.")
+        return
+
+    total_gains  = df[df["gain_loss_eur"] > 0]["gain_loss_eur"].sum()
+    total_losses = df[df["gain_loss_eur"] < 0]["gain_loss_eur"].sum()
+    net_gl       = df["gain_loss_eur"].sum()
+    st_total     = df[df["holding_type"] == "Short-term"]["gain_loss_eur"].sum()
+    lt_total     = df[df["holding_type"] == "Long-term"]["gain_loss_eur"].sum()
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Total Gains",   f"€ {total_gains:,.2f}")
+    m2.metric("Total Losses",  f"€ {total_losses:,.2f}")
+    m3.metric("Net G/L",       f"€ {net_gl:,.2f}")
+    m4.metric("Short-term",    f"€ {st_total:,.2f}")
+    m5.metric("Long-term",     f"€ {lt_total:,.2f}")
+
+    df_display = df.copy()
+    df_display["sell_date"] = df_display["sell_date"].dt.strftime("%Y-%m-%d")
+    st.dataframe(
+        df_display.style.format({
+            "quantity":        "{:,.4f}",
+            "sell_price":      "{:,.4f}",
+            "sell_amount_eur": "{:,.2f} €",
+            "cost_basis_eur":  "{:,.2f} €",
+            "gain_loss_eur":   "{:+,.2f} €",
+        }).map(color_negative_red, subset=["gain_loss_eur"]),
+        hide_index=True, width="stretch",
+        column_config={
+            "securities_name": "Security",
+            "account_name":    "Account",
+            "sell_date":       "Sell Date",
+            "quantity":        st.column_config.NumberColumn("Quantity",      format="%,.4f"),
+            "sell_price":      st.column_config.NumberColumn("Sell Price",    format="%,.4f"),
+            "sell_amount_eur": st.column_config.NumberColumn("Proceeds (€)",  format="%,.2f €"),
+            "cost_basis_eur":  st.column_config.NumberColumn("Cost Basis (€)", format="%,.2f €"),
+            "gain_loss_eur":   st.column_config.NumberColumn("Gain / Loss (€)", format="%+,.2f €"),
+            "holding_type":    "Term",
+        },
+    )
+
+    fig = px.bar(
+        df, x="securities_name", y="gain_loss_eur", color="holding_type",
+        title="<b>Gains / Losses by Security</b>",
+        template="plotly_dark",
+        labels={"gain_loss_eur": "Gain / Loss (€)", "securities_name": "Security"},
+        barmode="group",
+    )
+    fig.update_layout(margin=dict(l=0, r=0, t=50, b=0))
+    st.plotly_chart(fig, width="stretch")
+
+
+# ======================================================
+# B8. TAX-LOSS HARVESTING
+# ======================================================
+
+def render_tax_loss_harvesting():
+    """Render Tax-Loss Harvesting opportunities."""
+    st.subheader("\U0001f33f Tax-Loss Harvesting Opportunities")
+    st.caption(
+        "**Tax-loss harvesting** is the practice of selling positions that are currently at a loss in order to realise "
+        "that loss and offset it against capital gains (or, in some jurisdictions, ordinary income up to a limit). "
+        "The table below shows all current holdings with an unrealised loss. "
+        "Selling these positions before year-end can reduce your tax liability. "
+        "Always consult a qualified tax advisor, and pay close attention to the **wash-sale** warning below."
+    )
+
+    df = get_tax_loss_opportunities()
+    if df.empty:
+        st.info("No positions with unrealized losses found. Great job!")
+        return
+
+    total_harvestable = df["unrealized_loss_eur"].sum()
+    st.metric("Total Harvestable Loss", f"€ {total_harvestable:,.2f}")
+
+    st.info(
+        "⚠️ **Wash-sale rules**: In many jurisdictions, if you sell a security at a loss "
+        "and repurchase the same (or substantially identical) security within 30 days before or "
+        "after the sale, the loss may be disallowed. Consult a tax advisor before harvesting losses."
+    )
+
+    st.dataframe(
+        df.style.format({
+            "quantity":            "{:,.4f}",
+            "current_price":       "€ {:,.4f}",
+            "cost_basis":          "€ {:,.4f}",
+            "current_value_eur":   "€ {:,.2f}",
+            "cost_basis_eur":      "€ {:,.2f}",
+            "unrealized_loss_eur": "€ {:,.2f}",
+            "loss_pct":            "{:.2f}%",
+        }).map(color_negative_red, subset=["unrealized_loss_eur", "loss_pct"]),
+        hide_index=True, width="stretch",
+    )
+
+
+# ======================================================
+# B8b. DIVIDEND & INTEREST INCOME
+# ======================================================
+
+def render_investment_income():
+    """Render the Dividend & Interest Income report."""
+    st.subheader("\U0001f4b0 Dividend & Interest Income")
+    st.caption(
+        "Per-transaction income from dividends, interest (IntInc), and return-of-capital events for the selected tax year. "
+        "All amounts are converted to EUR using the linked cash transaction (most accurate) or the closest historical FX rate. "
+        "This income is typically taxed separately from capital gains — consult your tax advisor for the applicable rates."
+    )
+
+    current_year = datetime.now().year
+    year_options = list(range(current_year, current_year - 5, -1))
+    tax_year = st.selectbox("Tax Year", options=year_options, key="inc_tax_year",
+                            help="Select the tax year for which to report dividend and interest income.")
+
+    df = get_investment_income_report(int(tax_year))
+    if df.empty:
+        st.info(f"No dividend or interest income found for {tax_year}.")
+        return
+
+    total_div  = df[df["action"] == "Dividend"]["amount_eur"].sum()
+    total_int  = df[df["action"] == "IntInc"]["amount_eur"].sum()
+    total_roc  = df[df["action"] == "RtrnCap"]["amount_eur"].sum()
+    total_all  = df["amount_eur"].sum()
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total Dividends",         f"€ {total_div:,.2f}")
+    m2.metric("Total Interest",          f"€ {total_int:,.2f}")
+    m3.metric("Return of Capital",       f"€ {total_roc:,.2f}")
+    m4.metric("Total Income",            f"€ {total_all:,.2f}")
+
+    df_display = df.copy()
+    df_display["date"] = df_display["date"].dt.strftime("%Y-%m-%d")
+    st.dataframe(
+        df_display.style.format({"amount_eur": "{:,.2f} €"}),
+        hide_index=True,
+        width="stretch",
+        column_config={
+            "securities_name": "Security",
+            "account_name":    "Account",
+            "date":            "Date",
+            "action":          "Type",
+            "amount_eur":      st.column_config.NumberColumn("Amount (€)", format="%,.2f €"),
+        },
+    )
+
+    # Chart: income by security
+    df_by_sec = (
+        df.groupby(["securities_name", "action"], as_index=False)["amount_eur"].sum()
+    )
+    fig = px.bar(
+        df_by_sec, x="securities_name", y="amount_eur", color="action",
+        title="<b>Dividend & Interest Income by Security</b>",
+        template="plotly_dark",
+        labels={"amount_eur": "Amount (€)", "securities_name": "Security", "action": "Type"},
+        barmode="stack",
+    )
+    fig.update_layout(margin=dict(l=0, r=0, t=50, b=0))
+    st.plotly_chart(fig, width="stretch")
+
+
+# ======================================================
+# B9. Investment Tax Report PAGE
+# ======================================================
+
+def render_tax_report():
+    """Investment Tax Report page."""
+    st.subheader("Investment Tax Report")
+    tab_cg, tab_tlh, tab_inc = st.tabs([
+        "\U0001f4cb Capital Gains",
+        "\U0001f33f Tax-Loss Harvesting",
+        "\U0001f4b0 Dividend & Interest Income",
+    ])
+    with tab_cg:
+        render_capital_gains()
+    with tab_tlh:
+        render_tax_loss_harvesting()
+    with tab_inc:
+        render_investment_income()
+
+
+# ======================================================
+# B10. GOALS
+# ======================================================
+
+def render_goals():
+    """Render the Financial Goals tracker."""
+    st.subheader("\U0001f3af Financial Goals")
+    st.caption(
+        "Track progress towards your personal financial milestones — such as building an emergency fund, "
+        "saving for a house deposit, or funding a holiday. "
+        "For each active goal you can see how much has been saved, how much remains, and how much you need to set aside "
+        "each month to reach the target on time. Use the expander below to add or update goals."
+    )
+
+    df = get_goals()
+
+    with st.expander("➕ Add / Edit Goal"):
+        goal_ids    = [None] + (df["goal_id"].tolist() if not df.empty else [])
+        goal_labels = ["New Goal"] + (df["goal_name"].tolist() if not df.empty else [])
+        goal_sel_label = st.selectbox("Select Goal to Edit", options=goal_labels, key="goals_edit_sel")
+        goal_sel_idx   = goal_labels.index(goal_sel_label)
+        goal_id_edit   = goal_ids[goal_sel_idx]
+
+        default_row = (
+            df[df["goal_id"] == goal_id_edit].iloc[0]
+            if (goal_id_edit is not None and not df.empty and goal_id_edit in df["goal_id"].values)
+            else None
+        )
+
+        g_name    = st.text_input("Goal Name",
+                                   value=default_row["goal_name"] if default_row is not None else "",
+                                   key="goals_name")
+        g_target  = st.number_input("Target Amount (€)", min_value=0.0, step=100.0,
+                                     value=float(default_row["target_amount"]) if default_row is not None else 0.0,
+                                     key="goals_target")
+        g_current = st.number_input("Current Amount (€)", min_value=0.0, step=100.0,
+                                     value=float(default_row["current_amount"]) if default_row is not None else 0.0,
+                                     key="goals_current")
+        _default_date = None
+        if default_row is not None and default_row["target_date"] is not None:
+            try:
+                _d = default_row["target_date"]
+                _default_date = _d.date() if hasattr(_d, "date") else _d
+            except Exception:
+                _default_date = None
+        g_date  = st.date_input("Target Date (optional)", value=_default_date, key="goals_date")
+        g_notes = st.text_area("Notes",
+                                value=(default_row["notes"] or "") if default_row is not None else "",
+                                key="goals_notes")
+
+        col_save, col_del = st.columns([1, 1])
+        if col_save.button("\U0001f4be Save Goal", key="goals_save"):
+            upsert_goal(goal_id_edit, g_name, g_target, g_date, g_current, g_notes)
+            st.success("Goal saved!")
+            st.rerun()
+        if goal_id_edit is not None and col_del.button("\U0001f5d1️ Delete Goal", key="goals_delete"):
+            delete_goal(int(goal_id_edit))
+            st.success("Goal deleted.")
+            st.rerun()
+
+    if df.empty:
+        st.info("No active goals. Add your first goal above!")
+        return
+
+    for _, row in df.iterrows():
+        pct       = float(row["progress_pct"])
+        remaining = row["target_amount"] - row["current_amount"]
+        st.markdown(
+            f"**{row['goal_name']}** — "
+            f"€ {row['current_amount']:,.2f} / € {row['target_amount']:,.2f} ({pct:.1f}%)"
+        )
+        st.progress(min(pct / 100, 1.0))
+
+        if row["target_date"] is not None:
+            try:
+                td = row["target_date"]
+                if hasattr(td, "date"):
+                    td = td.date()
+                days_left = (td - datetime.now().date()).days
+                if days_left > 0 and remaining > 0:
+                    months_left    = max(days_left / 30.44, 1)
+                    monthly_needed = remaining / months_left
+                    st.caption(f"\U0001f4c5 {days_left} days remaining · Need € {monthly_needed:,.2f}/month")
+                elif days_left <= 0:
+                    st.caption("⚠️ Target date has passed.")
+            except Exception:
+                pass
+
+        if row["notes"]:
+            st.caption(f"\U0001f4dd {row['notes']}")
+        st.divider()
+
+
+# ======================================================
+# B11. FIRE CALCULATOR
+# ======================================================
+
+def render_fire_calculator():
+    """FIRE Calculator."""
+    st.subheader("\U0001f525 FIRE Calculator")
+    st.caption(
+        "**FIRE** (Financial Independence, Retire Early) is based on the idea that once your investment portfolio "
+        "is large enough to sustain your annual expenses indefinitely, you no longer *need* to work. "
+        "The **FIRE Number** is your target portfolio size: **Annual Expenses ÷ Safe Withdrawal Rate**. "
+        "At a 4% SWR (the classic \"4% rule\" from the Trinity Study), a portfolio of 25× your annual spending is considered sufficient. "
+        "Adjust the inputs below to model your own scenario — the chart shows how long it will take to cross the FIRE line."
+    )
+
+    _default_portfolio = get_investable_portfolio_value()
+
+    col1, col2 = st.columns(2)
+    with col1:
+        current_portfolio = st.number_input("Current Portfolio (€)", min_value=0.0, step=1000.0, value=_default_portfolio, key="fire_portfolio",
+                                            help="Total value of your investable assets today (holdings + pension + investment accounts). Pre-filled from live data.")
+        monthly_savings   = st.number_input("Monthly Savings (€)",   min_value=0.0, step=100.0,  value=1000.0,  key="fire_savings",
+                                            help="Amount added to the portfolio each month going forward.")
+        annual_return     = st.number_input("Expected Annual Return (%)", min_value=0.0, max_value=30.0, value=7.0, step=0.1, key="fire_return",
+                                            help="Expected average annual nominal return. Historically a diversified equity portfolio has returned ~7-10% nominal.")
+    with col2:
+        withdrawal_rate = st.number_input("Safe Withdrawal Rate (%)", min_value=1.0, max_value=10.0, value=4.0, step=0.1, key="fire_withdrawal",
+                                          help="Annual percentage of portfolio withdrawn in retirement. The '4% rule' is the most widely cited guideline, though lower rates (3–3.5%) are more conservative.")
+        annual_expenses = st.number_input("Annual Expenses (€)", min_value=0.0, step=1000.0, value=30000.0, key="fire_expenses",
+                                          help="Your expected annual spending in retirement (in today's euros).")
+
+    fire_number = annual_expenses / (withdrawal_rate / 100)
+    st.metric("FIRE Number", f"€ {fire_number:,.2f}")
+
+    r_monthly     = (1 + annual_return / 100) ** (1 / 12) - 1
+    portfolio     = current_portfolio
+    years_to_fire = None
+    pv            = [portfolio]
+    for m in range(1, 60 * 12 + 1):
+        portfolio = portfolio * (1 + r_monthly) + monthly_savings
+        pv.append(portfolio)
+        if portfolio >= fire_number and years_to_fire is None:
+            years_to_fire = m / 12
+
+    if years_to_fire:
+        st.success(f"\U0001f389 You could reach FIRE in **{years_to_fire:.1f} years**.")
+    else:
+        st.warning("At current savings rate, FIRE target may not be reached within 60 years.")
+
+    max_months = min(len(pv), 30 * 12 + 1)
+    df_fire = pd.DataFrame({"Years": [m / 12 for m in range(max_months)], "Portfolio (€)": pv[:max_months]})
+    fig = go.Figure()
+    fig.add_scatter(x=df_fire["Years"], y=df_fire["Portfolio (€)"],
+                    name="Portfolio", mode="lines", line=dict(color="#2ECC71", width=2))
+    fig.add_hline(y=fire_number, line_dash="dash", line_color="#F39C12",
+                  annotation_text=f"FIRE: € {fire_number:,.0f}")
+    fig.update_layout(
+        template="plotly_dark", title="<b>Projected Portfolio Value</b>",
+        xaxis_title="Years", yaxis_title="Portfolio (€)",
+        margin=dict(l=0, r=0, t=50, b=0),
+    )
+    st.plotly_chart(fig, width="stretch")
+
+    swr_rates = [3.0, 3.5, 4.0, 4.5, 5.0]
+    swr_data  = [{"SWR (%)": r, "FIRE Number (€)": f"€ {annual_expenses / (r / 100):,.0f}"} for r in swr_rates]
+    st.markdown("#### Safe Withdrawal Rate Sensitivity")
+    st.dataframe(pd.DataFrame(swr_data), hide_index=True, width="stretch")
+
+
+# ======================================================
+# B12. LOAN AMORTIZATION
+# ======================================================
+
+def render_loan_amortization():
+    """Loan Amortization Calculator."""
+    import calendar as _cal
+
+    st.subheader("\U0001f3e6 Loan Amortization")
+    st.caption(
+        "Enter your loan details to see the full repayment schedule. "
+        "Each monthly payment is split into **Principal** (reduces the outstanding balance) and **Interest** (cost of borrowing). "
+        "In a standard fixed-payment (annuity) loan, early payments are mostly interest; the principal share grows over time. "
+        "The stacked bar chart illustrates this shift. "
+        "The **Total Interest** metric shows the total extra cost of borrowing over the life of the loan."
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        loan_amount = st.number_input("Loan Amount (€)", min_value=0.0, step=1000.0, value=100000.0, key="loan_amount",
+                                      help="The original principal amount borrowed.")
+        annual_rate = st.number_input("Annual Interest Rate (%)", min_value=0.0, max_value=50.0, value=3.5, step=0.1, key="loan_rate",
+                                      help="Nominal annual interest rate. For variable-rate loans use the current rate as an approximation.")
+    with col2:
+        term_months = st.number_input("Term (months)", min_value=1, max_value=480, value=120, step=1, key="loan_term",
+                                      help="Total number of monthly payments. E.g. 120 = 10 years, 360 = 30 years.")
+        start_date  = st.date_input("Start Date", value=datetime.now().date(), key="loan_start",
+                                    help="Date of the first payment.")
+
+    if loan_amount <= 0 or term_months <= 0:
+        st.info("Please enter valid loan parameters.")
+        return
+
+    monthly_rate = (annual_rate / 100) / 12
+    if monthly_rate > 0:
+        payment = loan_amount * (monthly_rate * (1 + monthly_rate) ** term_months) / ((1 + monthly_rate) ** term_months - 1)
+    else:
+        payment = loan_amount / term_months
+
+    balance  = loan_amount
+    rows     = []
+    pay_date = start_date
+    for i in range(1, int(term_months) + 1):
+        interest  = balance * monthly_rate
+        principal = payment - interest
+        balance   = max(balance - principal, 0)
+        rows.append({
+            "Payment #":       i,
+            "Date":            pay_date.strftime("%Y-%m-%d"),
+            "Payment (€)":   payment,
+            "Principal (€)": principal,
+            "Interest (€)":  interest,
+            "Balance (€)":   balance,
+        })
+        nxt_month = pay_date.month + 1
+        nxt_year  = pay_date.year + (nxt_month - 1) // 12
+        nxt_month = ((nxt_month - 1) % 12) + 1
+        last_day  = _cal.monthrange(nxt_year, nxt_month)[1]
+        pay_date  = pay_date.replace(year=nxt_year, month=nxt_month, day=min(pay_date.day, last_day))
+
+    df_amort       = pd.DataFrame(rows)
+    total_paid     = df_amort["Payment (€)"].sum()
+    total_interest = df_amort["Interest (€)"].sum()
+
+    sm1, sm2 = st.columns(2)
+    sm1.metric("Total Paid",     f"€ {total_paid:,.2f}")
+    sm2.metric("Total Interest", f"€ {total_interest:,.2f}")
+
+    fig = go.Figure()
+    fig.add_bar(x=df_amort["Payment #"], y=df_amort["Principal (€)"], name="Principal", marker_color="#2ECC71")
+    fig.add_bar(x=df_amort["Payment #"], y=df_amort["Interest (€)"],  name="Interest",  marker_color="#E74C3C")
+    fig.update_layout(
+        template="plotly_dark", barmode="stack",
+        title="<b>Principal vs Interest per Payment</b>",
+        xaxis_title="Payment #", yaxis_title="Amount (€)",
+        margin=dict(l=0, r=0, t=50, b=0),
+    )
+    st.plotly_chart(fig, width="stretch")
+
+    fmts = {
+        "Payment (€)":   "€ {:,.2f}",
+        "Principal (€)": "€ {:,.2f}",
+        "Interest (€)":  "€ {:,.2f}",
+        "Balance (€)":   "€ {:,.2f}",
+    }
+    st.dataframe(df_amort.style.format(fmts), hide_index=True, width="stretch")
+
+
+# ======================================================
+# B13. FINANCIAL PLANNING PAGE
+# ======================================================
+
+def render_financial_planning():
+    """Financial Planning page."""
+    st.subheader("Financial Planning")
+    tab_goals, tab_fire, tab_loan = st.tabs([
+        "\U0001f3af Goals",
+        "\U0001f525 FIRE Calculator",
+        "\U0001f3e6 Loan Amortization",
+    ])
+    with tab_goals:
+        render_goals()
+    with tab_fire:
+        render_fire_calculator()
+    with tab_loan:
+        render_loan_amortization()
+
+
+# ======================================================
+# B14. RISK METRICS
+# ======================================================
+
+def render_risk_metrics(account_ids: tuple = None):
+    """Render Portfolio Risk Metrics."""
+    st.subheader("⚡ Portfolio Risk Metrics")
+    st.caption(
+        "Quantifies the risk profile of your current portfolio using historical price data. "
+        "Returns are **value-weighted** by current position size and use a **3% risk-free rate**.\n\n"
+        "- **Ann. Volatility** — annualised standard deviation of daily returns; higher = more volatile.\n"
+        "- **Sharpe Ratio** — excess return per unit of total risk. Above 1.0 is good; above 2.0 is excellent.\n"
+        "- **Sortino Ratio** — like Sharpe but only penalises downside volatility. Preferred when returns are skewed.\n"
+        "- **Max Drawdown** — largest peak-to-trough decline in the period; indicates the worst-case loss an investor would have suffered.\n"
+        "- **VaR 95%** — on a typical day there is only a 5% chance the portfolio loses *more* than this percentage.\n"
+        "- **CVaR 95%** — average loss on the worst 5% of days (also called Expected Shortfall); a more conservative tail-risk measure.\n\n"
+        "The rolling Sharpe chart shows how risk-adjusted performance has changed over time — dips below zero indicate periods of underperformance vs. the risk-free rate."
+    )
+
+    lookback  = st.slider("Lookback days", min_value=60, max_value=756, value=252, step=20, key="risk_lookback",
+                          help="Number of calendar days of price history to include. 252 ≈ 1 trading year.")
+    df_prices = get_price_returns(lookback, account_ids)
+
+    if df_prices is None or df_prices.empty or df_prices.shape[1] < 1:
+        st.info("Insufficient price history to compute risk metrics. Need at least 30 days of data for current holdings.")
+        return
+
+    try:
+        daily_returns = df_prices.pct_change().dropna()
+        if daily_returns.empty or len(daily_returns) < 10:
+            st.info("Not enough return data to compute risk metrics.")
+            return
+
+        # Value-weighted portfolio returns; fall back to equal-weight when weights unavailable
+        df_weights = get_portfolio_weights(account_ids)
+        if not df_weights.empty:
+            wmap  = dict(zip(df_weights["ticker"], df_weights["weight"]))
+            avail = [c for c in daily_returns.columns if c in wmap]
+            if avail:
+                w = pd.Series([wmap[t] for t in avail], index=avail)
+                w = w / w.sum()
+                port_returns = daily_returns[avail].dot(w)
+            else:
+                port_returns = daily_returns.mean(axis=1)
+        else:
+            port_returns = daily_returns.mean(axis=1)
+
+        portfolio_value = get_investable_portfolio_value(account_ids)
+
+        ann_vol    = port_returns.std() * np.sqrt(252)
+        ann_return = (1 + port_returns.mean()) ** 252 - 1
+        rf_rate    = 0.03
+        excess     = ann_return - rf_rate
+        sharpe     = excess / ann_vol if ann_vol > 0 else 0
+
+        down_ret = port_returns[port_returns < 0]
+        down_dev = down_ret.std() * np.sqrt(252) if len(down_ret) > 0 else 0
+        sortino  = excess / down_dev if down_dev > 0 else 0
+
+        cum_ret  = (1 + port_returns).cumprod()
+        roll_max = cum_ret.cummax()
+        drawdown = (cum_ret - roll_max) / roll_max
+        max_dd   = drawdown.min()
+
+        var_95      = np.percentile(port_returns, 5)
+        cvar_95     = port_returns[port_returns <= var_95].mean()
+        var_95_eur  = abs(var_95)  * portfolio_value
+        cvar_95_eur = abs(cvar_95) * portfolio_value
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Ann. Volatility", f"{ann_vol * 100:.2f}%")
+        m2.metric("Sharpe Ratio",    f"{sharpe:.2f}")
+        m3.metric("Sortino Ratio",   f"{sortino:.2f}")
+        m4.metric("Max Drawdown",    f"{max_dd * 100:.2f}%")
+
+        m5, m6, _c1, _c2 = st.columns(4)
+        m5.metric("VaR 95% (daily)",  f"{var_95 * 100:.2f}%  ·  € {var_95_eur:,.0f}")
+        m6.metric("CVaR 95% (daily)", f"{cvar_95 * 100:.2f}%  ·  € {cvar_95_eur:,.0f}")
+
+        rolling_sharpe = port_returns.rolling(30).apply(
+            lambda x: (x.mean() * 252 - rf_rate) / (x.std() * np.sqrt(252)) if x.std() > 0 else 0,
+            raw=True,
+        )
+        df_rs = pd.DataFrame({"Date": port_returns.index, "Rolling 30d Sharpe": rolling_sharpe.values})
+        fig = px.line(df_rs, x="Date", y="Rolling 30d Sharpe",
+                      title="<b>Rolling 30-Day Sharpe Ratio</b>",
+                      template="plotly_dark",
+                      labels={"Rolling 30d Sharpe": "Sharpe Ratio"})
+        fig.add_hline(y=0, line_dash="dash", line_color="#E74C3C")
+        fig.update_layout(margin=dict(l=0, r=0, t=50, b=0))
+        st.plotly_chart(fig, width="stretch")
+        if portfolio_value > 0:
+            st.caption(
+                f"Returns are value-weighted by current position size (total: € {portfolio_value:,.0f}). "
+                "VaR/CVaR EUR figures assume this portfolio size."
+            )
+
+    except Exception as e:
+        st.info(f"Could not compute risk metrics: {e}")
+
+
+# ======================================================
+# B15. CORRELATION MATRIX
+# ======================================================
+
+def render_correlation_matrix(account_ids: tuple = None):
+    """Render the Price Correlation Matrix."""
+    st.subheader("\U0001f517 Correlation Matrix")
+    st.caption(
+        "Shows how closely the daily price returns of your holdings move together over the selected period. "
+        "Values range from **−1** (perfectly inverse) to **+1** (perfectly in sync), with **0** meaning no linear relationship.\n\n"
+        "- **Dark red (near +1):** the two assets tend to rise and fall together — low diversification benefit.\n"
+        "- **Dark blue (near −1):** the two assets tend to move in opposite directions — strong diversification benefit.\n"
+        "- **White / near 0:** weak or no linear relationship — good for portfolio diversification.\n\n"
+        "A well-diversified portfolio should have many near-zero or negative off-diagonal entries. "
+        "High positive correlations across all holdings mean the portfolio behaves like a single concentrated bet."
+    )
+
+    lookback  = st.slider("Lookback days", min_value=60, max_value=756, value=252, step=20, key="corr_lookback",
+                          help="Number of calendar days of price history used to compute correlations. 252 ≈ 1 trading year.")
+    df_prices  = get_price_returns(lookback, account_ids)
+    df_weights = get_portfolio_weights(account_ids)
+
+    if df_prices is None or df_prices.empty or df_prices.shape[1] < 2:
+        st.info("Insufficient price history to compute correlation. Need at least 2 securities with 30+ days of data.")
+        return
+
+    try:
+        # Reorder columns by position value (largest exposure first) so the
+        # n_max slider always keeps the most significant holdings.
+        if not df_weights.empty:
+            ordered = [t for t in df_weights["ticker"].tolist() if t in df_prices.columns]
+            rest    = [c for c in df_prices.columns if c not in ordered]
+            df_prices = df_prices[ordered + rest]
+
+        n_max = st.slider(
+            "Max holdings to show",
+            min_value=2,
+            max_value=min(df_prices.shape[1], 30),
+            value=min(df_prices.shape[1], 15),
+            key="corr_n",
+            help="Keeps the top N holdings by position value.",
+        )
+        df_sub      = df_prices.iloc[:, :n_max]
+        daily_rets  = df_sub.pct_change().dropna()
+        corr_matrix = daily_rets.corr()
+
+        fig = go.Figure(data=go.Heatmap(
+            z=corr_matrix.values,
+            x=corr_matrix.columns.tolist(),
+            y=corr_matrix.index.tolist(),
+            colorscale="RdBu",
+            zmid=0,
+            text=np.round(corr_matrix.values, 2),
+            texttemplate="%{text}",
+            showscale=True,
+        ))
+        fig.update_layout(
+            template="plotly_dark",
+            title="<b>Price Return Correlation Matrix</b>",
+            margin=dict(l=0, r=0, t=50, b=0),
+            xaxis=dict(tickangle=-45),
+        )
+        st.plotly_chart(fig, width="stretch")
+
+    except Exception as e:
+        st.info(f"Could not compute correlation matrix: {e}")
+
+
+# ======================================================
+# B16. MONTE CARLO
+# ======================================================
+
+def render_monte_carlo(account_ids: tuple = None):
+    """Render the Monte Carlo simulation."""
+    st.subheader("\U0001f3b2 Monte Carlo Simulation")
+    st.caption(
+        "Runs thousands of randomised future scenarios to model the range of possible portfolio outcomes. "
+        "Returns are calibrated from your actual portfolio's recent history (last 252 trading days), "
+        "weighted by current position value, so the simulation reflects your real allocation — not a hypothetical equal-weight mix.\n\n"
+        "**How to read the chart:**\n"
+        "- The **green line (90th percentile)** represents an optimistic outcome — only 10% of simulations do better.\n"
+        "- The **blue line (median / 50th percentile)** is the most likely outcome — half of simulations end above it, half below.\n"
+        "- The **red line (10th percentile)** represents a pessimistic outcome — only 10% of simulations do worse.\n\n"
+        "The **probability table** below shows the likelihood of ending above various wealth targets. "
+        "Note that this model assumes returns are normally distributed and stationary — "
+        "real markets exhibit fat tails, regime changes, and sequence-of-returns risk not captured here."
+    )
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        years_ahead     = st.slider("Years ahead", min_value=1, max_value=30, value=10, key="mc_years",
+                                    help="Investment horizon in years for the simulation.")
+    with col2:
+        num_sims        = st.slider("Simulations", min_value=100, max_value=2000, value=500, step=100, key="mc_sims",
+                                    help="Number of independent random paths to simulate. More simulations give smoother percentile bands but take slightly longer.")
+    with col3:
+        monthly_contrib = st.number_input("Monthly Contribution (€)", min_value=0.0, step=100.0, value=500.0, key="mc_contrib",
+                                          help="Fixed amount added to the portfolio each month throughout the simulation.")
+    with col4:
+        lookback_mc = st.slider("Calibration lookback (days)", min_value=252, max_value=1260, value=756, step=63,
+                                key="mc_lookback",
+                                help="Historical price window used to estimate mean return and volatility. Longer = more stable estimate. 252≈1yr, 756≈3yr, 1260≈5yr.")
+
+    _mc_default_portfolio = get_investable_portfolio_value(account_ids)
+    initial_value = st.number_input(
+        "Starting Portfolio Value (€)", min_value=0.0, step=1000.0,
+        value=_mc_default_portfolio, key="mc_initial",
+        help="Pre-filled from your live portfolio value (holdings + pension + investment accounts).",
+    )
+
+    df_prices  = get_price_returns(lookback_mc, account_ids)
+    df_weights = get_portfolio_weights(account_ids)
+
+    if df_prices is None or df_prices.empty or df_prices.shape[1] < 1:
+        st.info("Insufficient price history to run Monte Carlo simulation.")
+        return
+
+    try:
+        daily_returns = df_prices.pct_change().dropna()
+
+        # Value-weighted portfolio returns
+        if not df_weights.empty:
+            wmap  = dict(zip(df_weights["ticker"], df_weights["weight"]))
+            avail = [c for c in daily_returns.columns if c in wmap]
+            if avail:
+                w = pd.Series([wmap[t] for t in avail], index=avail)
+                w = w / w.sum()
+                port_returns = daily_returns[avail].dot(w)
+            else:
+                port_returns = daily_returns.mean(axis=1)
+        else:
+            port_returns = daily_returns.mean(axis=1)
+
+        hist_ann_return = (1 + port_returns.mean()) ** 252 - 1
+        hist_ann_vol    = port_returns.std() * np.sqrt(252)
+
+        # Clamp calibrated values to sensible display range before passing to widgets.
+        # Extreme values (e.g. -41%) come from stale/bad price data; the user can
+        # see the raw figure in the caption and override freely.
+        _RETURN_MIN, _RETURN_MAX = -99.0, 100.0
+        _VOL_MIN,    _VOL_MAX    =   0.1, 200.0
+        _default_ret = max(_RETURN_MIN, min(_RETURN_MAX, round(hist_ann_return * 100, 1)))
+        _default_vol = max(_VOL_MIN,    min(_VOL_MAX,    round(hist_ann_vol    * 100, 1)))
+
+        _looks_bad = abs(hist_ann_return) > 0.20   # flag anything beyond ±20% as suspect
+
+        # Show calibrated parameters and allow manual override.
+        # Widgets inside a collapsed expander still run and return their values.
+        with st.expander(
+            "⚙️ Return Assumptions (calibrated from history — click to override)",
+            expanded=_looks_bad,   # auto-open when calibration looks unrealistic
+        ):
+            if _looks_bad:
+                st.warning(
+                    f"⚠️ Calibrated return is **{hist_ann_return * 100:+.1f}%** — this is likely driven by "
+                    "bad or stale price data for one or more securities in the selected accounts. "
+                    "Please override with realistic values below (long-run equity average: ~7–10%)."
+                )
+            else:
+                st.caption(
+                    f"Calibrated from the last **{lookback_mc} days** of price history: "
+                    f"**{hist_ann_return * 100:+.1f}% annual return**, "
+                    f"**{hist_ann_vol * 100:.1f}% annual volatility**. "
+                    "If this looks wrong, increase the lookback slider or override manually here."
+                )
+            ov_col1, ov_col2 = st.columns(2)
+            with ov_col1:
+                override_return = st.number_input(
+                    "Expected annual return (%)",
+                    min_value=_RETURN_MIN, max_value=_RETURN_MAX,
+                    value=_default_ret, step=0.5, key="mc_override_ret",
+                    help="Override the calibrated value. Long-run equity average is ~7-10% nominal."
+                )
+            with ov_col2:
+                override_vol = st.number_input(
+                    "Annual volatility (%)",
+                    min_value=_VOL_MIN, max_value=_VOL_MAX,
+                    value=_default_vol, step=0.5, key="mc_override_vol",
+                    help="Override the calibrated volatility. Broad equity index is typically 15-20%."
+                )
+
+        ann_return_used = override_return / 100
+        ann_vol_used    = override_vol / 100
+        mean_daily      = (1 + ann_return_used) ** (1 / 252) - 1
+        std_daily       = ann_vol_used / np.sqrt(252)
+
+        # Show active parameters as metrics
+        mc1, mc2, mc3 = st.columns(3)
+        mc1.metric("Annual Return (used)", f"{ann_return_used * 100:+.1f}%",
+                   help="Expected annual return driving the simulation.")
+        mc2.metric("Annual Volatility (used)", f"{ann_vol_used * 100:.1f}%",
+                   help="Standard deviation of annual returns.")
+        mc3.metric("Calibration window", f"{lookback_mc}d  ({lookback_mc // 252:.0f}–{lookback_mc // 252 + 1:.0f} yrs)")
+
+        if std_daily == 0:
+            st.info("Portfolio volatility is zero — cannot run simulation.")
+            return
+
+        n_steps      = years_ahead * 12
+        mean_monthly = (1 + mean_daily) ** 21 - 1
+        std_monthly  = std_daily * np.sqrt(21)
+
+        rng         = np.random.default_rng(42)
+        sim_returns = rng.normal(mean_monthly, std_monthly, size=(num_sims, n_steps))
+
+        paths       = np.zeros((num_sims, n_steps + 1))
+        paths[:, 0] = initial_value
+        for t in range(1, n_steps + 1):
+            paths[:, t] = paths[:, t - 1] * (1 + sim_returns[:, t - 1]) + monthly_contrib
+
+        p10 = np.percentile(paths, 10, axis=0)
+        p50 = np.percentile(paths, 50, axis=0)
+        p90 = np.percentile(paths, 90, axis=0)
+
+        time_axis = [i / 12 for i in range(n_steps + 1)]
+
+        fig = go.Figure()
+        fig.add_scatter(x=time_axis, y=p90, name="90th Percentile", mode="lines",
+                        line=dict(color="#2ECC71", width=2))
+        fig.add_scatter(x=time_axis, y=p50, name="Median (50th)", mode="lines",
+                        line=dict(color="#3498DB", width=2))
+        fig.add_scatter(x=time_axis, y=p10, name="10th Percentile", mode="lines",
+                        line=dict(color="#E74C3C", width=2),
+                        fill="tonexty", fillcolor="rgba(231,76,60,0.1)")
+        fig.update_layout(
+            template="plotly_dark",
+            title=f"<b>Monte Carlo: {num_sims} Simulations over {years_ahead} Years</b>",
+            xaxis_title="Years", yaxis_title="Portfolio Value (€)",
+            margin=dict(l=0, r=0, t=50, b=0),
+        )
+        st.plotly_chart(fig, width="stretch")
+
+        final_values = paths[:, -1]
+        targets      = [50_000, 100_000, 250_000, 500_000, 1_000_000]
+        prob_data    = [
+            {"Target (€)": f"€ {t:,.0f}", "Probability": f"{(final_values >= t).mean() * 100:.1f}%"}
+            for t in targets
+        ]
+        st.markdown("#### Probability of Reaching Target Amounts")
+        st.dataframe(pd.DataFrame(prob_data), hide_index=True, width="stretch")
+
+    except Exception as e:
+        st.info(f"Monte Carlo simulation error: {e}")
