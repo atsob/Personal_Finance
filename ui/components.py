@@ -65,7 +65,12 @@ def format_qty_display(row):
         return val
     
 def copy_df_button(df, key: str, label: str = "📋 Copy") -> None:
-    """Render a button that copies the dataframe as TSV to the clipboard (paste directly into Excel)."""
+    """Render a button that copies the dataframe as TSV to the clipboard (paste directly into Excel).
+
+    Uses execCommand('copy') as the primary path because navigator.clipboard is blocked inside
+    Streamlit's sandboxed iframes (requires HTTPS + allow="clipboard-write" which Streamlit
+    does not set). execCommand works in all browsers without special permissions.
+    """
     raw = df.data if hasattr(df, "data") else df
     if not isinstance(raw, pd.DataFrame):
         raw = pd.DataFrame(raw)
@@ -82,9 +87,27 @@ def copy_df_button(df, key: str, label: str = "📋 Copy") -> None:
     # Escape characters that would break the JS template literal
     tsv_js = tsv.replace("\\", "\\\\").replace("`", "\\`").replace("$", "\\$")
     html = f"""
-    <button onclick="navigator.clipboard.writeText(`{tsv_js}`)
-        .then(()=>{{this.innerText='✅ Copied!';setTimeout(()=>this.innerText='{label}',2000)}})
-        .catch(()=>this.innerText='❌ Failed');"
+    <button id="cpbtn" onclick="
+      (function(btn){{
+        var ta = document.createElement('textarea');
+        ta.value = `{tsv_js}`;
+        ta.style.position = 'fixed';
+        ta.style.left = '-9999px';
+        ta.style.top  = '0';
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        var ok = false;
+        try {{ ok = document.execCommand('copy'); }} catch(e) {{}}
+        document.body.removeChild(ta);
+        if (ok) {{
+          btn.innerText = '✅ Copied!';
+          setTimeout(function(){{ btn.innerText = '{label}'; }}, 2000);
+        }} else {{
+          btn.innerText = '❌ Failed';
+          setTimeout(function(){{ btn.innerText = '{label}'; }}, 2000);
+        }}
+      }})(this);"
       style="background:#262730;color:white;border:1px solid #555;padding:4px 12px;
              border-radius:4px;cursor:pointer;font-size:13px;font-family:sans-serif">
       {label}

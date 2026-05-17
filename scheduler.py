@@ -3,12 +3,12 @@ Background scheduler — runs as a separate Docker service (see docker-compose.y
 
 Jobs
 ────
-• Weekly summary    : every Monday at 07:00 local time.
-                      Also fires once at startup if this week has no summary yet.
-• Market data       : every MARKET_REFRESH_INTERVAL_MINUTES during business days
-                      (Mon–Fri) between MARKET_HOURS_START and MARKET_HOURS_END.
-                      Downloads the latest prices (1-day period) for all securities
-                      and the latest FX rates.
+• Market data       : every MARKET_REFRESH_INTERVAL_MINUTES (24 × 7).
+                      Downloads the latest prices for all securities and FX rates.
+• Daily backup      : 06:00 AM — pg_dump + retention purge.
+• Morning maint.    : 06:15 AM — VACUUM ANALYZE + full embedding update.
+• Weekly summary    : Monday 07:00 — also fires at startup if missing for this week.
+• Securities info   : once per calendar day (at startup).
 """
 
 import logging
@@ -28,6 +28,7 @@ from data.downloaders import (
     download_historical_fx,
     download_securities_info_from_yahoo,
 )
+from ai.update_vector import update_all_embeddings
 from database.backup import DatabaseBackup
 from database.connection import get_connection
 
@@ -42,6 +43,11 @@ MARKET_REFRESH_INTERVAL_MINUTES = 5   # how often to refresh prices & FX (24 × 
 # ── Daily backup config ───────────────────────────────────────────────────────
 BACKUP_HOUR            = 6    # local hour at which the daily backup runs (06:00 AM)
 BACKUP_RETENTION_DAYS  = 30   # delete backups older than this many days
+
+# ── Morning maintenance config ────────────────────────────────────────────────
+# Runs 15 minutes after backup (backup completes well within 5 minutes).
+MAINTENANCE_HOUR   = BACKUP_HOUR  # same hour as backup (06:xx)
+MAINTENANCE_MINUTE = 15           # 06:15 AM
 
 # Tick interval — the scheduler wakes up this often to check all jobs.
 # Keep it at 60 s so Monday-07:00 is never missed by more than a minute.
@@ -162,6 +168,29 @@ def _backup_job():
         logging.error(f"Backup retention purge failed: {e}", exc_info=True)
 
 
+def _morning_maintenance_job():
+    """VACUUM ANALYZE the database, then refresh all embeddings."""
+    # --- VACUUM ANALYZE ---
+    logging.info("Running VACUUM ANALYZE…")
+    try:
+        conn = get_connection()
+        conn.autocommit = True          # VACUUM cannot run inside a transaction
+        with conn.cursor() as cur:
+            cur.execute("VACUUM ANALYZE")
+        conn.close()
+        logging.info("VACUUM ANALYZE completed.")
+    except Exception as e:
+        logging.error(f"VACUUM ANALYZE failed: {e}", exc_info=True)
+
+    # --- Embedding update ---
+    logging.info("Updating transaction embeddings…")
+    try:
+        update_all_embeddings()
+        logging.info("Embedding update completed.")
+    except Exception as e:
+        logging.error(f"Embedding update failed: {e}", exc_info=True)
+
+
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -211,6 +240,17 @@ if __name__ == "__main__":
     _securities_info_job()
     _last_securities_info_date = date.today()
 
+    # Morning maintenance (VACUUM ANALYZE + embeddings): skip if already ran today
+    _last_maintenance_date: date = date.min
+    _now_startup = datetime.now()
+    if (
+        _now_startup.hour > MAINTENANCE_HOUR
+        or (_now_startup.hour == MAINTENANCE_HOUR and _now_startup.minute >= MAINTENANCE_MINUTE)
+    ):
+        # Assume maintenance already ran if we're starting up after its scheduled window
+        _last_maintenance_date = date.today()
+        logging.info("Past maintenance window at startup — skipping initial run.")
+
     # Tick loop — wakes every TICK_SECONDS and evaluates each job
     while True:
         time.sleep(TICK_SECONDS)
@@ -245,3 +285,12 @@ if __name__ == "__main__":
         ):
             _weekly_summary_job()
             _last_weekly_summary_date = date.today()
+
+        # ── Morning maintenance: VACUUM ANALYZE + embeddings at 06:15 ───────────
+        if (
+            now.hour == MAINTENANCE_HOUR
+            and MAINTENANCE_MINUTE <= now.minute < MAINTENANCE_MINUTE + 5
+            and _last_maintenance_date != date.today()
+        ):
+            _morning_maintenance_job()
+            _last_maintenance_date = date.today()

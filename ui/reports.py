@@ -26,6 +26,9 @@ from database.queries import (
     get_investment_accounts,
     get_benchmark_candidates,
     get_benchmark_returns,
+    get_benchmark_presets,
+    upsert_benchmark_preset,
+    delete_benchmark_preset,
 )
 from data.downloaders import download_historical_fx, download_historical_prices_from_tradingview, download_historical_prices_from_yahoo, download_bond_prices_from_solidus, download_securities_info_from_yahoo
 from ui.components import color_negative_red, color_value, custom_metric, get_color, copy_df_button
@@ -114,103 +117,6 @@ def render_reports():
                 fig_dd.update_layout(yaxis_tickformat='.1f', margin=dict(l=0, r=0, t=50, b=0))
                 st.plotly_chart(fig_dd, width='stretch')
 
-                # ── Benchmark Comparison (price performance, indexed to 100) ───
-                st.markdown("#### 📊 Benchmark Comparison (Price Performance)")
-                df_bm_list = get_benchmark_candidates(min_days=30)
-                bm_idx_opts = {"— None —": None}
-                bm_idx_opts.update({row["name"]: int(row["id"]) for _, row in df_bm_list.iterrows()})
-
-                earliest_date = pd.to_datetime(min_inv_date)
-                lookback_bm   = max(60, (pd.Timestamp.today() - earliest_date).days + 30)
-
-                col_bm_sel, col_bm_lb = st.columns([3, 1])
-                with col_bm_sel:
-                    bm_idx_label = st.selectbox(
-                        "Overlay benchmark",
-                        list(bm_idx_opts.keys()),
-                        key="pos_chart_benchmark",
-                        help=(
-                            "Portfolio line shows **cumulative price return** of your holdings "
-                            "(value-weighted, daily prices) — cash flows like buys, sells and "
-                            "bond maturities are excluded so the comparison is apples-to-apples."
-                        ),
-                    )
-                with col_bm_lb:
-                    bm_smooth = st.selectbox(
-                        "Resample",
-                        ["Daily", "Weekly", "Monthly"],
-                        index=2,
-                        key="pos_chart_bm_resample",
-                        help="Resample frequency for the chart.",
-                    )
-                bm_idx_sec_id = bm_idx_opts[bm_idx_label]
-                resample_map  = {"Daily": "D", "Weekly": "W", "Monthly": "ME"}
-                resample_freq = resample_map[bm_smooth]
-
-                # Portfolio performance: cumulative return from daily price changes
-                # (value-weighted by current holdings; cash flows are invisible here)
-                df_px = get_price_returns(lookback_bm, None)
-                fig_idx = go.Figure()
-
-                if df_px is not None and not df_px.empty:
-                    df_w = get_portfolio_weights(None)
-                    if not df_w.empty:
-                        wmap  = dict(zip(df_w["ticker"], df_w["weight"]))
-                        avail = [c for c in df_px.columns if c in wmap]
-                        if avail:
-                            w = pd.Series([wmap[t] for t in avail], index=avail)
-                            w = w / w.sum()
-                            port_ret = df_px[avail].pct_change().dropna().dot(w)
-                        else:
-                            port_ret = df_px.pct_change().dropna().mean(axis=1)
-                    else:
-                        port_ret = df_px.pct_change().dropna().mean(axis=1)
-
-                    port_cum = (1 + port_ret).cumprod()
-                    port_cum = port_cum[port_cum.index >= earliest_date]
-                    port_cum = port_cum.resample(resample_freq).last().dropna()
-                    port_indexed = port_cum / port_cum.iloc[0] * 100
-
-                    fig_idx.add_trace(go.Scatter(
-                        x=port_indexed.index, y=port_indexed.values,
-                        name="Portfolio (price return)", line=dict(color="white", width=3),
-                    ))
-
-                if bm_idx_sec_id is not None:
-                    bm_prices = get_benchmark_returns(bm_idx_sec_id, lookback_bm)
-                    if not bm_prices.empty:
-                        # Align to portfolio date grid, forward-fill across calendar gaps
-                        if df_px is not None and not df_px.empty:
-                            all_dates  = port_ret.index.union(bm_prices.index).sort_values()
-                            bm_aligned = bm_prices.reindex(all_dates).ffill().reindex(port_ret.index)
-                            bm_ret     = bm_aligned.pct_change().dropna()
-                            bm_cum     = (1 + bm_ret).cumprod()
-                        else:
-                            bm_cum = (1 + bm_prices.pct_change().dropna()).cumprod()
-                        bm_cum     = bm_cum[bm_cum.index >= earliest_date]
-                        bm_cum     = bm_cum.resample(resample_freq).last().dropna()
-                        bm_indexed = bm_cum / bm_cum.iloc[0] * 100
-                        fig_idx.add_trace(go.Scatter(
-                            x=bm_indexed.index, y=bm_indexed.values,
-                            name=bm_idx_label, line=dict(dash="dash", width=2),
-                        ))
-                    else:
-                        st.caption(f"No price history found for {bm_idx_label} in the selected period.")
-
-                if fig_idx.data:
-                    fig_idx.update_layout(
-                        title="<b>Portfolio Price Return vs Benchmark (Indexed to 100)</b>",
-                        template="plotly_dark",
-                        yaxis_title="Cumulative return (start = 100)",
-                        margin=dict(l=0, r=0, t=50, b=0),
-                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                    )
-                    st.plotly_chart(fig_idx, width='stretch')
-                    st.caption(
-                        "Portfolio return is the **daily price return** of your holdings, "
-                        "value-weighted by current position size. Buys, sells, dividends received as cash, "
-                        "and bond maturities do not affect this line — only price movements do."
-                    )
 
         with tab_data:
             st.subheader("📋 Monthly Summary per Account")
@@ -258,40 +164,102 @@ def render_reports():
             render_fx_exposure()
 
     elif hist_sub_menu == "Investment Performance":
-        # ── Investment account selection for Risk / Correlation / Monte Carlo ──
-        df_inv_accounts = get_investment_accounts()
-        inv_all_ids     = df_inv_accounts['accounts_id'].tolist()
+        # ── Shared preset selector (drives Benchmark, Risk Metrics, Correlation, Monte Carlo) ──
+        _perf_inv_accts  = get_investment_accounts()
+        _perf_id_to_name = dict(zip(_perf_inv_accts['accounts_id'], _perf_inv_accts['accounts_name']))
+        _perf_name_to_id = {v: k for k, v in _perf_id_to_name.items()}
+        _perf_all_names  = list(_perf_inv_accts['accounts_name'])
+        _PERF_BUILTIN    = "Full Portfolio"
 
-        saved_risk_ids  = get_nwr_account_selection('risk_metrics_account_ids')
-        init_risk_sel   = set(saved_risk_ids) if saved_risk_ids is not None else set(inv_all_ids)
+        _perf_presets_df = get_benchmark_presets()
+        _perf_preset_map = {}
+        for _, _pp in _perf_presets_df.iterrows():
+            _perf_preset_map[_pp['preset_name']] = _pp['account_ids'] or []
 
-        df_inv_sel = df_inv_accounts.copy()
-        df_inv_sel.insert(0, 'Include', df_inv_sel['accounts_id'].isin(init_risk_sel))
+        with st.expander("⚙️ Portfolio Preset", expanded=False):
+            _pp1, _pp2, _pp3, _pp4 = st.columns([3, 3, 1, 1])
+            with _pp1:
+                sel_preset = st.selectbox(
+                    "Preset",
+                    [_PERF_BUILTIN] + sorted(_perf_preset_map.keys()),
+                    key="perf_preset_sel",
+                    help="Drives which accounts are used in Benchmark, Risk Metrics, Correlation and Monte Carlo.",
+                )
+            with _pp2:
+                _perf_name_input = st.text_input(
+                    "Preset name",
+                    value="" if sel_preset == _PERF_BUILTIN else sel_preset,
+                    placeholder="Name to save as…",
+                    key="perf_preset_name_input",
+                    label_visibility="collapsed",
+                )
+            with _pp3:
+                _perf_save = st.button("💾 Save", key="perf_save_btn", use_container_width=True)
+            with _pp4:
+                _perf_del = st.button(
+                    "🗑️ Delete", key="perf_del_btn",
+                    disabled=(sel_preset == _PERF_BUILTIN),
+                    use_container_width=True,
+                )
 
-        risk_selected_ids = list(init_risk_sel)
-        with st.expander("⚙️ Investment Account Selection (Risk / Correlation / Monte Carlo)", expanded=False):
-            edited_inv_df = st.data_editor(
-                df_inv_sel.rename(columns={'accounts_name': 'Account', 'accounts_type': 'Type'}),
-                column_config={
-                    'Include':     st.column_config.CheckboxColumn('Include', default=True),
-                    'accounts_id': None,
-                },
-                hide_index=True,
-                width="stretch",
-                disabled=['Account', 'Type'],
-                key="risk_account_editor",
+            if sel_preset == _PERF_BUILTIN:
+                _perf_default_names = _perf_all_names
+            else:
+                _perf_saved_ids     = _perf_preset_map.get(sel_preset) or []
+                _perf_default_names = [_perf_id_to_name[i] for i in _perf_saved_ids if i in _perf_id_to_name]
+
+            _perf_sel_names = st.multiselect(
+                "Accounts in this preset",
+                options=_perf_all_names,
+                default=_perf_default_names,
+                key=f"perf_accts_{sel_preset}",
+                disabled=(sel_preset == _PERF_BUILTIN),
+                help="Accounts included in all performance analyses on this page.",
             )
-            risk_selected_ids = edited_inv_df[edited_inv_df['Include']]['accounts_id'].tolist()
-            col_save_risk, _ = st.columns([1, 4])
-            if col_save_risk.button("💾 Save Selection", key="risk_acct_save"):
-                save_nwr_account_selection(risk_selected_ids, 'risk_metrics_account_ids')
-                st.success("Account selection saved!")
+            _perf_sel_ids = (
+                None
+                if sel_preset == _PERF_BUILTIN
+                else (tuple(_perf_name_to_id[n] for n in _perf_sel_names if n in _perf_name_to_id) or None)
+            )
 
-        _risk_acct_ids = tuple(sorted(risk_selected_ids)) if risk_selected_ids else None
+            if _perf_save:
+                _pname = _perf_name_input.strip()
+                if not _pname or _pname == _PERF_BUILTIN:
+                    st.warning("Please enter a valid preset name (not 'Full Portfolio').")
+                elif not _perf_sel_names:
+                    st.warning("Select at least one account before saving.")
+                else:
+                    upsert_benchmark_preset(_pname, _perf_sel_ids)
+                    get_benchmark_presets.clear()
+                    st.toast(f"Preset '{_pname}' saved.", icon="✅")
+                    st.rerun()
 
-        tab_report, tab_movers, tab_savings, tab_dividends, tab_bonds, tab_risk, tab_corr, tab_monte = st.tabs([
+            _perf_del_key = f"perf_del_confirm_{sel_preset}"
+            if _perf_del and sel_preset != _PERF_BUILTIN:
+                st.session_state[_perf_del_key] = True
+                st.rerun()
+            if st.session_state.get(_perf_del_key):
+                st.warning(f"Delete preset **'{sel_preset}'**? This cannot be undone.")
+                _pd1, _pd2 = st.columns(2)
+                with _pd1:
+                    if st.button("Cancel", key="perf_del_cancel"):
+                        st.session_state.pop(_perf_del_key, None)
+                        st.rerun()
+                with _pd2:
+                    if st.button("Yes, delete", key="perf_del_yes", type="primary"):
+                        _pmatch = _perf_presets_df[_perf_presets_df['preset_name'] == sel_preset]
+                        if not _pmatch.empty:
+                            delete_benchmark_preset(int(_pmatch.iloc[0]['preset_id']))
+                        get_benchmark_presets.clear()
+                        st.session_state.pop(_perf_del_key, None)
+                        st.toast(f"Preset '{sel_preset}' deleted.", icon="🗑️")
+                        st.rerun()
+
+        _risk_acct_ids = _perf_sel_ids
+
+        tab_report, tab_movers, tab_savings, tab_dividends, tab_bonds, tab_bm, tab_risk, tab_corr, tab_monte = st.tabs([
             "📊 P&L Report", "🚀 Top Movers", "💰 Savings", "💸 Dividend Tracker",
-            "📋 Bond Schedule", "⚡ Risk Metrics", "🔗 Correlation", "🎲 Monte Carlo",
+            "📋 Bond Schedule", "📈 Benchmark", "⚡ Risk Metrics", "🔗 Correlation", "🎲 Monte Carlo",
         ])
         
         with tab_report:
@@ -1307,6 +1275,9 @@ def render_reports():
 
         with tab_bonds:
             render_bond_schedule()
+
+        with tab_bm:
+            render_benchmark_comparison(account_ids=_risk_acct_ids, preset_label=sel_preset)
 
         with tab_risk:
             render_risk_metrics(account_ids=_risk_acct_ids)
@@ -2441,7 +2412,7 @@ def render_dividend_tracker():
             'cost_basis_eur':      _wtd_cost(g),
             'position_start_date': g['position_start_date'].min(),
             'last_income_date':    g['date'].max(),
-        }))
+        }), include_groups=False)
         .reset_index()
         .sort_values('period_income_eur', ascending=False)
     )
@@ -4488,6 +4459,126 @@ def render_financial_planning():
 
 
 # ======================================================
+# B13b. BENCHMARK COMPARISON
+# ======================================================
+
+def render_benchmark_comparison(account_ids: tuple = None, preset_label: str = "Full Portfolio"):
+    """Render the Benchmark Comparison (price-return indexed chart)."""
+    st.subheader("📊 Benchmark Comparison (Price Performance)")
+    st.caption(
+        "Compares the **cumulative price return** of your holdings (value-weighted by position size) "
+        "against a chosen market index. Cash flows — buys, sells, dividends received as cash, "
+        "and bond maturities — are excluded so the comparison is apples-to-apples."
+    )
+
+    df_bm_list  = get_benchmark_candidates(min_days=30)
+    if df_bm_list.empty:
+        st.info(
+            "No **Market Index** securities found with sufficient price history. "
+            "Go to **Market Data → Securities** and set the type to *Market Index* "
+            "for the indices you want to use as benchmarks (e.g. S&P 500, ATHEX)."
+        )
+        return
+    bm_idx_opts = {"— None —": None}
+    bm_idx_opts.update({row["name"]: int(row["id"]) for _, row in df_bm_list.iterrows()})
+
+    _cc1, _cc2, _cc3 = st.columns([3, 2, 1])
+    with _cc1:
+        bm_idx_label = st.selectbox(
+            "Overlay benchmark",
+            list(bm_idx_opts.keys()),
+            key="perf_chart_benchmark",
+            help="Market index to compare against.",
+        )
+    with _cc2:
+        bm_start_date = st.date_input(
+            "Start date",
+            value=(datetime.today() - timedelta(days=365 * 3)).date(),
+            key="perf_bm_chart_start_date",
+            help="Start date for the comparison (both lines are indexed to 100 here).",
+        )
+    with _cc3:
+        bm_smooth = st.selectbox(
+            "Resample",
+            ["Daily", "Weekly", "Monthly"],
+            index=2,
+            key="perf_chart_bm_resample",
+        )
+
+    bm_idx_sec_id = bm_idx_opts[bm_idx_label]
+    resample_map  = {"Daily": "D", "Weekly": "W", "Monthly": "ME"}
+    resample_freq = resample_map[bm_smooth]
+    bm_earliest   = pd.to_datetime(bm_start_date)
+    lookback_bm   = max(60, (pd.Timestamp.today() - bm_earliest).days + 30)
+
+    df_px   = get_price_returns(lookback_bm, account_ids)
+    fig_idx = go.Figure()
+    port_ret = None
+
+    if df_px is not None and not df_px.empty:
+        df_w = get_portfolio_weights(account_ids)
+        if not df_w.empty:
+            wmap  = dict(zip(df_w["ticker"], df_w["weight"]))
+            avail = [c for c in df_px.columns if c in wmap]
+            if avail:
+                w = pd.Series([wmap[t] for t in avail], index=avail)
+                w = w / w.sum()
+                port_ret = df_px[avail].pct_change(fill_method=None).dropna().dot(w)
+            else:
+                port_ret = df_px.pct_change(fill_method=None).dropna().mean(axis=1)
+        else:
+            port_ret = df_px.pct_change(fill_method=None).dropna().mean(axis=1)
+
+        port_cum = (1 + port_ret).cumprod()
+        port_cum = port_cum[port_cum.index >= bm_earliest]
+        port_cum = port_cum.resample(resample_freq).last().dropna()
+        if not port_cum.empty:
+            port_indexed  = port_cum / port_cum.iloc[0] * 100
+            port_total_ret = port_indexed.iloc[-1] - 100
+            fig_idx.add_trace(go.Scatter(
+                x=port_indexed.index, y=port_indexed.values,
+                name=f"{preset_label}  {port_total_ret:+.1f}%", line=dict(color="white", width=3),
+            ))
+
+    if bm_idx_sec_id is not None:
+        bm_prices = get_benchmark_returns(bm_idx_sec_id, lookback_bm)
+        if not bm_prices.empty:
+            if port_ret is not None:
+                all_dates  = port_ret.index.union(bm_prices.index).sort_values()
+                bm_aligned = bm_prices.reindex(all_dates).ffill().reindex(port_ret.index)
+                bm_ret     = bm_aligned.pct_change(fill_method=None).dropna()
+                bm_cum     = (1 + bm_ret).cumprod()
+            else:
+                bm_cum = (1 + bm_prices.pct_change(fill_method=None).dropna()).cumprod()
+            bm_cum = bm_cum[bm_cum.index >= bm_earliest]
+            bm_cum = bm_cum.resample(resample_freq).last().dropna()
+            if not bm_cum.empty:
+                bm_indexed    = bm_cum / bm_cum.iloc[0] * 100
+                bm_total_ret  = bm_indexed.iloc[-1] - 100
+                fig_idx.add_trace(go.Scatter(
+                    x=bm_indexed.index, y=bm_indexed.values,
+                    name=f"{bm_idx_label}  {bm_total_ret:+.1f}%", line=dict(dash="dash", width=2),
+                ))
+        else:
+            st.caption(f"No price history found for **{bm_idx_label}** in the selected period.")
+
+    if fig_idx.data:
+        fig_idx.update_layout(
+            title=(
+                f"<b>Price Return vs Benchmark (Indexed to 100)</b>"
+                f"<br><sup>Preset: {preset_label} · from {bm_start_date}</sup>"
+            ),
+            template="plotly_dark",
+            yaxis_title="Cumulative return (start = 100)",
+            margin=dict(l=0, r=0, t=70, b=0),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+        st.plotly_chart(fig_idx, width='stretch')
+    elif df_px is None or df_px.empty:
+        st.info("No price history found for the selected accounts. Try a different preset or wider date range.")
+
+
+# ======================================================
 # B14. RISK METRICS
 # ======================================================
 
@@ -4527,7 +4618,7 @@ def render_risk_metrics(account_ids: tuple = None):
         return
 
     try:
-        daily_returns = df_prices.pct_change().dropna()
+        daily_returns = df_prices.pct_change(fill_method=None).dropna()
         if daily_returns.empty or len(daily_returns) < 10:
             st.info("Not enough return data to compute risk metrics.")
             return
@@ -4579,7 +4670,7 @@ def render_risk_metrics(account_ids: tuple = None):
             if not bench_prices.empty:
                 all_dates     = port_returns.index.union(bench_prices.index).sort_values()
                 bench_aligned = bench_prices.reindex(all_dates).ffill().reindex(port_returns.index)
-                bench_ret     = bench_aligned.pct_change().dropna()
+                bench_ret     = bench_aligned.pct_change(fill_method=None).dropna()
                 common_idx    = port_returns.index.intersection(bench_ret.index)
                 if len(common_idx) >= 30:
                     p = port_returns.loc[common_idx].values
@@ -4669,7 +4760,7 @@ def render_correlation_matrix(account_ids: tuple = None):
             help="Keeps the top N holdings by position value.",
         )
         df_sub      = df_prices.iloc[:, :n_max]
-        daily_rets  = df_sub.pct_change().dropna()
+        daily_rets  = df_sub.pct_change(fill_method=None).dropna()
         corr_matrix = daily_rets.corr()
 
         fig = go.Figure(data=go.Heatmap(
@@ -4744,7 +4835,7 @@ def render_monte_carlo(account_ids: tuple = None):
         return
 
     try:
-        daily_returns = df_prices.pct_change().dropna()
+        daily_returns = df_prices.pct_change(fill_method=None).dropna()
 
         # Value-weighted portfolio returns
         if not df_weights.empty:

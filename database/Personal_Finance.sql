@@ -2,7 +2,7 @@ CREATE EXTENSION IF NOT EXISTS vector;
 
 CREATE TYPE Institutions_Type AS ENUM ('Bank', 'Credit Union', 'Insurance', 'Pension Fund', 'Broker', 'Crypto Exchange', 'Internal', 'Other');
 CREATE TYPE Accounts_Type AS ENUM ('Cash', 'Checking', 'Savings', 'Credit Card', 'Brokerage', 'Pension', 'Other Investment', 'Margin', 'Loan', 'Real Estate', 'Vehicle', 'Asset', 'Liability', 'Other');
-CREATE TYPE Securities_Type AS ENUM ('Stock', 'ETF', 'Bond', 'Mutual Fund', 'Crypto', 'Option', 'Commodity', 'PF_Unit');
+CREATE TYPE Securities_Type AS ENUM ('Stock', 'ETF', 'Bond', 'Mutual Fund', 'Crypto', 'Option', 'Commodity', 'PF_Unit', 'Market Index', 'CD', 'Emp. Stock Opt.', 'FX Spot', 'Other');
 CREATE TYPE Categories_Type AS ENUM ('Income', 'Expense', 'Transfer', 'Trading', 'Investment', 'Dividend', 'Interest', 'Tax', 'Fee');
 CREATE TYPE Investments_Action AS ENUM ('Buy', 'Sell', 'Dividend', 'Reinvest', 'Split', 'ShrIn', 'ShrOut', 'IntInc', 'CashIn', 'CashOut', 'Vest', 'Expire', 'Grant', 'Exercise', 'MiscExp', 'RtrnCap');
 CREATE SEQUENCE IF NOT EXISTS transfers_id_seq START 1 INCREMENT 1;

@@ -4,7 +4,6 @@ import datetime
 import streamlit as st
 from ai.agent import _compact_schema
 from database.connection import get_connection
-from langchain_community.callbacks.streamlit import StreamlitCallbackHandler
 from langchain_community.chat_message_histories import StreamlitChatMessageHistory
 from ai.rag import semantic_search
 from ai.web_search import web_search
@@ -28,6 +27,16 @@ def _classify_question(user_input: str) -> str:
         "hello", "hi ", "hey ", "good morning", "good afternoon", "good evening",
         "thank", "what can you", "how are you", "nice to meet", "help me understand",
         "what is a", "what is an", "explain ", "define ",
+        # financial advice / open-ended questions — no DB query will help here
+        "advice", "tips ", "tip for", "options for", "explore option",
+        "saving money", "save money", "how to save", "how should i", "what should i",
+        "suggest", "recommend", "strategies", "improve my finance", "improve my budget",
+        "help me plan", "financial plan", "financial goal", "reduce expense",
+        "cut cost", "cut spending", "increase income", "pay off debt",
+        "should i invest", "is it a good idea", "what do you think",
+        # conversational / control phrases
+        "re-try", "retry", "try again", "please try", "can you try",
+        "please re", "rephrase", "help me", "can you help",
     ]
     if any(kw in text for kw in general_keywords):
         return "GENERAL"
@@ -81,6 +90,8 @@ def _run_sql(user_input: str, full_date: str, llm, db) -> str:
         f"(e.g. JOIN payees ON payees.payees_id = transactions.payees_id to show payees_name)\n"
         f"- Alias every aggregate column\n"
         f"- LIMIT 200 unless the user asks for everything\n"
+        f"- NEVER select the 'embedding' column — it is a 768-float vector and will break output\n"
+        f"- NEVER use SELECT * — always list explicit columns\n"
         f"Output the SQL query ONLY — no prose, no markdown fences.\n\n"
         f"SCHEMA:\n{schema_info}\n\n"
         f"QUESTION: {user_input}"
@@ -155,15 +166,25 @@ def run_ai_assistant(user_input: str, llm, agent_with_history, rag_engine, db=No
             except Exception:
                 return semantic_results  # Return raw results if LLM synthesis fails
 
-        # Last resort: full ReAct agent
-        st.warning("Retrying with agent...")
+        # Last resort: direct LLM with context about what failed
+        st.warning("Could not find a precise database answer — answering from general knowledge...")
+        fallback_prompt = (
+            f"You are a personal finance assistant. Today is {full_date}.\n"
+            f"The user asked: {user_input}\n\n"
+            f"You could not find a specific database answer. "
+            f"Give a helpful response: if this is a question about their personal data "
+            f"(transactions, balances, investments), ask them to be more specific "
+            f"(e.g. mention an account name, date range, or category). "
+            f"If it is a general finance question, answer it directly."
+        )
         try:
-            st_callback = StreamlitCallbackHandler(st.container())
-            config = {"configurable": {"session_id": "Personal_Finance"}, "callbacks": [st_callback]}
-            response = agent_with_history.invoke({"input": full_prompt}, config=config)
-            return response["output"]
+            return llm.invoke(fallback_prompt).content
         except Exception as e:
-            return f"I wasn't able to answer that question. Error: {str(e)[:150]}"
+            return (
+                "I wasn't able to find a precise answer in the database. "
+                "Try rephrasing with specific details — for example: "
+                "'Show my expenses in January 2026' or 'What is the balance of account X?'"
+            )
 
     elif decision == "WEB":
         st.info("🌐 Searching the web...")
@@ -178,7 +199,15 @@ def run_ai_assistant(user_input: str, llm, agent_with_history, rag_engine, db=No
 
     else:
         st.info("🤖 Answering directly...")
-        return llm.invoke(full_prompt).content
+        general_prompt = (
+            f"You are a personal finance assistant helping a user manage their finances. "
+            f"Today is {full_date}.\n"
+            f"Answer helpfully and stay focused on personal finance topics. "
+            f"If greeted, introduce yourself as a personal finance assistant and briefly list what you can help with "
+            f"(e.g. querying transactions, portfolio analysis, market prices, budgeting advice).\n\n"
+            f"User: {user_input}"
+        )
+        return llm.invoke(general_prompt).content
 
 
 def render_ai_assistant(llm, agent_with_history, rag_engine, db=None):
@@ -213,21 +242,36 @@ def render_ai_assistant(llm, agent_with_history, rag_engine, db=None):
         from database.connection import get_connection as _gc
         _conn = _gc()
         _cur = _conn.cursor()
-        _cur.execute("SELECT COUNT(*) FROM Transactions")
+        # Count only transactions that are actually embeddable: must have at least
+        # one non-zero split (same inner-join + filter logic as update_embeddings).
+        _cur.execute("""
+            SELECT COUNT(DISTINCT t.transactions_id)
+            FROM Transactions t
+            JOIN Splits s ON s.transactions_id = t.transactions_id
+            WHERE t.total_amount <> 0
+              AND s.Amount       <> 0
+        """)
         _total = _cur.fetchone()[0]
-        _cur.execute("SELECT COUNT(*) FROM Transactions WHERE embedding IS NOT NULL")
+        _cur.execute("""
+            SELECT COUNT(*)
+            FROM Transactions t
+            JOIN Splits s ON s.transactions_id = t.transactions_id
+            WHERE t.embedding  IS NOT NULL
+              AND t.total_amount <> 0
+              AND s.Amount        <> 0
+        """)
         _embedded = _cur.fetchone()[0]
         _cur.close()
         _conn.close()
         if _embedded == 0:
             st.warning(
-                f"⚠️ No transaction embeddings found ({_total} transactions total). "
+                f"⚠️ No transaction embeddings found ({_total:,} embeddable transactions). "
                 "Click 'Update Embeddings' to enable semantic search fallback."
             )
         elif _embedded < _total:
-            st.info(f"🔍 Semantic search ready — {_embedded}/{_total} transactions indexed.")
+            st.info(f"🔍 Semantic search ready — {_embedded:,}/{_total:,} transactions indexed.")
         else:
-            st.success(f"✅ Semantic search ready — all {_total} transactions indexed.")
+            st.success(f"✅ Semantic search ready — all {_total:,} transactions indexed.")
     except Exception:
         pass
 

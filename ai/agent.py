@@ -14,7 +14,8 @@ def _compact_schema(db) -> str:
         inspector = sa_inspect(db._engine)
         lines = []
         for table in sorted(db.get_usable_table_names()):
-            cols = [c["name"] for c in inspector.get_columns(table)]
+            # Exclude 'embedding' — a 768-float vector column that overflows the context window
+            cols = [c["name"] for c in inspector.get_columns(table) if c["name"] != "embedding"]
             lines.append(f"{table}({', '.join(cols)})")
         return "\n".join(lines)
     except Exception:
@@ -50,7 +51,10 @@ DATABASE SCHEMA:
 {schema_info}
 
 RULES:
-- Use only SELECT statements.
+- Use only SELECT statements — never INSERT, UPDATE, DELETE, DROP, or DDL.
+- NEVER use SELECT * — always list explicit column names.
+- NEVER select the 'embedding' column — it is a 768-float vector that will overflow your context window.
+- NEVER wrap SQL in backticks or markdown code fences — write raw SQL only.
 - For "this year" use DATE_TRUNC('year', CURRENT_DATE). For "this month" use DATE_TRUNC('month', CURRENT_DATE).
 - Always give aggregated columns a clear alias (e.g. SUM(amount) AS total).
 - Match text filters case-insensitively with ILIKE or LOWER().
@@ -74,7 +78,6 @@ Question: {input}
         suffix=custom_suffix,
         handle_parsing_errors=True,
         max_iterations=3,
-        early_stopping_method="generate",
         allow_dangerous_requests=True,
     )
 

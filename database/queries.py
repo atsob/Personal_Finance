@@ -3311,13 +3311,14 @@ def get_price_returns(lookback_days: int = 252, account_ids: tuple = None):
 
 @st.cache_data(ttl=3600)
 def get_benchmark_candidates(min_days: int = 30):
-    """Securities with enough price history to serve as a benchmark."""
+    """Market Index securities with enough price history to serve as a benchmark."""
     conn = get_connection()
     df = pd.read_sql("""
         SELECT s.Securities_Id AS id, s.Securities_Name AS name, s.Ticker AS ticker,
                COUNT(hp.Date) AS price_days
         FROM Securities s
         JOIN Historical_Prices hp ON hp.Securities_Id = s.Securities_Id
+        WHERE s.Securities_Type = 'Market Index'
         GROUP BY s.Securities_Id, s.Securities_Name, s.Ticker
         HAVING COUNT(hp.Date) >= %(min_days)s
         ORDER BY s.Securities_Name
@@ -3342,3 +3343,59 @@ def get_benchmark_returns(securities_id: int, lookback_days: int = 252):
         return pd.Series(dtype=float)
     df['date'] = pd.to_datetime(df['date'])
     return df.set_index('date')['close']
+
+
+# ── Benchmark presets ─────────────────────────────────────────────────────────
+
+def _ensure_benchmark_presets_table(conn):
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS Benchmark_Presets (
+                Preset_Id   SERIAL PRIMARY KEY,
+                Preset_Name VARCHAR(100) UNIQUE NOT NULL,
+                Account_Ids INTEGER[] NOT NULL DEFAULT '{}',
+                Created_At  TIMESTAMP DEFAULT NOW(),
+                Updated_At  TIMESTAMP DEFAULT NOW()
+            )
+        """)
+    conn.commit()
+
+
+@st.cache_data(ttl=3600)
+def get_benchmark_presets():
+    """Fetch all saved benchmark presets ordered by name."""
+    conn = get_connection()
+    _ensure_benchmark_presets_table(conn)
+    df = pd.read_sql("""
+        SELECT Preset_Id AS preset_id, Preset_Name AS preset_name, Account_Ids AS account_ids
+        FROM Benchmark_Presets
+        ORDER BY Preset_Name
+    """, conn)
+    conn.close()
+    return df
+
+
+def upsert_benchmark_preset(name: str, account_ids):
+    """Insert or update a named benchmark preset (upsert on name)."""
+    conn = get_connection()
+    _ensure_benchmark_presets_table(conn)
+    ids = list(account_ids) if account_ids else []
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO Benchmark_Presets (Preset_Name, Account_Ids, Updated_At)
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (Preset_Name) DO UPDATE
+                SET Account_Ids = EXCLUDED.Account_Ids,
+                    Updated_At  = NOW()
+        """, (name, ids))
+    conn.commit()
+    conn.close()
+
+
+def delete_benchmark_preset(preset_id: int):
+    """Delete a benchmark preset by ID."""
+    conn = get_connection()
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM Benchmark_Presets WHERE Preset_Id = %s", (preset_id,))
+    conn.commit()
+    conn.close()
