@@ -1,6 +1,58 @@
+import time as _time
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as _st_components
+
+# ── Plotly config applied to every chart for better mobile UX ─────────────────
+_PLOTLY_CONFIG = {
+    "scrollZoom": True,          # pinch-to-zoom and scroll-wheel zoom
+    "displayModeBar": "hover",   # toolbar appears only on hover, less clutter on mobile
+    "responsive": True,          # reflows when container resizes (orientation change, etc.)
+    "modeBarButtonsToRemove": ["select2d", "lasso2d"],  # keep only useful tools
+}
+
+
+def pf_plotly_chart(fig, key=None):
+    """Drop-in replacement for st.plotly_chart with mobile-friendly defaults.
+
+    Uses container width, enables scroll/pinch zoom, and hides the toolbar until
+    the user hovers — which keeps the mobile view clean.
+    """
+    st.plotly_chart(fig, width="stretch", config=_PLOTLY_CONFIG, key=key)
+
+
+def scroll_table_to_bottom():
+    """Scroll the data-editor/dataframe immediately above this call to its last row.
+
+    Works correctly even when multiple data editors are on the page (e.g. inside
+    different Streamlit tabs that all render simultaneously).  Instead of using a
+    fixed index like s[0], the script locates its own <iframe> inside the parent
+    document and then finds the last .dvn-scroller that precedes it in the DOM —
+    which is always the grid directly above this component.
+
+    A millisecond timestamp is embedded to make the HTML unique every rerun so
+    Streamlit never serves a cached (and therefore non-executing) copy.
+    """
+    ts = int(_time.time() * 1000)
+    _st_components.html(
+        f"<script>var _ts={ts};"
+        "(function(){"
+        "function _scroll(){"
+        "var doc=window.parent.document;"
+        "var scrollers=doc.querySelectorAll('.dvn-scroller');"
+        "var frames=doc.querySelectorAll('iframe');"
+        "var myFrame=null;"
+        "for(var i=0;i<frames.length;i++){try{if(frames[i].contentWindow===window){myFrame=frames[i];break;}}catch(e){}}"
+        "if(!myFrame||!scrollers.length)return;"
+        "var target=null;"
+        "for(var j=0;j<scrollers.length;j++){"
+        "if(myFrame.compareDocumentPosition(scrollers[j])&2)target=scrollers[j];}"  # 2 = PRECEDING
+        "if(target)target.scrollTop=target.scrollHeight;}"
+        "setTimeout(_scroll,400);setTimeout(_scroll,900);setTimeout(_scroll,1600);"
+        "})();</script>",
+        height=1,
+    )
+
 
 # Βοηθητική συνάρτηση για το χρώμα (πράσινο αν > 0, κόκκινο αν < 0)
 def get_color(val):

@@ -31,7 +31,7 @@ from database.queries import (
     delete_benchmark_preset,
 )
 from data.downloaders import download_historical_fx, download_historical_prices_from_tradingview, download_historical_prices_from_yahoo, download_bond_prices_from_solidus, download_securities_info_from_yahoo
-from ui.components import color_negative_red, color_value, custom_metric, get_color, copy_df_button
+from ui.components import color_negative_red, color_value, custom_metric, get_color, copy_df_button, pf_plotly_chart
 from datetime import datetime, timedelta
 
 def render_reports():
@@ -99,7 +99,7 @@ def render_reports():
                 fig = px.line(df_pivot, x="date", y=[c for c in df_pivot.columns if c != 'date'],
                              title="<b>Investment Value per Account</b>", template="plotly_dark")
                 fig.for_each_trace(lambda t: t.update(line=dict(color="white", width=4) if t.name == "TOTAL" else dict(width=2)))
-                st.plotly_chart(fig, width='stretch')
+                pf_plotly_chart(fig)
 
                 st.markdown("#### 📉 Portfolio Drawdown")
                 df_dd = df_total.copy().sort_values('date')
@@ -115,7 +115,7 @@ def render_reports():
                     labels={'drawdown_pct': 'Drawdown (%)', 'date': 'Date'}
                 )
                 fig_dd.update_layout(yaxis_tickformat='.1f', margin=dict(l=0, r=0, t=50, b=0))
-                st.plotly_chart(fig_dd, width='stretch')
+                pf_plotly_chart(fig_dd)
 
 
         with tab_data:
@@ -601,7 +601,7 @@ def render_reports():
             #    st.dataframe(df_acc.style.map(color_negative_red).format("{:,.2f} €"), width="stretch")
 
                 # Ορίζουμε τις στήλες που θέλουν σύμβολο € (όλες εκτός από τα % columns)
-                _pct_display_cols = {'Daily P&L %', 'YTD P&L %', 'ROI %', 'Annual YOC %'}
+                _pct_display_cols = {'Daily P&L %', 'YTD P&L %', 'ROI %', 'Annual YOC %', 'Price Day Change %'}
                 euro_cols = [col for col in df_acc.columns if col not in _pct_display_cols]
 
                 st.dataframe(
@@ -658,15 +658,20 @@ def render_reports():
                         df_holdings = pd.read_sql(query_holdings, conn)
 
                         query_prices = f"""
-                            SELECT DISTINCT ON (h.Securities_Id) 
-                                h.Securities_Id, 
+                            SELECT DISTINCT ON (h.Securities_Id)
+                                h.Securities_Id,
                                 s.Securities_Name,
                                 h.Quantity,
-                                (SELECT hp.Close 
-                                FROM Historical_Prices hp 
-                                WHERE hp.Securities_Id = h.Securities_Id 
-                                AND hp.Date <= CURRENT_DATE 
-                                ORDER BY hp.Date DESC LIMIT 1) AS Latest_Price
+                                (SELECT hp.Close
+                                FROM Historical_Prices hp
+                                WHERE hp.Securities_Id = h.Securities_Id
+                                AND hp.Date <= CURRENT_DATE
+                                ORDER BY hp.Date DESC LIMIT 1) AS Latest_Price,
+                                (SELECT hp.Close
+                                FROM Historical_Prices hp
+                                WHERE hp.Securities_Id = h.Securities_Id
+                                AND hp.Date <= CURRENT_DATE
+                                ORDER BY hp.Date DESC LIMIT 1 OFFSET 1) AS Prev_Price
                             FROM Holdings h
                             JOIN Securities s ON h.Securities_Id = s.Securities_Id
                             WHERE h.Accounts_Id = {account_id} AND h.Quantity != 0
@@ -692,16 +697,33 @@ def render_reports():
                         df_details['quantity'] = 0
                     
                     if not df_prices.empty:
+                        _price_cols = ['securities_name', 'latest_price']
+                        if 'prev_price' in df_prices.columns:
+                            _price_cols.append('prev_price')
                         df_details = df_details.merge(
-                            df_prices[['securities_name', 'latest_price']], 
-                            on='securities_name', 
+                            df_prices[_price_cols],
+                            on='securities_name',
                             how='left'
                         )
                     else:
                         df_details['latest_price'] = 0
-                    
-                    df_details['quantity'] = df_details['quantity'].fillna(0)
+
+                    df_details['quantity']     = df_details['quantity'].fillna(0)
                     df_details['latest_price'] = df_details['latest_price'].fillna(0)
+
+                    if 'prev_price' in df_details.columns:
+                        df_details['prev_price'] = df_details['prev_price'].fillna(0)
+                        df_details['price_day_change'] = (
+                            df_details['latest_price'] - df_details['prev_price']
+                        )
+                        df_details['price_day_change_pct'] = (
+                            df_details['price_day_change']
+                            / df_details['prev_price'].replace(0, float('nan'))
+                            * 100
+                        ).fillna(0)
+                    else:
+                        df_details['price_day_change']     = 0.0
+                        df_details['price_day_change_pct'] = 0.0
 
                     # ── Recompute % columns from EUR totals ───────────────
                     # Averaging or summing percentages across rows is wrong.
@@ -722,12 +744,15 @@ def render_reports():
                     ).fillna(0)
 
                     df_display = df_details[[
-                        'securities_name', 'quantity', 'latest_price', 'current_value_eur', 
+                        'securities_name', 'quantity', 'latest_price', 'current_value_eur',
                         'pnl_dtd_market_eur', 'pnl_dtd_fx_eur',
                         'pnl_dtd_eur', 'pnl_dtd_percent', 'pnl_wtd_eur', 'pnl_mtd_eur', 'pnl_qtd_eur',
-                        'pnl_ytd_market_eur', 'pnl_ytd_fx_eur', 
-                        'realized_pnl_ytd_eur', 'unrealized_pnl_ytd_eur', 
-                        'pnl_ytd_eur', 'pnl_ytd_percent', 'realized_pnl_eur', 'unrealized_pnl_eur', 'pnl_net_all_time_eur', 'pnl_net_all_time_percent', 'dividend_yoc_pct'
+                        'pnl_ytd_market_eur', 'pnl_ytd_fx_eur',
+                        'realized_pnl_ytd_eur', 'unrealized_pnl_ytd_eur',
+                        'pnl_ytd_eur', 'pnl_ytd_percent', 'realized_pnl_eur', 'unrealized_pnl_eur',
+                        'pnl_net_all_time_eur', 'pnl_net_all_time_percent',
+                        'price_day_change', 'price_day_change_pct',
+                        'dividend_yoc_pct'
                     ]].rename(columns={
                         'securities_name': 'Security',
                         'quantity': 'Quantity',        
@@ -751,6 +776,8 @@ def render_reports():
                         'unrealized_pnl_eur': 'Unrealized P&L',
                         'pnl_net_all_time_eur': 'Total Net P&L',
                         'pnl_net_all_time_percent': 'ROI %',
+                        'price_day_change': 'Price Day Change',
+                        'price_day_change_pct': 'Price Day Change %',
                         'dividend_yoc_pct': 'Annual YOC %'
                     })
 
@@ -759,7 +786,7 @@ def render_reports():
                         df_display = df_display[df_display['Value (€)'] != 0]
 
 
-                    pnl_cols = ['Daily Market P&L', 'Daily FX P&L', 'Daily P&L', 'Daily P&L %', 'Weekly P&L', 'Monthly P&L', 'Quarterly P&L', 'YTD Market P&L', 'YTD FX P&L', 'YTD Realized P&L', 'YTD Unrealized P&L', 'YTD P&L', 'YTD P&L %', 'Realized P&L', 'Unrealized P&L', 'Total Net P&L', 'ROI %', 'Annual YOC %']
+                    pnl_cols = ['Daily Market P&L', 'Daily FX P&L', 'Daily P&L', 'Daily P&L %', 'Weekly P&L', 'Monthly P&L', 'Quarterly P&L', 'YTD Market P&L', 'YTD FX P&L', 'YTD Realized P&L', 'YTD Unrealized P&L', 'YTD P&L', 'YTD P&L %', 'Realized P&L', 'Unrealized P&L', 'Total Net P&L', 'ROI %', 'Price Day Change', 'Price Day Change %', 'Annual YOC %']
 
                     # 1. Set 'Security' as the index so Streamlit treats it as the frozen lead column
                     df_to_show = df_display.set_index('Security')
@@ -781,15 +808,14 @@ def render_reports():
                     #    .map(color_negative_red, subset=pnl_cols)
                         .map(color_negative_red, subset=existing_pnl_cols)
                         .format({
-                            # P&L columns
-                    #        **{col: "{:,.2f} €" for col in pnl_cols},
-                            **{col: "{:,.2f} €" for col in existing_pnl_cols},
+                            **{col: "{:,.2f} €" for col in existing_pnl_cols
+                               if col not in {'Price Day Change', 'Price Day Change %'}},
                             'Daily P&L %': "{:.2f}%",
                             'YTD P&L %': "{:.2f}%",
                             'ROI %': "{:.2f}%",
-                            # Value column
+                            'Price Day Change': "{:+,.4f}",
+                            'Price Day Change %': "{:+.2f}%",
                             'Value (€)': "{:,.2f} €",
-                            # Price and Quantity columns
                             'Latest Price': "{:,.2f}",
                             'Quantity': "{:,.8f}",
                             'Annual YOC %': "{:.4f}%"
@@ -1167,7 +1193,7 @@ def render_reports():
                         margin=dict(l=0, r=60, t=50, b=0),
                         yaxis_title=None
                     )
-                    st.plotly_chart(fig_yoc, width="stretch")
+                    pf_plotly_chart(fig_yoc)
 
                 # ── Detail table ──────────────────────────────────────────────
                 st.subheader("Detail")
@@ -1504,7 +1530,7 @@ def render_reports():
             fig.add_hline(y=0, line_dash="dash", line_color="white")
             fig.add_vline(x=df_data["vol_1y_ann"].median(), line_dash="dash", line_color="gray")
             
-            st.plotly_chart(fig, width='stretch')
+            pf_plotly_chart(fig)
 
             # 2. Top Efficiency Picks Table
             st.markdown("### 🏆 Top Efficiency Picks (High Sharpe Ratio)")
@@ -2119,7 +2145,7 @@ def render_income_expense_reports():
                         height=450,
                         legend=dict(groupclick='toggleitem'),
                     )
-                    st.plotly_chart(fig_bar, width="stretch")
+                    pf_plotly_chart(fig_bar)
 
                     st.markdown("---")
 
@@ -2167,7 +2193,7 @@ def render_income_expense_reports():
                                     title_font=dict(size=18),
                                     margin=dict(t=60, b=20, l=20, r=20),
                                 )
-                                st.plotly_chart(fig_pie, width="stretch")
+                                pf_plotly_chart(fig_pie)
                             else:
                                 st.info(f"No {group_label} data available.")
                 
@@ -2225,7 +2251,7 @@ def render_income_expense_reports():
                                     markers=True
                                 )
                                 fig_line.update_layout(xaxis_tickangle=-45, hovermode='x unified', height=500)
-                                st.plotly_chart(fig_line, width='stretch')
+                                pf_plotly_chart(fig_line)
                 
                 with tab_drilldown:
                     st.subheader("Detailed Transaction Drill Down")
@@ -2377,7 +2403,7 @@ def render_dividend_tracker():
         color_discrete_sequence=['#2ECC71'],
     )
     fig_bar.update_layout(margin=dict(l=0, r=0, t=50, b=0))
-    st.plotly_chart(fig_bar, width='stretch')
+    pf_plotly_chart(fig_bar)
 
     # Income by security for the selected period
     st.markdown(f"#### Income by Security — {period_label}")
@@ -2488,7 +2514,7 @@ def render_dividend_tracker():
         hovertemplate='<b>%{label}</b><br>€ %{value:,.2f}<br>%{percent}<extra></extra>',
     )
     fig_pie.update_layout(margin=dict(l=0, r=0, t=50, b=0), showlegend=True)
-    st.plotly_chart(fig_pie, width='stretch')
+    pf_plotly_chart(fig_pie)
 
     # Full detail table
     with st.expander("Full transaction detail"):
@@ -2652,7 +2678,7 @@ def render_cash_flow_forecast():
             margin=dict(l=0, r=0, t=50, b=0),
             legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
         )
-        st.plotly_chart(fig, width='stretch')
+        pf_plotly_chart(fig)
     else:
         st.info(f"No cash flows found within the next {days} days.")
 
@@ -2775,7 +2801,7 @@ def render_asset_allocation():
         )
         fig.update_traces(textinfo='percent+label')
         fig.update_layout(margin=dict(l=0, r=0, t=50, b=0), showlegend=False)
-        st.plotly_chart(fig, width='stretch')
+        pf_plotly_chart(fig)
 
     with col_bar:
         fig2 = px.bar(
@@ -2787,7 +2813,7 @@ def render_asset_allocation():
             color_discrete_map={'actual_pct': '#457B9D', 'target_pct': '#F1A208'},
         )
         fig2.update_layout(margin=dict(l=0, r=0, t=50, b=0))
-        st.plotly_chart(fig2, width='stretch')
+        pf_plotly_chart(fig2)
 
     st.markdown("#### Rebalancing Delta")
     df_display = df.copy()
@@ -2850,7 +2876,7 @@ def render_sector_allocation():
         )
         fig_s_pie.update_traces(textinfo='percent+label')
         fig_s_pie.update_layout(margin=dict(l=0, r=0, t=50, b=0), showlegend=False)
-        st.plotly_chart(fig_s_pie, width='stretch')
+        pf_plotly_chart(fig_s_pie)
 
     with col_bar:
         fig_s_bar = px.bar(
@@ -2862,7 +2888,7 @@ def render_sector_allocation():
         )
         fig_s_bar.update_traces(textposition='outside')
         fig_s_bar.update_layout(margin=dict(l=0, r=0, t=50, b=0), yaxis_title='%')
-        st.plotly_chart(fig_s_bar, width='stretch')
+        pf_plotly_chart(fig_s_bar)
 
     st.dataframe(
         df_sector.style.format({'value_eur': '{:,.2f} €', 'actual_pct': '{:.2f}%'}),
@@ -2899,7 +2925,7 @@ def render_sector_allocation():
         )
         fig_i_pie.update_traces(textinfo='percent+label')
         fig_i_pie.update_layout(margin=dict(l=0, r=0, t=50, b=0), showlegend=False)
-        st.plotly_chart(fig_i_pie, width='stretch')
+        pf_plotly_chart(fig_i_pie)
 
     with col_ind_bar:
         fig_i_bar = px.bar(
@@ -2914,7 +2940,7 @@ def render_sector_allocation():
             xaxis_tickangle=-35,
             legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
         )
-        st.plotly_chart(fig_i_bar, width='stretch')
+        pf_plotly_chart(fig_i_bar)
 
     st.dataframe(
         df_industry.style.format({'value_eur': '{:,.2f} €', 'actual_pct': '{:.2f}%'}),
@@ -2960,7 +2986,7 @@ def render_fx_exposure():
     )
     fig.update_traces(textposition='outside')
     fig.update_layout(coloraxis_showscale=False, margin=dict(l=0, r=0, t=50, b=0))
-    st.plotly_chart(fig, width='stretch')
+    pf_plotly_chart(fig)
 
     st.markdown("#### Sensitivity to ±5% FX Move")
     df_display = df.copy()
@@ -3028,7 +3054,7 @@ def render_bond_schedule():
         )
         fig.update_traces(textposition='outside')
         fig.update_layout(showlegend=False, margin=dict(l=0, r=0, t=50, b=0))
-        st.plotly_chart(fig, width='stretch')
+        pf_plotly_chart(fig)
 
     st.markdown("#### Bond Holdings Detail")
     st.dataframe(
@@ -3189,7 +3215,7 @@ def render_net_worth_report():
             margin=dict(l=0, r=0, t=50, b=0),
             legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
         )
-        st.plotly_chart(fig, width='stretch')
+        pf_plotly_chart(fig)
 
         # ── Hierarchical table ─────────────────────────────────────────────
         ASSET_GROUPS     = ['Investments', 'Pension', 'Cash & Bank', 'Other Assets', 'Other']
@@ -3453,7 +3479,7 @@ def render_net_worth_report():
                 )
                 fig_pie.update_traces(textinfo='percent+label')
                 fig_pie.update_layout(showlegend=False, margin=dict(l=0, r=0, t=50, b=0))
-                st.plotly_chart(fig_pie, width='stretch')
+                pf_plotly_chart(fig_pie)
 
             with col_table:
                 st.dataframe(
@@ -3518,7 +3544,7 @@ def render_net_worth_report():
             margin=dict(l=0, r=0, t=50, b=0),
             legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
         )
-        st.plotly_chart(fig_ab, width='stretch')
+        pf_plotly_chart(fig_ab)
 
         # ── Table — period columns labelled with explicit end dates ─────────
         def fmt_period_date(dt):
@@ -3739,7 +3765,7 @@ def render_savings_rate():
         legend=dict(orientation="h", yanchor="bottom", y=-0.25, xanchor="center", x=0.5),
         margin=dict(l=0, r=0, t=50, b=0),
     )
-    st.plotly_chart(fig, width="stretch")
+    pf_plotly_chart(fig)
 
     df_display = df_plot[["month_str", "income_eur", "expenses_eur", "savings_eur", "savings_rate_pct"]].copy()
     df_display.columns = ["Month", "Income (€)", "Expenses (€)", "Savings (€)", "Savings Rate (%)"]
@@ -3859,7 +3885,7 @@ def render_budget_vs_actual():
             xaxis_tickangle=-40,
             margin=dict(l=0, r=0, t=50, b=130),
         )
-        st.plotly_chart(fig, width="stretch")
+        pf_plotly_chart(fig)
 
     # ---- Progress bars for budgeted categories ----
     if not df_budgeted.empty:
@@ -3943,7 +3969,7 @@ def render_spending_trends():
         labels={"amount_eur": "Amount (€)", "month": "Month", "category": "Category"},
     )
     fig.update_layout(margin=dict(l=0, r=0, t=50, b=0))
-    st.plotly_chart(fig, width="stretch")
+    pf_plotly_chart(fig)
 
     st.markdown("#### Year-over-Year Comparison")
     all_categories    = sorted(df["category"].unique().tolist())
@@ -3965,7 +3991,7 @@ def render_spending_trends():
         category_orders={"month_name": list(month_names.values())},
     )
     fig_yoy.update_layout(margin=dict(l=0, r=0, t=50, b=0))
-    st.plotly_chart(fig_yoy, width="stretch")
+    pf_plotly_chart(fig_yoy)
 
 
 # ======================================================
@@ -4058,7 +4084,7 @@ def render_capital_gains():
         barmode="group",
     )
     fig.update_layout(margin=dict(l=0, r=0, t=50, b=0))
-    st.plotly_chart(fig, width="stretch")
+    pf_plotly_chart(fig)
 
 
 # ======================================================
@@ -4165,7 +4191,7 @@ def render_investment_income():
         barmode="stack",
     )
     fig.update_layout(margin=dict(l=0, r=0, t=50, b=0))
-    st.plotly_chart(fig, width="stretch")
+    pf_plotly_chart(fig)
 
 
 # ======================================================
@@ -4342,7 +4368,7 @@ def render_fire_calculator():
         xaxis_title="Years", yaxis_title="Portfolio (€)",
         margin=dict(l=0, r=0, t=50, b=0),
     )
-    st.plotly_chart(fig, width="stretch")
+    pf_plotly_chart(fig)
 
     swr_rates = [3.0, 3.5, 4.0, 4.5, 5.0]
     swr_data  = [{"SWR (%)": r, "FIRE Number (€)": f"€ {annual_expenses / (r / 100):,.0f}"} for r in swr_rates]
@@ -4427,7 +4453,7 @@ def render_loan_amortization():
         xaxis_title="Payment #", yaxis_title="Amount (€)",
         margin=dict(l=0, r=0, t=50, b=0),
     )
-    st.plotly_chart(fig, width="stretch")
+    pf_plotly_chart(fig)
 
     fmts = {
         "Payment (€)":   "€ {:,.2f}",
@@ -4573,7 +4599,7 @@ def render_benchmark_comparison(account_ids: tuple = None, preset_label: str = "
             margin=dict(l=0, r=0, t=70, b=0),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         )
-        st.plotly_chart(fig_idx, width='stretch')
+        pf_plotly_chart(fig_idx)
     elif df_px is None or df_px.empty:
         st.info("No price history found for the selected accounts. Try a different preset or wider date range.")
 
@@ -4706,7 +4732,7 @@ def render_risk_metrics(account_ids: tuple = None):
                       labels={"Rolling 30d Sharpe": "Sharpe Ratio"})
         fig.add_hline(y=0, line_dash="dash", line_color="#E74C3C")
         fig.update_layout(margin=dict(l=0, r=0, t=50, b=0))
-        st.plotly_chart(fig, width="stretch")
+        pf_plotly_chart(fig)
         if portfolio_value > 0:
             st.caption(
                 f"Returns are value-weighted by current position size (total: € {portfolio_value:,.0f}). "
@@ -4763,6 +4789,11 @@ def render_correlation_matrix(account_ids: tuple = None):
         daily_rets  = df_sub.pct_change(fill_method=None).dropna()
         corr_matrix = daily_rets.corr()
 
+        # Scale cell size so the matrix stays readable; clamp so it fits most screens
+        cell_px    = max(36, min(55, 500 // max(n_max, 1)))
+        fig_px     = max(380, n_max * cell_px)
+        label_font = max(9, min(13, cell_px - 22))
+
         fig = go.Figure(data=go.Heatmap(
             z=corr_matrix.values,
             x=corr_matrix.columns.tolist(),
@@ -4771,15 +4802,22 @@ def render_correlation_matrix(account_ids: tuple = None):
             zmid=0,
             text=np.round(corr_matrix.values, 2),
             texttemplate="%{text}",
+            textfont=dict(size=label_font),
             showscale=True,
         ))
         fig.update_layout(
             template="plotly_dark",
             title="<b>Price Return Correlation Matrix</b>",
+            height=fig_px,
             margin=dict(l=0, r=0, t=50, b=0),
-            xaxis=dict(tickangle=-45),
+            xaxis=dict(tickangle=-45, tickfont=dict(size=label_font)),
+            yaxis=dict(tickfont=dict(size=label_font)),
         )
-        st.plotly_chart(fig, width="stretch")
+        if n_max > 10:
+            st.caption(
+                f"Tip: {n_max} holdings — pinch to zoom or use the toolbar to pan on mobile."
+            )
+        pf_plotly_chart(fig)
 
     except Exception as e:
         st.info(f"Could not compute correlation matrix: {e}")
@@ -4821,9 +4859,12 @@ def render_monte_carlo(account_ids: tuple = None):
                                 help="Historical price window used to estimate mean return and volatility. Longer = more stable estimate. 252≈1yr, 756≈3yr, 1260≈5yr.")
 
     _mc_default_portfolio = get_investable_portfolio_value(account_ids)
+    # Key includes account_ids so the widget resets when the preset changes,
+    # forcing Streamlit to pick up the freshly-computed default value.
+    _mc_key_suffix = str(account_ids)
     initial_value = st.number_input(
         "Starting Portfolio Value (€)", min_value=0.0, step=1000.0,
-        value=_mc_default_portfolio, key="mc_initial",
+        value=_mc_default_portfolio, key=f"mc_initial_{_mc_key_suffix}",
         help="Pre-filled from your live portfolio value (holdings + pension + investment accounts).",
     )
 
@@ -4887,14 +4928,14 @@ def render_monte_carlo(account_ids: tuple = None):
                 override_return = st.number_input(
                     "Expected annual return (%)",
                     min_value=_RETURN_MIN, max_value=_RETURN_MAX,
-                    value=_default_ret, step=0.5, key="mc_override_ret",
+                    value=_default_ret, step=0.5, key=f"mc_override_ret_{_mc_key_suffix}",
                     help="Override the calibrated value. Long-run equity average is ~7-10% nominal."
                 )
             with ov_col2:
                 override_vol = st.number_input(
                     "Annual volatility (%)",
                     min_value=_VOL_MIN, max_value=_VOL_MAX,
-                    value=_default_vol, step=0.5, key="mc_override_vol",
+                    value=_default_vol, step=0.5, key=f"mc_override_vol_{_mc_key_suffix}",
                     help="Override the calibrated volatility. Broad equity index is typically 15-20%."
                 )
 
@@ -4947,7 +4988,7 @@ def render_monte_carlo(account_ids: tuple = None):
             xaxis_title="Years", yaxis_title="Portfolio Value (€)",
             margin=dict(l=0, r=0, t=50, b=0),
         )
-        st.plotly_chart(fig, width="stretch")
+        pf_plotly_chart(fig)
 
         final_values = paths[:, -1]
         targets      = [50_000, 100_000, 250_000, 500_000, 1_000_000]

@@ -1,3 +1,4 @@
+import math
 import pandas as pd
 import streamlit as st
 from psycopg2.extras import execute_values
@@ -106,7 +107,7 @@ def execute_db_save(df_original, df_edited, table_name, id_col, current_acc_id=N
                         )
 
             elif table_name == "Transactions":
-                # Sync date and Accounts_Id changes to the mirrored transfer transaction
+                # Sync changes to the mirrored transfer transaction
                 for _, row in df_updates.iterrows():
                     transfers_id = _safe_val(row.get('transfers_id'))
                     if not transfers_id:
@@ -117,10 +118,14 @@ def execute_db_save(df_original, df_edited, table_name, id_col, current_acc_id=N
                         continue
                     orig = orig_rows.iloc[0]
 
-                    new_date    = _safe_val(row.get('date'))
-                    orig_date   = _safe_val(orig.get('date'))
-                    new_acc_id  = _safe_val(row.get('accounts_id'))
-                    orig_acc_id = _safe_val(orig.get('accounts_id'))
+                    new_date         = _safe_val(row.get('date'))
+                    orig_date        = _safe_val(orig.get('date'))
+                    new_acc_id       = _safe_val(row.get('accounts_id'))
+                    orig_acc_id      = _safe_val(orig.get('accounts_id'))
+                    new_total        = _safe_val(row.get('total_amount'))
+                    orig_total       = _safe_val(orig.get('total_amount'))
+                    new_total_target = _safe_val(row.get('total_amount_target'))
+                    orig_total_target= _safe_val(orig.get('total_amount_target'))
 
                     if new_date != orig_date:
                         cur.execute(
@@ -135,6 +140,30 @@ def execute_db_save(df_original, df_edited, table_name, id_col, current_acc_id=N
                             """UPDATE Transactions SET accounts_id_target = %s
                                WHERE transfers_id = %s AND transactions_id != %s""",
                             (int(new_acc_id), int(transfers_id), tx_id),
+                        )
+                    # Sync amount changes to the mirror.
+                    # Convention (from transfer creation):
+                    #   source.total_amount        = signed outflow (-) or inflow (+)
+                    #   source.total_amount_target = abs amount arriving at the mirror account
+                    #   mirror.total_amount        = opposite-signed value of source.total_amount_target
+                    #   mirror.total_amount_target = abs(source.total_amount)
+                    if new_total != orig_total or new_total_target != orig_total_target:
+                        mirror_total = None
+                        mirror_total_target = None
+                        if new_total_target is not None and new_total is not None:
+                            # Mirror receives the target amount with the opposite sign
+                            mirror_total = math.copysign(abs(float(new_total_target)), -float(new_total))
+                            mirror_total_target = abs(float(new_total))
+                        elif new_total is not None:
+                            mirror_total_target = abs(float(new_total))
+                        elif new_total_target is not None and orig_total is not None:
+                            mirror_total = math.copysign(abs(float(new_total_target)), -float(orig_total))
+                        cur.execute(
+                            """UPDATE Transactions
+                                  SET total_amount        = COALESCE(%s, total_amount),
+                                      total_amount_target = COALESCE(%s, total_amount_target)
+                               WHERE transfers_id = %s AND transactions_id != %s""",
+                            (mirror_total, mirror_total_target, int(transfers_id), tx_id),
                         )
 
         # ── INSERT new rows ───────────────────────────────────────────────────

@@ -4,7 +4,7 @@ from datetime import datetime, date, timedelta
 import calendar
 from database.connection import get_db
 from database.crud import save_changes, execute_db_save, update_accounts_balances, update_holdings, update_investment_balances, update_pension_balances
-from ui.components import copy_df_button
+from ui.components import copy_df_button, scroll_table_to_bottom
 
 def _render_transaction_table(acc_id, payee_options, acc_options, cat_options, tab_key):
     """Render a filtered transaction register for one account.
@@ -193,22 +193,7 @@ def _render_transaction_table(acc_id, payee_options, acc_options, cat_options, t
     _copy_txns = _copy_txns.rename(columns={"payees_id": "Payee", "accounts_id_target": "Target Account"})
     copy_df_button(_copy_txns, key=f"dl_reg_txns_{unique_key}")
 
-    # Scroll the grid to the bottom on every sort change so the user lands
-    # at the end of the sorted list (newest entries for Date ASC, etc.).
-    _scroll_key = f"{unique_key}_scrolled"
-    if _scroll_key not in st.session_state:
-        st.session_state[_scroll_key] = True
-        st.components.v1.html(
-            "<script>"
-            "function _scrollBottom(){"
-            "var s=window.parent.document.querySelectorAll('.dvn-scroller');"
-            "if(s.length)s[s.length-1].scrollTop=s[s.length-1].scrollHeight;}"
-            "setTimeout(_scrollBottom,400);"
-            "setTimeout(_scrollBottom,900);"
-            "setTimeout(_scrollBottom,1600);"
-            "</script>",
-            height=1,
-        )
+    scroll_table_to_bottom()
 
     # ── Change detection & Save ───────────────────────────────────────────────
     _orig_for_cmp   = df_original.drop(columns=["_selected"])
@@ -244,164 +229,12 @@ def _render_transaction_table(acc_id, payee_options, acc_options, cat_options, t
                     current_acc_id=acc_id, conn=_conn_save
                 )
 
-    # ── Move transactions ─────────────────────────────────────────────────────
-    st.write("---")
-    st.subheader("🔀 Move Transactions to Another Account")
-    st.caption("Tick ☑ on rows above, pick a target account, then click Move.")
 
     _selected_ids = edited_reg.loc[
         edited_reg.get("_selected", False) == True, "transactions_id"
     ].dropna().astype(int).tolist()
 
     _all_ids = df["transactions_id"].dropna().astype(int).tolist()
-
-    _move_targets = {k: v for k, v in acc_options.items() if k != acc_id}
-    _m1, _m2, _m3 = st.columns([3, 1, 1])
-    with _m1:
-        _move_target_id = st.selectbox(
-            "Move to account",
-            options=list(_move_targets.keys()),
-            format_func=lambda x: _move_targets[x],
-            key=f"move_target_{acc_id}_{tab_key}"
-        )
-    with _m2:
-        st.write("")
-        st.write("")
-        _move_btn = st.button(
-            f"▶️ Move {len(_selected_ids)} selected",
-            key=f"move_btn_{acc_id}_{tab_key}",
-            type="primary",
-            disabled=len(_selected_ids) == 0
-        )
-    with _m3:
-        st.write("")
-        st.write("")
-        _move_all_btn = st.button(
-            f"⏩ Move All ({len(_all_ids)})",
-            key=f"move_all_btn_{acc_id}_{tab_key}",
-            disabled=len(_all_ids) == 0,
-        )
-
-    # ── Confirmation: Move Selected ───────────────────────────────────────
-    _move_sel_ck = f"confirm_move_sel_{acc_id}_{tab_key}"
-    if _move_btn:
-        st.session_state[_move_sel_ck] = True
-
-    if st.session_state.get(_move_sel_ck) and _selected_ids:
-        _target_name = _move_targets.get(_move_target_id, "selected account")
-        st.warning(
-            f"⚠️ Move **{len(_selected_ids)} selected transaction(s)** to **{_target_name}**? "
-            "This cannot be undone automatically."
-        )
-        _ca, _cb, _ = st.columns([1, 1, 3])
-        with _ca:
-            if _ca.button("✖ Cancel", key=f"confirm_move_sel_cancel_{acc_id}_{tab_key}", width="stretch"):
-                st.session_state[_move_sel_ck] = False
-                st.rerun()
-        with _cb:
-            if _cb.button("✔ Yes, move", type="primary", key=f"confirm_move_sel_yes_{acc_id}_{tab_key}", width="stretch"):
-                st.session_state[_move_sel_ck] = False
-                _move_btn = True   # fall through to existing move logic below
-            else:
-                _move_btn = False  # keep armed but don't execute yet
-    else:
-        _move_btn = False
-
-    # ── Confirmation: Move All ────────────────────────────────────────────
-    _confirm_key = f"confirm_move_all_{acc_id}_{tab_key}"
-    if _move_all_btn:
-        st.session_state[_confirm_key] = True
-
-    if st.session_state.get(_confirm_key):
-        _target_name = _move_targets.get(_move_target_id, "selected account")
-        st.warning(
-            f"⚠️ You are about to move **all {len(_all_ids)} transaction(s)** from this account "
-            f"to **{_target_name}**. This cannot be undone automatically. Are you sure?"
-        )
-        _ca, _cb, _ = st.columns([1, 1, 3])
-        _confirm_cancel = _ca.button("✖ Cancel",       key=f"confirm_cancel_{acc_id}_{tab_key}", width="stretch")
-        _confirm_ok     = _cb.button("✔ Yes, move all", key=f"confirm_ok_{acc_id}_{tab_key}",    width="stretch", type="primary")
-
-        if _confirm_cancel:
-            st.session_state.pop(_confirm_key, None)
-            st.rerun()
-
-        if _confirm_ok:
-            st.session_state.pop(_confirm_key, None)
-            _move_btn = False          # don't double-execute
-            _ids_to_move = _all_ids
-            with get_db() as conn:
-                cur = conn.cursor()
-                cur.execute(
-                    "UPDATE Transactions SET Accounts_Id = %s WHERE Transactions_Id = ANY(%s)",
-                    (_move_target_id, _ids_to_move)
-                )
-                cur.execute(
-                    """
-                    SELECT DISTINCT t2.Transactions_Id
-                    FROM Transactions t1
-                    JOIN Transactions t2 ON t2.Transfers_Id = t1.Transfers_Id
-                    WHERE t1.Transactions_Id = ANY(%s)
-                      AND t1.Transfers_Id IS NOT NULL
-                      AND t2.Transactions_Id != ALL(%s)
-                      AND t2.Accounts_Id NOT IN (%s, %s)
-                      AND t2.Accounts_Id_Target = %s
-                    """,
-                    (_ids_to_move, _ids_to_move, acc_id, _move_target_id, acc_id)
-                )
-                counterpart_ids = [r[0] for r in cur.fetchall()]
-                if counterpart_ids:
-                    cur.execute(
-                        "UPDATE Transactions SET Accounts_Id_Target = %s WHERE Transactions_Id = ANY(%s)",
-                        (_move_target_id, counterpart_ids)
-                    )
-            update_accounts_balances(acc_id)
-            update_accounts_balances(_move_target_id)
-            st.success(
-                f"✅ Moved all {len(_ids_to_move)} transaction(s) to "
-                f"**{_target_name}**."
-            )
-            for _k in ["df_accs", "register_df"]:
-                st.session_state.pop(_k, None)
-            st.rerun()
-
-    if _move_btn and _selected_ids:
-        with get_db() as conn:
-            cur = conn.cursor()
-            cur.execute(
-                "UPDATE Transactions SET Accounts_Id = %s WHERE Transactions_Id = ANY(%s)",
-                (_move_target_id, _selected_ids)
-            )
-            # For transfer transactions: find counterpart rows in other accounts
-            # that reference acc_id as target, and remap to _move_target_id
-            cur.execute(
-                """
-                SELECT DISTINCT t2.Transactions_Id
-                FROM Transactions t1
-                JOIN Transactions t2 ON t2.Transfers_Id = t1.Transfers_Id
-                WHERE t1.Transactions_Id = ANY(%s)
-                  AND t1.Transfers_Id IS NOT NULL
-                  AND t2.Transactions_Id != ALL(%s)
-                  AND t2.Accounts_Id NOT IN (%s, %s)
-                  AND t2.Accounts_Id_Target = %s
-                """,
-                (_selected_ids, _selected_ids, acc_id, _move_target_id, acc_id)
-            )
-            counterpart_ids = [r[0] for r in cur.fetchall()]
-            if counterpart_ids:
-                cur.execute(
-                    "UPDATE Transactions SET Accounts_Id_Target = %s WHERE Transactions_Id = ANY(%s)",
-                    (_move_target_id, counterpart_ids)
-                )
-        update_accounts_balances(acc_id)
-        update_accounts_balances(_move_target_id)
-        st.success(
-            f"✅ Moved {len(_selected_ids)} transaction(s) to "
-            f"**{_move_targets[_move_target_id]}**."
-        )
-        for _k in ["df_accs", "register_df"]:
-            st.session_state.pop(_k, None)
-        st.rerun()
 
     # ── Splits section ────────────────────────────────────────────────────────
     st.write("---")
@@ -498,6 +331,159 @@ def _render_transaction_table(acc_id, payee_options, acc_options, cat_options, t
                 )
             else:
                 st.info(f"✅ Splits balance correctly ({total_split:,.2f})")
+
+
+    # ── Move transactions ─────────────────────────────────────────────────────
+    st.write("---")
+    with st.expander("🔀 Move Transactions to Another Account"):
+        st.caption("Tick ☑ on rows above, pick a target account, then click Move.")
+        _move_targets = {k: v for k, v in acc_options.items() if k != acc_id}
+        _m1, _m2, _m3 = st.columns([3, 1, 1])
+        with _m1:
+            _move_target_id = st.selectbox(
+                "Move to account",
+                options=list(_move_targets.keys()),
+                format_func=lambda x: _move_targets[x],
+                key=f"move_target_{acc_id}_{tab_key}"
+            )
+        with _m2:
+            st.write("")
+            st.write("")
+            _move_btn = st.button(
+                f"▶️ Move {len(_selected_ids)} selected",
+                key=f"move_btn_{acc_id}_{tab_key}",
+                type="primary",
+                disabled=len(_selected_ids) == 0
+            )
+        with _m3:
+            st.write("")
+            st.write("")
+            _move_all_btn = st.button(
+                f"⏩ Move All ({len(_all_ids)})",
+                key=f"move_all_btn_{acc_id}_{tab_key}",
+                disabled=len(_all_ids) == 0,
+            )
+
+        # ── Confirmation: Move Selected ───────────────────────────────────────
+        _move_sel_ck = f"confirm_move_sel_{acc_id}_{tab_key}"
+        if _move_btn:
+            st.session_state[_move_sel_ck] = True
+
+        if st.session_state.get(_move_sel_ck) and _selected_ids:
+            _target_name = _move_targets.get(_move_target_id, "selected account")
+            st.warning(
+                f"⚠️ Move **{len(_selected_ids)} selected transaction(s)** to **{_target_name}**? "
+                "This cannot be undone automatically."
+            )
+            _ca, _cb, _ = st.columns([1, 1, 3])
+            with _ca:
+                if _ca.button("✖ Cancel", key=f"confirm_move_sel_cancel_{acc_id}_{tab_key}", width="stretch"):
+                    st.session_state[_move_sel_ck] = False
+                    st.rerun()
+            with _cb:
+                if _cb.button("✔ Yes, move", type="primary", key=f"confirm_move_sel_yes_{acc_id}_{tab_key}", width="stretch"):
+                    st.session_state[_move_sel_ck] = False
+                    _move_btn = True   # fall through to existing move logic below
+                else:
+                    _move_btn = False  # keep armed but don't execute yet
+        else:
+            _move_btn = False
+
+        # ── Confirmation: Move All ────────────────────────────────────────────
+        _confirm_key = f"confirm_move_all_{acc_id}_{tab_key}"
+        if _move_all_btn:
+            st.session_state[_confirm_key] = True
+
+        if st.session_state.get(_confirm_key):
+            _target_name = _move_targets.get(_move_target_id, "selected account")
+            st.warning(
+                f"⚠️ You are about to move **all {len(_all_ids)} transaction(s)** from this account "
+                f"to **{_target_name}**. This cannot be undone automatically. Are you sure?"
+            )
+            _ca, _cb, _ = st.columns([1, 1, 3])
+            _confirm_cancel = _ca.button("✖ Cancel",       key=f"confirm_cancel_{acc_id}_{tab_key}", width="stretch")
+            _confirm_ok     = _cb.button("✔ Yes, move all", key=f"confirm_ok_{acc_id}_{tab_key}",    width="stretch", type="primary")
+
+            if _confirm_cancel:
+                st.session_state.pop(_confirm_key, None)
+                st.rerun()
+
+            if _confirm_ok:
+                st.session_state.pop(_confirm_key, None)
+                _move_btn = False          # don't double-execute
+                _ids_to_move = _all_ids
+                with get_db() as conn:
+                    cur = conn.cursor()
+                    cur.execute(
+                        "UPDATE Transactions SET Accounts_Id = %s WHERE Transactions_Id = ANY(%s)",
+                        (_move_target_id, _ids_to_move)
+                    )
+                    cur.execute(
+                        """
+                        SELECT DISTINCT t2.Transactions_Id
+                        FROM Transactions t1
+                        JOIN Transactions t2 ON t2.Transfers_Id = t1.Transfers_Id
+                        WHERE t1.Transactions_Id = ANY(%s)
+                          AND t1.Transfers_Id IS NOT NULL
+                          AND t2.Transactions_Id != ALL(%s)
+                          AND t2.Accounts_Id NOT IN (%s, %s)
+                          AND t2.Accounts_Id_Target = %s
+                        """,
+                        (_ids_to_move, _ids_to_move, acc_id, _move_target_id, acc_id)
+                    )
+                    counterpart_ids = [r[0] for r in cur.fetchall()]
+                    if counterpart_ids:
+                        cur.execute(
+                            "UPDATE Transactions SET Accounts_Id_Target = %s WHERE Transactions_Id = ANY(%s)",
+                            (_move_target_id, counterpart_ids)
+                        )
+                update_accounts_balances(acc_id)
+                update_accounts_balances(_move_target_id)
+                st.success(
+                    f"✅ Moved all {len(_ids_to_move)} transaction(s) to "
+                    f"**{_target_name}**."
+                )
+                for _k in ["df_accs", "register_df"]:
+                    st.session_state.pop(_k, None)
+                st.rerun()
+
+        if _move_btn and _selected_ids:
+            with get_db() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    "UPDATE Transactions SET Accounts_Id = %s WHERE Transactions_Id = ANY(%s)",
+                    (_move_target_id, _selected_ids)
+                )
+                # For transfer transactions: find counterpart rows in other accounts
+                # that reference acc_id as target, and remap to _move_target_id
+                cur.execute(
+                    """
+                    SELECT DISTINCT t2.Transactions_Id
+                    FROM Transactions t1
+                    JOIN Transactions t2 ON t2.Transfers_Id = t1.Transfers_Id
+                    WHERE t1.Transactions_Id = ANY(%s)
+                      AND t1.Transfers_Id IS NOT NULL
+                      AND t2.Transactions_Id != ALL(%s)
+                      AND t2.Accounts_Id NOT IN (%s, %s)
+                      AND t2.Accounts_Id_Target = %s
+                    """,
+                    (_selected_ids, _selected_ids, acc_id, _move_target_id, acc_id)
+                )
+                counterpart_ids = [r[0] for r in cur.fetchall()]
+                if counterpart_ids:
+                    cur.execute(
+                        "UPDATE Transactions SET Accounts_Id_Target = %s WHERE Transactions_Id = ANY(%s)",
+                        (_move_target_id, counterpart_ids)
+                    )
+            update_accounts_balances(acc_id)
+            update_accounts_balances(_move_target_id)
+            st.success(
+                f"✅ Moved {len(_selected_ids)} transaction(s) to "
+                f"**{_move_targets[_move_target_id]}**."
+            )
+            for _k in ["df_accs", "register_df"]:
+                st.session_state.pop(_k, None)
+            st.rerun()
 
 
 def get_or_create_payee_id(cur, payee_name, categories_id_default=None):
@@ -944,7 +930,10 @@ def _render_new_investment_form(acc_id, acc_type, df_accs, df_securities, get_db
 
                 # Clear caches so the investment register and account list
                 # both reflect the newly saved row on the next render.
-                st.session_state.pop(f"inv_reg_{acc_id}_orig", None)
+                # The register key includes sort column+direction, so clear all variants.
+                _inv_prefix = f"inv_reg_{acc_id}_"
+                for _k in [k for k in st.session_state if k.startswith(_inv_prefix) and k.endswith("_orig")]:
+                    st.session_state.pop(_k, None)
                 st.session_state.pop("df_accs", None)
 
                 st.session_state['inv_form_reset'] = rc + 1
@@ -1171,7 +1160,7 @@ def render_register():
         
         st.subheader(f"Outstanding Balance: {acc_balance:,.2f}")
 
-        t_view, t_new = st.tabs(["👁️ View Register", "➕ New Transaction / Transfer"])
+        t_new, t_view = st.tabs(["➕ New Transaction / Transfer", "👁️ View Register"])
 
         with t_new:
             t_tx, t_transfer = st.tabs(["Transaction", "Money Transfer"])
@@ -1733,8 +1722,8 @@ def render_register():
         with t_view:
             _render_transaction_table(acc_id, payee_options, acc_options, cat_options, "bank")
     else:
-        tab_inv_view, tab_inv_new, tab_view_hold, tab_edit_hold, cash_view = st.tabs([
-            "📓 Investment Register", "➕ New Investment Transaction",
+        tab_inv_new, tab_inv_view, tab_view_hold, tab_edit_hold, cash_view = st.tabs([
+            "➕ New Investment Transaction", "📓 Investment Register",
             "📊 Current Holdings", "✏️ Edit Holdings", "👁️ Cash Transaction Register",
         ])
         with cash_view:
@@ -1856,21 +1845,7 @@ def render_register():
             _copy_inv = _copy_inv.rename(columns={"securities_id": "Security"})
             copy_df_button(_copy_inv, key=f"dl_reg_inv_{acc_id}")
 
-            # Scroll to bottom on every sort change
-            _inv_scroll_key = f"{_inv_orig_key}_scrolled"
-            if _inv_scroll_key not in st.session_state:
-                st.session_state[_inv_scroll_key] = True
-                st.components.v1.html(
-                    "<script>"
-                    "function _scrollBottom(){"
-                    "var s=window.parent.document.querySelectorAll('.dvn-scroller');"
-                    "if(s.length)s[s.length-1].scrollTop=s[s.length-1].scrollHeight;}"
-                    "setTimeout(_scrollBottom,400);"
-                    "setTimeout(_scrollBottom,900);"
-                    "setTimeout(_scrollBottom,1600);"
-                    "</script>",
-                    height=1,
-                )
+            scroll_table_to_bottom()
 
             # ── Change detection & Save ────────────────────────────────────────
             # Align dtypes before comparing — data_editor can return different

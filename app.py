@@ -25,11 +25,84 @@ def startup_db_maintenance():
         cursor.execute("ANALYZE;")
     return True
 
+_MOBILE_CSS = """
+<style>
+/* ── Mobile-first responsive tweaks ───────────────────────────────────────── */
+
+/* Prevent iOS Safari from auto-zooming on input focus (requires font-size≥16px) */
+input, select, textarea,
+.stTextInput > div > div > input,
+.stNumberInput input,
+.stTextArea textarea,
+.stSelectbox > div > div > div,
+.stMultiSelect > div > div > div {
+    font-size: 16px !important;
+}
+
+/* Plotly chart containers: allow horizontal scroll instead of squashing */
+[data-testid="stPlotlyChart"] > div {
+    overflow-x: auto !important;
+    -webkit-overflow-scrolling: touch;
+}
+.js-plotly-plot {
+    min-width: 0;         /* let Plotly control its own width */
+}
+
+/* NOTE: do NOT add overflow:auto/hidden to [data-testid="stDataFrame"] —
+   it creates a clipping context that hides the data editor toolbar (search,
+   delete, fullscreen buttons). Streamlit data editors scroll internally. */
+
+@media (max-width: 768px) {
+    /* Tighter content padding on phones */
+    .main .block-container {
+        padding-left: 0.75rem !important;
+        padding-right: 0.75rem !important;
+        padding-top: 1rem !important;
+    }
+
+    /* Bigger touch targets for buttons (Apple HIG recommends ≥44 pt) */
+    .stButton > button {
+        min-height: 44px !important;
+        font-size: 15px !important;
+        padding: 8px 16px !important;
+    }
+
+    /* Bigger touch targets for selectboxes and inputs */
+    .stSelectbox > div,
+    .stMultiSelect > div,
+    .stTextInput > div,
+    .stNumberInput > div {
+        min-height: 44px !important;
+    }
+
+    /* Tabs: slightly smaller text so they fit without wrapping */
+    .stTabs [data-baseweb="tab"] {
+        padding: 6px 10px !important;
+        font-size: 13px !important;
+    }
+
+    /* Sidebar toggle button — easier to tap */
+    [data-testid="collapsedControl"] {
+        width: 44px !important;
+        height: 44px !important;
+    }
+
+    /* Stack metric columns more naturally */
+    [data-testid="column"] {
+        min-width: 140px;
+    }
+}
+</style>
+"""
+
 def main():
     """Main application entry point."""
     # Page configuration
     st.set_page_config(page_title="Personal Finance", layout="wide")
-    
+
+    # Inject responsive / mobile-friendly CSS
+    st.markdown(_MOBILE_CSS, unsafe_allow_html=True)
+
     # Initialize
     startup_db_maintenance()
     configure_warnings_and_ssl()
