@@ -27,6 +27,7 @@ from data.downloaders import (
     download_bond_prices_from_solidus,
     download_historical_fx,
     download_securities_info_from_yahoo,
+    download_securities_info_from_tradingview,
 )
 from ai.update_vector import update_all_embeddings
 from database.backup import DatabaseBackup
@@ -120,10 +121,16 @@ def _market_data_job():
 
 
 def _securities_info_job():
-    """Download securities metadata (name, sector, description, …) once per day."""
+    """Download securities metadata (sector, industry, rating, target price) once per day.
+
+    Yahoo Finance runs first (broker analyst consensus); TradingView fills any
+    remaining NULL fields (sector/industry/target price) for securities not
+    covered by Yahoo (e.g. ATHEX stocks).
+    """
     logging.info("Running securities info refresh…")
     try:
         download_securities_info_from_yahoo()
+        download_securities_info_from_tradingview()
         logging.info("Securities info refreshed.")
     except Exception as e:
         logging.error(f"Securities info refresh failed: {e}", exc_info=True)
