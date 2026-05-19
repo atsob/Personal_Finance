@@ -84,71 +84,103 @@ def download_historical_fx(tsperiod=None, currencies_id=None):
         conn.close()
 
 def download_securities_info_from_yahoo(target_sec_id=None):
-    """Download securities information from Yahoo Finance."""
+    """Download securities information from Yahoo Finance.
+
+    Fetches sector, industry, analyst rating and target price for all
+    securities that have a Yahoo_Ticker defined.  Requests are made in
+    parallel (up to MAX_WORKERS concurrent threads) to minimise wall-clock
+    time; DB writes are batched into a single executemany + commit.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    MAX_WORKERS = 5   # conservative — avoids Yahoo rate-limiting
+
     conn = get_connection()
-    cur = conn.cursor()
+    cur  = conn.cursor()
     custom_session = get_custom_session()
-    
+
+    def _fetch(sec_id, sec_name, symbol):
+        """Fetch Yahoo info for one ticker; returns a result tuple."""
+        try:
+            info = yf.Ticker(symbol, session=custom_session).info
+            sector   = info.get('sector')   or None
+            industry = info.get('industry') or None
+            _raw     = info.get('recommendationKey')
+            rating   = (
+                None
+                if (not _raw or str(_raw).strip().lower() in ('none', 'n/a', ''))
+                else str(_raw).strip().lower()
+            )
+            target_price = info.get('targetMeanPrice') or None
+            return (sec_id, sec_name, symbol, sector, industry, rating, target_price, None)
+        except Exception as exc:
+            return (sec_id, sec_name, symbol, None, None, None, None, str(exc))
+
     try:
-
-        # Dynamic Query definition
         base_query = """
-            SELECT Securities_Id, Securities_Name, Yahoo_Ticker 
-            FROM Securities 
-            WHERE Yahoo_Ticker IS NOT NULL 
-            AND Yahoo_Ticker != '' 
-            AND Securities_Name NOT LIKE 'Hellenic T-Bill%'
+            SELECT Securities_Id, Securities_Name, Yahoo_Ticker
+            FROM   Securities
+            WHERE  Yahoo_Ticker IS NOT NULL
+              AND  Yahoo_Ticker != ''
+              AND  Securities_Name NOT LIKE 'Hellenic T-Bill%'
         """
-        params = []
-
-        # If a specific Security ID has been defined, it is added in the filter
         if target_sec_id:
-        #    base_query += " AND Securities_Id = %s"
-        #    params.append(int(target_sec_id)) 
-            base_query += f" AND Securities_Id = {target_sec_id}"
-
+            base_query += f" AND Securities_Id = {int(target_sec_id)}"
         base_query += " ORDER BY Securities_Name ASC"
-        
-        cur.execute(base_query)
 
+        cur.execute(base_query)
         securities = cur.fetchall()
 
         if not securities:
             logging.warning("No matching securities found with a valid Yahoo Ticker.")
             return
-                
-        for sec_id, sec_name, symbol in securities:
-            print(f"Downloading information for {sec_name}...")
-            logging.info(f"Downloading information for {sec_name}...")
-            ticker = yf.Ticker(symbol, session=custom_session)
 
-            info = ticker.info # Αποθήκευση για ευκολία
+        total = len(securities)
+        print(f"Fetching Yahoo info for {total} securities (up to {MAX_WORKERS} in parallel)…")
+        logging.info(f"Fetching Yahoo info for {total} securities…")
 
-            # Χρήση .get() για αποφυγή KeyError αν λείπει το πεδίο
-            currency = info.get('currency')
-            sector = info.get('sector')
-            industry = info.get('industry')
-            # Το recommendationKey επιστρέφει τιμές όπως 'buy', 'strong_buy', 'hold', 'underperform'
-            rating = info.get('recommendationKey')
-            target_price = info.get('targetMeanPrice') # Η μέση τιμή-στόχος των αναλυτών
+        # ── Parallel fetch ────────────────────────────────────────────────────
+        results = []
+        futures = {}
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            for sec_id, sec_name, symbol in securities:
+                f = pool.submit(_fetch, sec_id, sec_name, symbol)
+                futures[f] = sec_name
 
-            print(f'    Found information: {currency}, {sector}, {industry}, {rating}, {target_price}')
+            for f in as_completed(futures):
+                results.append(f.result())
 
-            if not sector or not industry:
-                print(f"⚠️ Limited data found for {sec_name} ({symbol})")
-                logging.warning(f"Limited data found for {sec_name} ({symbol})")
+        # ── Batch DB update ───────────────────────────────────────────────────
+        updates = []
+        for sec_id, sec_name, symbol, sector, industry, rating, target_price, err in results:
+            if err:
+                print(f"  ⚠️ Error fetching {sec_name} ({symbol}): {err}")
+                logging.warning(f"Yahoo info error for {sec_name} ({symbol}): {err}")
                 continue
-                      
-            cur.execute("""
+            if not sector or not industry:
+                print(f"  ⚠️ Limited data for {sec_name} ({symbol}) — skipping")
+                logging.warning(f"Limited Yahoo data for {sec_name} ({symbol})")
+                continue
+            print(f"  ✔ {sec_name}: sector={sector}, industry={industry}, "
+                  f"rating={rating}, target={target_price}")
+            logging.info(f"Yahoo info {sec_name}: sector={sector}, industry={industry}, "
+                         f"rating={rating}, target={target_price}")
+            updates.append((sector, industry, rating, target_price, sec_id))
+
+        if updates:
+            cur.executemany("""
                 UPDATE Securities
-                SET Sector = %s, Industry = %s, Analyst_Rating = %s,  Analyst_Target_Price = %s
-                WHERE Securities_Id = %s
-            """, (sector, industry, rating, target_price, sec_id))
-            
+                SET    Sector               = %s,
+                       Industry             = %s,
+                       Analyst_Rating       = COALESCE(%s, Analyst_Rating),
+                       Analyst_Target_Price = COALESCE(%s, Analyst_Target_Price)
+                WHERE  Securities_Id = %s
+            """, updates)
             conn.commit()
-            print(f"Completed import for {symbol}")
-            logging.info(f"Completed import for {symbol}")
-            
+
+        print(f"Yahoo info update complete — {len(updates)}/{total} securities updated.")
+        logging.info(f"Yahoo info update complete — {len(updates)}/{total} updated.")
+
     except Exception as e:
         st.error(f"❌ Error: {e}")
         logging.error(f"Error: {e}")
@@ -321,6 +353,161 @@ def _period_to_n_bars(tsperiod: str) -> int:
     unit = match.group(2)
     multiplier = {"d": 1, "w": 5, "mo": 22, "y": 250}
     return value * multiplier[unit] + 10
+
+
+def _tv_recommend_to_rating(value):
+    """Convert TradingView Recommend.All (-1 … +1) to a rating label.
+
+    NOTE: Recommend.All is a TECHNICAL indicator composite (MAs, RSI, MACD…),
+    NOT broker analyst consensus.  It is NOT written to Analyst_Rating — kept
+    here in case a future 'Technical_Rating' column is added.
+
+    Returns None (→ SQL NULL) when the value is absent, non-numeric, or a
+    sentinel string ('none', 'n/a', 'nan') so we never write the literal
+    string "none" into the database.
+    """
+    if value is None:
+        return None
+    # Guard against sentinel strings
+    if isinstance(value, str) and value.strip().lower() in ('none', 'n/a', 'nan', ''):
+        return None
+    try:
+        import math
+        v = float(value)
+        if math.isnan(v):
+            return None
+        if v >= 0.5:    return 'strong_buy'
+        elif v >= 0.1:  return 'buy'
+        elif v > -0.1:  return 'hold'
+        elif v > -0.5:  return 'underperform'
+        else:           return 'sell'
+    except (ValueError, TypeError):
+        return None
+
+
+def download_securities_info_from_tradingview(target_sec_id=None, overwrite=False):
+    """Fetch Sector, Industry, Analyst Rating and Target Price from TradingView Screener.
+
+    Acts as a fallback for securities that Yahoo Finance does not cover (e.g. ATHEX
+    stocks).  By default only fills NULL columns; pass overwrite=True to refresh all.
+
+    Securities must have TV_Symbol and TV_Exchange populated.
+    The Recommend.All field (-1 … +1) is mapped to the same rating strings used by
+    the Yahoo Finance downloader (strong_buy / buy / hold / underperform / sell).
+    """
+    try:
+        from tradingview_screener import Query, Column
+    except ImportError:
+        print("tradingview-screener not installed. Run: pip install tradingview-screener")
+        return
+
+    conn = get_connection()
+    cur  = conn.cursor()
+
+    try:
+        sql = """
+            SELECT Securities_Id, Securities_Name, TV_Symbol, TV_Exchange
+            FROM   Securities
+            WHERE  TV_Symbol   IS NOT NULL AND TV_Symbol   != ''
+              AND  TV_Exchange IS NOT NULL AND TV_Exchange != ''
+        """
+        params = []
+
+        if not overwrite:
+            # Analyst_Rating is intentionally excluded: TradingView's screener API
+            # only exposes technical ratings (Recommend.All), not broker consensus.
+            # Analyst_Rating is populated exclusively by Yahoo Finance.
+            sql += " AND (Sector IS NULL OR Industry IS NULL OR Analyst_Target_Price IS NULL)"
+
+        if target_sec_id:
+            sql += " AND Securities_Id = %s"
+            params.append(int(target_sec_id))
+
+        sql += " ORDER BY Securities_Name"
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+
+        if not rows:
+            print("No securities require TradingView info update.")
+            logging.info("No securities require TradingView info update.")
+            return
+
+        print(f"Fetching TradingView screener data for {len(rows)} securities...")
+        logging.info(f"Fetching TradingView screener data for {len(rows)} securities...")
+
+        # Build lookup: "TV_EXCHANGE:TV_SYMBOL" (upper) → (sec_id, sec_name)
+        # Using full ticker ensures we match the exact security, not a same-named
+        # symbol on a different exchange (e.g. ATHEX:GD ≠ NYSE:GD).
+        sec_map = {
+            f"{r[3].upper()}:{r[2].upper()}": (r[0], r[1])
+            for r in rows
+        }
+        full_tickers = list(sec_map.keys())
+
+        BATCH = 50
+        updated = 0
+
+        for i in range(0, len(full_tickers), BATCH):
+            batch = full_tickers[i : i + BATCH]
+            try:
+                _count, df = (
+                    Query()
+                    .select('name', 'sector', 'industry', 'price_target_average')
+                    .set_tickers(*batch)
+                    .get_scanner_data()
+                )
+            except Exception as e:
+                print(f"  Screener query error for batch {i//BATCH + 1}: {e}")
+                logging.warning(f"TV screener batch error: {e}")
+                continue
+
+            for _, row in df.iterrows():
+                # 'ticker' column is always returned as EXCHANGE:SYMBOL
+                full_ticker = str(row.get('ticker', '')).upper()
+                if full_ticker not in sec_map:
+                    continue
+
+                sec_id, sec_name = sec_map[full_ticker]
+                sector       = row.get('sector')              or None
+                industry     = row.get('industry')            or None
+                target_price = row.get('price_target_average') or None
+
+                print(f"  {sec_name}: sector={sector}, industry={industry}, "
+                      f"target={target_price}")
+                logging.info(f"TV screener {sec_name}: sector={sector}, "
+                             f"industry={industry}, target={target_price}")
+
+                if overwrite:
+                    cur.execute("""
+                        UPDATE Securities
+                        SET    Sector               = COALESCE(%s, Sector),
+                               Industry             = COALESCE(%s, Industry),
+                               Analyst_Target_Price = COALESCE(%s, Analyst_Target_Price)
+                        WHERE  Securities_Id = %s
+                    """, (sector, industry, target_price, sec_id))
+                else:
+                    # Only fill genuinely empty columns
+                    cur.execute("""
+                        UPDATE Securities
+                        SET    Sector               = COALESCE(Sector, %s),
+                               Industry             = COALESCE(Industry, %s),
+                               Analyst_Target_Price = COALESCE(Analyst_Target_Price, %s)
+                        WHERE  Securities_Id = %s
+                    """, (sector, industry, target_price, sec_id))
+
+                updated += 1
+
+            conn.commit()
+
+        print(f"TradingView screener update complete — {updated} securities updated.")
+        logging.info(f"TradingView screener update complete — {updated} updated.")
+
+    except Exception as e:
+        print(f"Error in download_securities_info_from_tradingview: {e}")
+        logging.error(f"TV screener error: {e}")
+    finally:
+        cur.close()
+        conn.close()
 
 
 def download_historical_prices_from_tradingview(tsperiod="1m", target_sec_id=None):

@@ -9,7 +9,10 @@ def _safe_val(val):
     if pd.isna(val):
         return None
     if hasattr(val, 'item'):
-        return val.item()
+        val = val.item()
+    # Treat sentinel strings as NULL so they never reach the database.
+    if isinstance(val, str) and val.strip().lower() in ('none', 'n/a', 'na', ''):
+        return None
     return val
 
 

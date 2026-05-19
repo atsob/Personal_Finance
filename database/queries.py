@@ -924,18 +924,29 @@ def get_portfolio_signals(selected_acc_id=None): # Προσθήκη '=' εδώ
             JOIN Securities sec ON sig.Securities_Id = sec.Securities_Id
         )
         SELECT *,
-            CASE 
+            CASE
+                -- ── Math BUY + Analyst alignment ───────────────────────────────
                 WHEN recommendation_signal LIKE '🟢%%' AND wall_street_view IN ('buy', 'strong_buy') AND upside_pct > 20 THEN '🔥 HIGH CONVICTION BUY'
-                WHEN recommendation_signal LIKE '🟢%%' AND wall_street_view = 'strong_buy' THEN '💎 STRONG CONVICTION'
-                WHEN recommendation_signal LIKE '🟢%%' AND wall_street_view = 'buy' THEN '💎 CONVICTION BUY'
+                WHEN recommendation_signal LIKE '🟢%%' AND wall_street_view = 'strong_buy'            THEN '💎 STRONG CONVICTION'
+                WHEN recommendation_signal LIKE '🟢%%' AND wall_street_view = 'buy'                   THEN '💎 CONVICTION BUY'
+                WHEN recommendation_signal LIKE '🟢%%' AND wall_street_view = 'hold'                  THEN '🚀 MOMENTUM BUY'
                 WHEN recommendation_signal LIKE '🟢%%' AND wall_street_view IN ('sell', 'underperform') THEN '🔍 CONTRARIAN BUY'
-                WHEN recommendation_signal LIKE '🔴%%' AND wall_street_view IN ('buy', 'strong_buy') THEN '🔍 CONTRARIAN SELL'
-                WHEN recommendation_signal LIKE '🟢%%' AND wall_street_view = 'hold' THEN '🚀 MOMENTUM BUY'
-                WHEN recommendation_signal LIKE '🔴%%' AND wall_street_view = 'hold' THEN '📉 MOMENTUM SELL'
-                WHEN recommendation_signal LIKE '🟢%%' AND (wall_street_view IS NULL OR wall_street_view = 'none') THEN '⚙️ ALGO BUY'
-                WHEN recommendation_signal LIKE '🔴%%' AND (wall_street_view IS NULL OR wall_street_view = 'none') THEN '⚙️ ALGO SELL'
+                WHEN recommendation_signal LIKE '🟢%%' AND wall_street_view IS NULL                   THEN '⚙️ ALGO BUY'
+                -- ── Math SELL + Analyst alignment ──────────────────────────────
                 WHEN recommendation_signal LIKE '🔴%%' AND wall_street_view IN ('sell', 'underperform') THEN '⚠️ CONVICTION SELL'
-                ELSE recommendation_signal 
+                WHEN recommendation_signal LIKE '🔴%%' AND wall_street_view = 'hold'                  THEN '📉 MOMENTUM SELL'
+                WHEN recommendation_signal LIKE '🔴%%' AND wall_street_view IN ('buy', 'strong_buy')  THEN '🔍 CONTRARIAN SELL'
+                WHEN recommendation_signal LIKE '🔴%%' AND wall_street_view IS NULL                   THEN '⚙️ ALGO SELL'
+                -- ── Math HOLD + Analyst view ────────────────────────────────────
+                WHEN recommendation_signal LIKE '🟡%%' AND wall_street_view IN ('sell', 'underperform') THEN '⚠️ ANALYST CAUTION'
+                WHEN recommendation_signal LIKE '🟡%%' AND wall_street_view IN ('buy', 'strong_buy')  THEN '📈 ANALYST UPGRADE'
+                -- ── Math NEUTRAL + Analyst view ─────────────────────────────────
+                WHEN recommendation_signal LIKE '⚪%%' AND wall_street_view IN ('sell', 'underperform') THEN '🔻 ANALYST UNDERPERFORM'
+                WHEN recommendation_signal LIKE '⚪%%' AND wall_street_view IN ('buy', 'strong_buy')  THEN '📊 ANALYST BUY'
+                -- ── Watchlist + Analyst view ────────────────────────────────────
+                WHEN recommendation_signal LIKE '👀%%' AND wall_street_view IN ('buy', 'strong_buy')  THEN '🔬 WATCH: ANALYST BUY'
+                WHEN recommendation_signal LIKE '👀%%' AND wall_street_view IN ('sell', 'underperform') THEN '🔬 WATCH: ANALYST SELL'
+                ELSE recommendation_signal
             END as final_signal,
 			(SELECT Date FROM Historical_Prices WHERE Securities_Id = recommendations.Securities_Id AND Date <= CURRENT_DATE ORDER BY Date DESC LIMIT 1) as price_today_date
         FROM recommendations

@@ -14,6 +14,7 @@ from data.downloaders import (
     download_historical_prices_from_yahoo,
     download_bond_prices_from_solidus,
     download_securities_info_from_yahoo,
+    download_securities_info_from_tradingview,
 )
 
 
@@ -226,7 +227,13 @@ def render_market_data():
             save_changes(df_sec_save, edited_sec_save, "Securities", "securities_id")
 
         if st.button("🚀 Update Securities Information from Yahoo", key="mkt_download_sec_info", width="stretch"):
-            download_securities_info_from_yahoo()
+            with st.spinner("Fetching sector, industry, rating & target price from Yahoo…"):
+                download_securities_info_from_yahoo()
+            st.rerun()
+
+        if st.button("🚀 Update Securities Information from TradingView", key="mkt_download_tv_info", width="stretch"):
+            with st.spinner("Fetching sector, industry, rating & target price from TradingView…"):
+                download_securities_info_from_tradingview(target_sec_id=None, overwrite=False)
             st.rerun()
 
         st.divider()

@@ -30,7 +30,7 @@ from database.queries import (
     upsert_benchmark_preset,
     delete_benchmark_preset,
 )
-from data.downloaders import download_historical_fx, download_historical_prices_from_tradingview, download_historical_prices_from_yahoo, download_bond_prices_from_solidus, download_securities_info_from_yahoo
+from data.downloaders import download_historical_fx, download_historical_prices_from_tradingview, download_historical_prices_from_yahoo, download_bond_prices_from_solidus, download_securities_info_from_yahoo, download_securities_info_from_tradingview
 from ui.components import color_negative_red, color_value, custom_metric, get_color, copy_df_button, pf_plotly_chart
 from datetime import datetime, timedelta
 
@@ -542,16 +542,22 @@ def render_reports():
 
                 st.divider() # Optional separation line for better visual effect
 
-                # 1. Δημιουργία στηλών για τα φίλτρα και το Selectbox
-                col1, col2, col3 = st.columns([1, 1, 2])
+                # ── Display filters (affect both tables) ──────────────────────
+                col1, col2, col3, col4 = st.columns(4)
 
                 with col1:
-                    show_market_fx_split = st.checkbox("Show Market/FX Split", value=False)
+                    show_closed_accounts = st.checkbox("Show Closed Accounts", value=False)
                 with col2:
-                    show_realized_unrealized_split = st.checkbox("Show Realized/Unrealized Split", value=False)
+                    show_market_fx_split = st.checkbox("Show Market/FX Split", value=False)
                 with col3:
+                    show_realized_unrealized_split = st.checkbox("Show Realized/Unrealized Split", value=False)
+                with col4:
                     show_pnl_percent = st.checkbox("Show P&L %", value=True)
-                    
+
+                # Filter the account-level table: closed accounts have zero current value
+                if not show_closed_accounts:
+                    df_acc = df_acc[df_acc['current_value_eur'] != 0]
+
                 if not show_market_fx_split:
                     df_acc = df_acc.drop(columns=['pnl_dtd_market_eur','pnl_dtd_fx_eur', 'pnl_ytd_market_eur', 'pnl_ytd_fx_eur'])
                 if not show_realized_unrealized_split:
@@ -620,28 +626,50 @@ def render_reports():
 
 
 
-                # 1. Δημιουργία στηλών για τα φίλτρα και το Selectbox
+                # ── Security-level detail filters + account selector ─────────
                 col1, col2, col3 = st.columns([1, 1, 2])
 
                 with col1:
-                    show_closed_accounts = st.checkbox("Show Closed Accounts", value=False)
-                with col2:
                     show_closed_positions = st.checkbox("Show Closed Positions", value=False)
 
-                # 2. Φιλτράρισμα Λογαριασμών (βάσει current_value_eur)
+                # Build acc_options using the same show_closed_accounts flag from above
                 if show_closed_accounts:
                     acc_options = df_pnl['accounts_name'].unique()
                 else:
-                    # Μόνο λογαριασμοί που έχουν τουλάχιστον μία εγγραφή με αξία != 0
                     active_accs = df_pnl.groupby('accounts_name')['current_value_eur'].sum()
                     acc_options = active_accs[active_accs != 0].index.tolist()
 
                 with col3:
+                    # Preserve the selected account across Recalculate/Refresh reruns.
+                    #
+                    # Problem: when st.rerun() is called mid-script (inside the button
+                    # handler), the selectbox hasn't rendered yet in that pass.
+                    # Streamlit's widget-cleanup mechanism then clears the widget key
+                    # from session_state, so on the next render the selection is lost.
+                    #
+                    # Solution: a "shadow" key that is a plain session_state variable
+                    # (not owned by any widget) — Streamlit never auto-clears it.
+                    # We write to it every time the widget renders, and restore from it
+                    # when the widget key has been wiped.
+                    _acc_list   = list(acc_options)
+                    _SHADOW_KEY = "pnl_account_select_saved"
+                    _widget_val = st.session_state.get("pnl_account_select")
+                    _shadow_val = st.session_state.get(_SHADOW_KEY)
+                    # Pick the best candidate: prefer live widget value, fall back to shadow
+                    _target = (
+                        _widget_val if _widget_val in _acc_list else
+                        _shadow_val if _shadow_val in _acc_list else
+                        (_acc_list[0] if _acc_list else None)
+                    )
+                    if _target:
+                        st.session_state["pnl_account_select"] = _target
                     selected_acc = st.selectbox(
-                        "Select Account for Details:", 
-                        acc_options,
+                        "Select Account for Details:",
+                        _acc_list,
                         key="pnl_account_select"
                     )
+                    # Always keep shadow in sync so the next rerun can restore it
+                    st.session_state[_SHADOW_KEY] = selected_acc
 
                 with get_db() as conn:
                     query_acc_id = f"SELECT Accounts_Id FROM Accounts WHERE Accounts_Name = '{selected_acc}'"
@@ -1318,27 +1346,28 @@ def render_reports():
         # 1. Tabs
         tab_change, tab_volat, tab_inv_signals, tab_port_signals = st.tabs(["📈 Price Change %", "🌊 Volatility", "🎯 Investment Signals", "📢 Portfolio Action Signals"])
 
-        # 2. Sidebar (Διασφάλιση σωστών ονομάτων στηλών)
-        with get_db() as conn:
-            db_accounts = pd.read_sql("SELECT accounts_id, accounts_name FROM accounts WHERE accounts_type IN ('Brokerage', 'Margin', 'Other Investment') AND is_active = TRUE ORDER BY accounts_name", conn)
-        
-        # Δημιουργούμε το dictionary χρησιμοποιώντας τα πεζά ονόματα που επιστρέφει η Postgres
-        account_options = {"All Portfolio": None}
-        for _, row in db_accounts.iterrows():
-            # Χρησιμοποιούμε .lower() στα κλειδιά αν δεν είμαστε σίγουροι, 
-            # ή απλώς τα πεζά που επιστρέφει η Pandas
-            account_options[row['accounts_name']] = row['accounts_id']
-
-        selected_acc_name = st.sidebar.selectbox("📂 Select Account:", list(account_options.keys()), key="global_acc_filter")
-        selected_acc_id = account_options[selected_acc_name] # Αυτό θα είναι είτε ID (int) είτε None
-
-        # Global Refresh
-        if st.sidebar.button("🔄 Refresh All Market Data", key="refresh_all_btn"):
+        # Sidebar: Refresh button only — account filter removed (all securities shown,
+        # filtering is handled per-tab via the Portfolio Action Signals options).
+        if st.sidebar.button("🔁 Recalculate Indicators", key="spa_recalculate_indicators_btn"):
+            get_portfolio_signals.clear()
+            with st.spinner("Running :green[update_holdings()]"):
+                update_holdings()
             st.cache_data.clear()
             st.rerun()
 
-        # 3. Data Fetch - Περνάμε το selected_acc_id (που είναι ήδη None για το All)
-        df_data = get_portfolio_signals(selected_acc_id)
+        if st.sidebar.button("🔄 Refresh All Market Data", key="refresh_all_btn"):
+            st.cache_data.clear()
+            with st.spinner("Refreshing all market data... This may take a while."):
+                download_historical_fx("3y")
+                download_historical_prices_from_yahoo("3y")
+                download_historical_prices_from_tradingview("3y")
+                download_bond_prices_from_solidus()
+                download_securities_info_from_yahoo()
+                download_securities_info_from_tradingview()
+                update_holdings()
+            st.rerun()
+
+        df_data = get_portfolio_signals(None)
 
     #    st.sidebar.write(f"DEBUG: Found {len(df_data)} securities")
     #    if "Berkshire Hathaway Inc" in df_data['securities_name'].values:
@@ -1577,8 +1606,14 @@ def render_reports():
          
             # Display με χρωματική κωδικοποίηση
             def color_rec(val):
-                if 'SELL' in val: return 'color: red; font-weight: bold'
-                if 'STRONG BUY' in val: return 'color: green; font-weight: bold'
+                if not isinstance(val, str): return ''
+                v = val.upper()
+                if 'CONVICTION SELL' in v or 'UNDERPERFORM' in v:  return 'color: darkred; font-weight: bold'
+                if 'SELL' in v or 'CAUTION' in v:                  return 'color: red; font-weight: bold'
+                if 'HIGH CONVICTION BUY' in v:                     return 'color: darkgreen; font-weight: bold'
+                if 'STRONG' in v or 'CONVICTION BUY' in v:         return 'color: green; font-weight: bold'
+                if 'BUY' in v or 'UPGRADE' in v:                   return 'color: mediumseagreen; font-weight: bold'
+                if 'CONTRARIAN' in v:                               return 'color: darkorange; font-weight: bold'
                 return ''
 
             st.dataframe(
@@ -1618,8 +1653,8 @@ def render_reports():
 
             st.subheader("Market Data Synchronization")
 
-            # Create a 2x2 grid for specific updates
-            grid = st.columns(5)
+            # Create a grid for specific updates (3 columns × 2 rows)
+            grid = st.columns(3)
 
             # Define the buttons in a list to keep code DRY (Don't Repeat Yourself)
             tasks = [
@@ -1627,11 +1662,12 @@ def render_reports():
                 ("Security Prices from Yahoo", download_historical_prices_from_yahoo),
                 ("Security Prices from TradingView", download_historical_prices_from_tradingview),
                 ("Bond Prices from Solidus", download_bond_prices_from_solidus),
-                ("Info from Yahoo", download_securities_info_from_yahoo)
+                ("Info from Yahoo", download_securities_info_from_yahoo),
+                ("Info from TradingView", download_securities_info_from_tradingview),
             ]
 
             for i, (label, func) in enumerate(tasks):
-                with grid[i % 5]:
+                with grid[i % 3]:
                     if st.button(f"🔄 Update {label}", width='stretch'):
                         with st.spinner(f"Updating {label}..."):
                             func()
@@ -1652,6 +1688,7 @@ def render_reports():
                         download_historical_prices_from_tradingview("3y")
                         download_bond_prices_from_solidus()
                         download_securities_info_from_yahoo()
+                        download_securities_info_from_tradingview()
                         st.balloons()
                         st.success("All data up to date!")
                         st.rerun()

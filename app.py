@@ -23,6 +23,14 @@ def startup_db_maintenance():
     conn = get_connection()
     with conn.cursor() as cursor:
         cursor.execute("ANALYZE;")
+        # Normalise sentinel strings that older downloader runs may have written
+        # into text columns that should be NULL when no real value exists.
+        cursor.execute("""
+            UPDATE Securities
+            SET Analyst_Rating = NULL
+            WHERE LOWER(TRIM(Analyst_Rating)) IN ('none', 'n/a', 'na', '');
+        """)
+    conn.commit()
     return True
 
 _MOBILE_CSS = """
