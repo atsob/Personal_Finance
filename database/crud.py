@@ -65,6 +65,7 @@ def execute_db_save(df_original, df_edited, table_name, id_col, current_acc_id=N
 
         df_new = df_edited[df_edited[id_col].isna() | df_edited[id_col].isnull()].copy()
         df_updates = df_edited[df_edited[id_col].notna()].copy()
+        _inv_acc_ids_to_refresh: set = set()   # populated by the Investments cascade below
 
         # ── UPDATE rows ───────────────────────────────────────────────────────
         if not df_updates.empty:
@@ -78,36 +79,90 @@ def execute_db_save(df_original, df_edited, table_name, id_col, current_acc_id=N
 
             # ── UPDATE cascades ────────────────────────────────────────────────
             if table_name == "Investments":
-                # Sync date and total_amount to the linked cash transaction when changed
+                # Sync date and total_amount to every linked cash transaction.
+                # No change-detection guard — Decimal/float comparisons across
+                # psycopg2 and the data editor are unreliable.  Unconditional
+                # UPDATE by PK is cheap and safe.
+                #
+                # Convention (mirrors the investment creation logic):
+                #   Investments.total_amount        → in investment-account currency
+                #   Transactions.total_amount       → in cash-account currency
+                #                                     (= inv total when same currency,
+                #                                      = inv total × FX rate otherwise)
+                #   Transactions.total_amount_target → abs(inv total) in investment
+                #                                      account currency (always)
+                _inv_acc_ids_to_refresh = set()
                 for _, row in df_updates.iterrows():
                     linked_tx_id = _safe_val(row.get('transactions_id'))
                     if not linked_tx_id:
                         continue
-                    inv_id = int(row[id_col])
-                    orig_rows = df_original[df_original[id_col] == inv_id]
-                    if orig_rows.empty:
+                    inv_acc_id = _safe_val(row.get('accounts_id'))
+                    new_date   = _safe_val(row.get('date'))
+                    new_total  = _safe_val(row.get('total_amount'))
+                    action     = str(row.get('action', '') or '')
+                    cash_out   = action in {'Buy', 'MiscExp'}
+
+                    if new_total is None:
+                        continue   # nothing to sync if amount is unknown
+
+                    abs_inv_total = abs(float(new_total))
+
+                    # ── Resolve currencies ────────────────────────────────────
+                    cur.execute("""
+                        SELECT inv_acc.currencies_id, cash_acc.currencies_id,
+                               tx.accounts_id
+                        FROM   Transactions tx
+                        JOIN   Accounts cash_acc ON cash_acc.accounts_id = tx.accounts_id
+                        JOIN   Accounts inv_acc  ON inv_acc.accounts_id  = %s
+                        WHERE  tx.transactions_id = %s
+                    """, (inv_acc_id, int(linked_tx_id)))
+                    curr_row = cur.fetchone()
+                    if not curr_row:
                         continue
-                    orig = orig_rows.iloc[0]
-                    new_date = _safe_val(row.get('date'))
-                    new_total = _safe_val(row.get('total_amount'))
-                    orig_date = _safe_val(orig.get('date'))
-                    orig_total = _safe_val(orig.get('total_amount'))
-                    # Determine cash-flow sign from current action
-                    action = str(row.get('action', '') or '')
-                    cash_out = action in {'Buy', 'MiscExp'}
-                    if new_date != orig_date or new_total != orig_total:
-                        # Preserve sign: cash-out actions make the linked tx negative
-                        if new_total is not None:
-                            signed_total = -abs(float(new_total)) if cash_out else abs(float(new_total))
+                    inv_curr_id, cash_curr_id, cash_acc_id = curr_row
+
+                    # ── FX conversion (only when currencies differ) ───────────
+                    if inv_curr_id != cash_curr_id:
+                        # Try direct rate: inv_curr → cash_curr
+                        cur.execute("""
+                            SELECT fx_rate FROM Historical_FX
+                            WHERE  currencies_id_1 = %s
+                              AND  currencies_id_2 = %s
+                              AND  date <= COALESCE(%s, CURRENT_DATE)
+                            ORDER  BY date DESC LIMIT 1
+                        """, (inv_curr_id, cash_curr_id, new_date))
+                        fx_row = cur.fetchone()
+                        if fx_row:
+                            fx_rate = float(fx_row[0])
                         else:
-                            signed_total = None
-                        cur.execute(
-                            """UPDATE Transactions
-                                  SET date = COALESCE(%s, date),
-                                      total_amount = COALESCE(%s, total_amount)
-                               WHERE transactions_id = %s""",
-                            (new_date, signed_total, int(linked_tx_id)),
-                        )
+                            # Try reverse rate
+                            cur.execute("""
+                                SELECT 1.0 / fx_rate FROM Historical_FX
+                                WHERE  currencies_id_1 = %s
+                                  AND  currencies_id_2 = %s
+                                  AND  date <= COALESCE(%s, CURRENT_DATE)
+                                ORDER  BY date DESC LIMIT 1
+                            """, (cash_curr_id, inv_curr_id, new_date))
+                            fx_row = cur.fetchone()
+                            fx_rate = float(fx_row[0]) if fx_row else 1.0
+                        cash_amount = abs_inv_total * fx_rate
+                    else:
+                        cash_amount = abs_inv_total
+
+                    signed_cash = -cash_amount if cash_out else cash_amount
+
+                    cur.execute(
+                        """UPDATE Transactions
+                              SET date                = COALESCE(%s, date),
+                                  total_amount        = %s,
+                                  total_amount_target = %s
+                           WHERE transactions_id = %s
+                           RETURNING accounts_id""",
+                        (new_date, signed_cash, abs_inv_total, int(linked_tx_id)),
+                    )
+                    result = cur.fetchone()
+                    if result:
+                        _inv_acc_ids_to_refresh.add(result[0])
 
             elif table_name == "Transactions":
                 # Sync changes to the mirrored transfer transaction
@@ -188,6 +243,19 @@ def execute_db_save(df_original, df_edited, table_name, id_col, current_acc_id=N
         if table_name == "Transactions" and current_acc_id:
             update_accounts_balances(current_acc_id)
             st.session_state.balance_update_counter = st.session_state.get('balance_update_counter', 0) + 1
+
+        if table_name == "Investments" and _inv_acc_ids_to_refresh:
+            # Recalculate balances for all cash accounts whose linked transactions
+            # were just updated so the account summary stays in sync.
+            for _aid in _inv_acc_ids_to_refresh:
+                update_accounts_balances(_aid)
+            # Clear the transaction-register session-state cache for every affected
+            # cash account so the next render re-fetches fresh data from the DB.
+            # Cache keys follow the pattern: set_reg_{acc_id}_{tab_key}_{hash}_orig
+            _cash_prefix_set = {f"set_reg_{_aid}_" for _aid in _inv_acc_ids_to_refresh}
+            for _k in list(st.session_state.keys()):
+                if any(_k.startswith(pfx) for pfx in _cash_prefix_set) and _k.endswith("_orig"):
+                    st.session_state.pop(_k, None)
 
         st.success(f"Saved: {len(df_updates)} updates, {len(df_new)} new, {len(ids_to_delete)} deletions")
         st.rerun()

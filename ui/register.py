@@ -4,7 +4,7 @@ from datetime import datetime, date, timedelta
 import calendar
 from database.connection import get_db
 from database.crud import save_changes, execute_db_save, update_accounts_balances, update_holdings, update_investment_balances, update_pension_balances
-from ui.components import copy_df_button, scroll_table_to_bottom
+from ui.components import copy_df_button
 
 def _render_transaction_table(acc_id, payee_options, acc_options, cat_options, tab_key):
     """Render a filtered transaction register for one account.
@@ -111,7 +111,7 @@ def _render_transaction_table(acc_id, payee_options, acc_options, cat_options, t
         _sort_dir = st.radio(
             "Direction",
             options=["ASC", "DESC"],
-            index=0,
+            index=1,
             horizontal=True,
             key=f"{_sk}_sort_dir",
             label_visibility="collapsed",
@@ -192,8 +192,6 @@ def _render_transaction_table(acc_id, payee_options, acc_options, cat_options, t
     _copy_txns["accounts_id_target"] = _copy_txns["accounts_id_target"].map(acc_options).fillna("")
     _copy_txns = _copy_txns.rename(columns={"payees_id": "Payee", "accounts_id_target": "Target Account"})
     copy_df_button(_copy_txns, key=f"dl_reg_txns_{unique_key}")
-
-    scroll_table_to_bottom()
 
     # ── Change detection & Save ───────────────────────────────────────────────
     _orig_for_cmp   = df_original.drop(columns=["_selected"])
@@ -1756,7 +1754,7 @@ def render_register():
                 _inv_sort_dir = st.radio(
                     "Direction",
                     options=["ASC", "DESC"],
-                    index=0,
+                    index=1,
                     horizontal=True,
                     key=f"{_inv_sk}_dir",
                     label_visibility="collapsed",
@@ -1844,8 +1842,6 @@ def render_register():
             _copy_inv["securities_id"] = _copy_inv["securities_id"].map(_full_sec_options).fillna("")
             _copy_inv = _copy_inv.rename(columns={"securities_id": "Security"})
             copy_df_button(_copy_inv, key=f"dl_reg_inv_{acc_id}")
-
-            scroll_table_to_bottom()
 
             # ── Change detection & Save ────────────────────────────────────────
             # Align dtypes before comparing — data_editor can return different

@@ -189,82 +189,119 @@ def download_securities_info_from_yahoo(target_sec_id=None):
         conn.close()
 
 def download_historical_prices_from_yahoo(tsperiod=None, target_sec_id=None):
-    """Download historical security prices from Yahoo Finance."""
+    """Download historical security prices from Yahoo Finance.
+
+    Requests are made in parallel (up to MAX_WORKERS concurrent threads) to
+    minimise wall-clock time.  All rows are collected in memory first, then
+    written to the DB in a single execute_batch + commit so the connection is
+    never held open across slow network calls.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    MAX_WORKERS = 5   # conservative — avoids Yahoo rate-limiting
+
     conn = get_connection()
-    cur = conn.cursor()
+    cur  = conn.cursor()
     custom_session = get_custom_session()
-    
+
+    if not tsperiod:
+        tsperiod = "1m"
+
+    def _fetch(sec_id, sec_name, symbol):
+        """Fetch OHLCV history for one ticker; returns (sec_id, sec_name, symbol, rows, error)."""
+        try:
+            hist = yf.Ticker(symbol, session=custom_session).history(period=tsperiod)
+            if hist is None or hist.empty:
+                return sec_id, sec_name, symbol, [], None
+            rows = []
+            for date, row in hist.iterrows():
+                if 'Close' not in row or pd.isna(row['Close']):
+                    continue
+                rows.append((
+                    int(sec_id),
+                    date.strftime('%Y-%m-%d'),
+                    float(row['Close']),
+                    float(row['High'])   if 'High'   in row and not pd.isna(row['High'])   else None,
+                    float(row['Low'])    if 'Low'    in row and not pd.isna(row['Low'])    else None,
+                    float(row['Volume']) if 'Volume' in row and not pd.isna(row['Volume']) else 0,
+                ))
+            return sec_id, sec_name, symbol, rows, None
+        except Exception as exc:
+            return sec_id, sec_name, symbol, [], str(exc)
+
     try:
-
-        # Dynamic Query definition
         base_query = """
-            SELECT Securities_Id, Securities_Name, Yahoo_Ticker 
-            FROM Securities 
-            WHERE Yahoo_Ticker IS NOT NULL 
-            AND Yahoo_Ticker != '' 
-            AND Securities_Name NOT LIKE 'Hellenic T-Bill%'
+            SELECT Securities_Id, Securities_Name, Yahoo_Ticker
+            FROM   Securities
+            WHERE  Yahoo_Ticker IS NOT NULL
+              AND  Yahoo_Ticker != ''
+              AND  Securities_Name NOT LIKE 'Hellenic T-Bill%'
         """
-        params = []
-
-        if not tsperiod:
-            tsperiod="1m"
-        # If a specific Security ID has been defined, it is added in the filter
         if target_sec_id:
-        #    base_query += " AND Securities_Id = %s"
-        #    params.append(int(target_sec_id)) 
             base_query += f" AND Securities_Id = {target_sec_id}"
-
-
         base_query += " ORDER BY Securities_Name ASC"
-        
-    #    print(base_query)
 
-        #cur.execute(base_query, params)
         cur.execute(base_query)
-
         securities = cur.fetchall()
 
         if not securities:
             logging.warning("No matching securities found with a valid Yahoo Ticker.")
             return
-                
-        for sec_id, sec_name, symbol in securities:
-            logging.info(f"Downloading historical data for {sec_name}...")
-            ticker = yf.Ticker(symbol, session=custom_session)
-            hist = ticker.history(period=tsperiod)
-            
-            if hist is None or hist.empty:
-                logging.warning(f"No data found for {sec_name} ({symbol})")
-                continue
-            
-            for date, row in hist.iterrows():
-                if 'Close' not in row or pd.isna(row['Close']):
-                    continue
-                
-                rate = float(row['Close'])
-                high = float(row['High']) if 'High' in row and not pd.isna(row['High']) else None
-                low = float(row['Low']) if 'Low' in row and not pd.isna(row['Low']) else None
-                volume = float(row['Volume']) if 'Volume' in row and not pd.isna(row['Volume']) else 0
-                formatted_date = date.strftime('%Y-%m-%d')
-                
-                cur.execute("""
-                    INSERT INTO Historical_Prices (Securities_Id, Date, Close, High, Low, Volume)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (Securities_Id, Date)
-                    DO UPDATE SET Close = EXCLUDED.Close, High = EXCLUDED.High, Low = EXCLUDED.Low, Volume = EXCLUDED.Volume
-                """, (sec_id, formatted_date, rate, high, low, volume))
-            
+
+        total = len(securities)
+        logging.info(f"Fetching Yahoo prices for {total} securities (up to {MAX_WORKERS} in parallel)…")
+        print(f"Fetching Yahoo prices for {total} securities (up to {MAX_WORKERS} in parallel)…")
+
+        # ── Parallel fetch ────────────────────────────────────────────────────
+        all_rows = []
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            futures = {pool.submit(_fetch, sid, sname, sym): sname
+                       for sid, sname, sym in securities}
+            for f in as_completed(futures):
+                sec_id, sec_name, symbol, rows, err = f.result()
+                if err:
+                    logging.warning(f"Price fetch error for {sec_name} ({symbol}): {err}")
+                    print(f"  ⚠️ Error fetching {sec_name} ({symbol}): {err}")
+                elif not rows:
+                    logging.warning(f"No data for {sec_name} ({symbol})")
+                    print(f"  ⚠️ No data for {sec_name} ({symbol})")
+                else:
+                    all_rows.extend(rows)
+                    logging.info(f"  ✔ {sec_name}: {len(rows)} rows")
+                    print(f"  ✔ {sec_name}: {len(rows)} rows")
+
+        # ── Single batch upsert ───────────────────────────────────────────────
+        if all_rows:
+            execute_batch(cur, """
+                INSERT INTO Historical_Prices (Securities_Id, Date, Close, High, Low, Volume)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (Securities_Id, Date)
+                DO UPDATE SET
+                    Close  = EXCLUDED.Close,
+                    High   = EXCLUDED.High,
+                    Low    = EXCLUDED.Low,
+                    Volume = EXCLUDED.Volume
+            """, all_rows, page_size=500)
             conn.commit()
-            logging.info(f"Completed import for {symbol}")
-            
+
+        logging.info(
+            f"Yahoo price download complete — {len(all_rows)} rows upserted "
+            f"for {total} securities."
+        )
+        print(
+            f"Yahoo price download complete — {len(all_rows)} rows upserted "
+            f"for {total} securities."
+        )
+
     except Exception as e:
+        conn.rollback()
         st.error(f"❌ Error: {e}")
         logging.error(f"Error: {e}")
     finally:
         cur.close()
         conn.close()
 
-    refresh_materialized_views()
+    _refresh_materialized_views_async()
 
 
 # ======================================================
@@ -283,6 +320,14 @@ def refresh_materialized_views():
         logging.warning(f"MV refresh skipped (views may not exist yet): {e}")
     finally:
         conn.close()
+
+
+def _refresh_materialized_views_async():
+    """Fire-and-forget wrapper — runs refresh_materialized_views() in a
+    background daemon thread so the calling download function can return
+    immediately without blocking the Streamlit UI."""
+    import threading
+    threading.Thread(target=refresh_materialized_views, daemon=True).start()
 
 
 # ======================================================
@@ -353,6 +398,183 @@ def _period_to_n_bars(tsperiod: str) -> int:
     unit = match.group(2)
     multiplier = {"d": 1, "w": 5, "mo": 22, "y": 250}
     return value * multiplier[unit] + 10
+
+
+class _PersistentTvDatafeed(TvDatafeed):
+    """TvDatafeed variant that keeps the WebSocket alive across get_hist() calls.
+
+    The standard TvDatafeed.get_hist() calls __create_connection() on every
+    invocation, paying a full TCP/TLS handshake per security.  This subclass
+    opens the connection once via _connect() and reuses it, generating a fresh
+    chart_session per symbol.
+
+    Issues fixed vs the naive persistent approach:
+    - Quote session removed: quote_create_session / quote_add_symbols enable
+      streaming tick updates that pile up in the socket buffer after each
+      request returns, causing the next call to read stale data and the socket
+      to appear "already closed".
+    - Socket drain: after series_completed we consume any residual frames
+      (du, acks, etc.) with a 150 ms window so the next request starts clean.
+    - Chart-session filtering: even after the drain, late-arriving du frames
+      from a previous session can slip in at the start of the next recv loop.
+      We filter raw_data to lines that belong to this chart_session before
+      parsing, eliminating data bleed entirely.
+    - Reconnect stagger: when a reconnect is needed mid-batch the shared
+      connect_lock (passed in at construction time) is acquired so no two
+      threads hammer TradingView simultaneously and trigger HTTP 429.
+    """
+
+    import re as _re
+    # Matches any chart-session token (cs_xxxxxxxxxxxxxxxx) that is NOT ours.
+    # Used to filter stale frames out of raw_data before parsing.
+    _CS_RE = _re.compile(r'\bcs_[a-zA-Z0-9]+\b')
+
+    # TradingView frames that signal the end of a series request (success or error).
+    # Breaking on error frames avoids waiting for the 5 s socket timeout when
+    # TradingView has no data for a symbol but keeps the connection alive.
+    _TERMINAL_FRAMES = ("series_completed", "series_error", "symbol_error", "critical_error")
+
+    # How long (seconds) to wait for each ws.recv() call.
+    # Kept below the library default (5 s) so "no-data" stalls are shorter.
+    _WS_TIMEOUT = 2
+
+    def __init__(self, *args, connect_lock=None, **kwargs):
+        """Initialise TvDatafeed with an optional shared connect_lock.
+
+        connect_lock : threading.Lock (or RLock), optional
+            When provided, both initial _connect() calls (via _get_tv()) and
+            reconnect _connect() calls (via get_hist()) acquire this lock so
+            that no more than one thread opens a new WebSocket at a time.
+            This prevents HTTP 429 errors when multiple workers try to
+            (re)connect simultaneously.
+        """
+        super().__init__(*args, **kwargs)
+        self._connect_lock = connect_lock
+
+    def _connect(self):
+        """Open the WebSocket and authenticate.  No quote session — not needed for OHLCV.
+
+        Does NOT acquire _connect_lock — the caller is responsible for holding
+        the lock before calling this method (see _get_tv() and _reconnect()).
+        """
+        self._TvDatafeed__create_connection()
+        try:
+            self.ws.settimeout(self._WS_TIMEOUT)
+        except Exception:
+            pass
+        self._TvDatafeed__send_message("set_auth_token", [self.token])
+
+    def _reconnect(self):
+        """Reconnect, acquiring the shared connect_lock if one was provided.
+
+        Called from get_hist() when a mid-batch WS error is detected.
+        Serialises reconnects across all worker threads so TradingView does
+        not see a burst of simultaneous new connections (HTTP 429).
+        """
+        if self._connect_lock is not None:
+            with self._connect_lock:
+                time.sleep(0.5)   # same stagger as initial connection
+                self._connect()
+        else:
+            self._connect()
+
+    def get_hist(
+        self,
+        symbol: str,
+        exchange: str = "NSE",
+        interval: Interval = Interval.in_daily,
+        n_bars: int = 10,
+        fut_contract: int = None,
+        extended_session: bool = False,
+    ) -> pd.DataFrame:
+        symbol_full = self._TvDatafeed__format_symbol(symbol, exchange, fut_contract)
+        interval_val = interval.value
+        session_str  = '"regular"' if not extended_session else '"extended"'
+
+        for attempt in range(2):
+            try:
+                return self._request_hist(symbol_full, interval_val, n_bars, session_str)
+            except Exception as exc:
+                if attempt == 0:
+                    logging.warning(
+                        f"TV WS error on {symbol_full} (attempt 1): {exc} — reconnecting…"
+                    )
+                    try:
+                        self._reconnect()   # uses connect_lock + stagger
+                    except Exception as re_exc:
+                        raise RuntimeError(
+                            f"TV reconnect failed for {symbol_full}: {re_exc}"
+                        ) from re_exc
+                else:
+                    raise
+
+    def _request_hist(
+        self, symbol_full: str, interval_val: str, n_bars: int, session_str: str
+    ) -> pd.DataFrame:
+        """Send a history request on the already-open WS and return a DataFrame."""
+        chart_session = self._TvDatafeed__generate_chart_session()
+        send = self._TvDatafeed__send_message   # alias for brevity
+
+        send("chart_create_session", [chart_session, ""])
+        send("resolve_symbol", [
+            chart_session, "symbol_1",
+            f'={{"symbol":"{symbol_full}","adjustment":"splits",'
+            f'"session":{session_str}}}',
+        ])
+        send("create_series",   [chart_session, "s1", "s1", "symbol_1",
+                                  interval_val, n_bars])
+        send("switch_timezone", [chart_session, "exchange"])
+
+        raw_data = ""
+        while True:
+            try:
+                result = self.ws.recv()
+                raw_data += result + "\n"
+            except Exception:
+                break
+
+            if any(frame in result for frame in self._TERMINAL_FRAMES):
+                if "series_completed" in result:
+                    # Delete the chart session so TradingView stops sending
+                    # real-time updates (du frames) for it.  Without this,
+                    # stale du frames from old sessions bleed into the next
+                    # security's raw_data and corrupt its price history.
+                    try:
+                        send("chart_delete_session", [chart_session])
+                    except Exception:
+                        pass
+                    # Drain the delete-ack and any other residual frames so
+                    # the next get_hist() call starts with a clean buffer.
+                    # Simple blind drain is safe here because the session is
+                    # already deleted — TV won't send any more data frames.
+                    try:
+                        self.ws.settimeout(0.15)
+                        while True:
+                            try:
+                                self.ws.recv()
+                            except Exception:
+                                break
+                    finally:
+                        try:
+                            self.ws.settimeout(self._WS_TIMEOUT)
+                        except Exception:
+                            pass
+                break
+
+        # ── Chart-session filtering ───────────────────────────────────────────
+        # Despite chart_delete_session + the drain window, a late-arriving du
+        # frame from a *previous* session can still slip through and appear at
+        # the top of raw_data for this security (its chart_session token is
+        # different from ours).  Strip any line that contains a foreign
+        # cs_xxxxxxxxxxxxxxxx token to eliminate bleed unconditionally.
+        filtered_lines = [
+            line for line in raw_data.split('\n')
+            if chart_session in line                  # belongs to our session
+            or not self._CS_RE.search(line)           # general protocol frame (no cs_ at all)
+        ]
+        raw_data = '\n'.join(filtered_lines)
+
+        return self._TvDatafeed__create_df(raw_data, symbol_full)
 
 
 def _tv_recommend_to_rating(value):
@@ -511,39 +733,100 @@ def download_securities_info_from_tradingview(target_sec_id=None, overwrite=Fals
 
 
 def download_historical_prices_from_tradingview(tsperiod="1m", target_sec_id=None):
-    """
-    Download and upsert historical daily prices from TradingView into DB.
+    """Download and upsert historical daily prices from TradingView into DB.
+
     Securities must have TV_Symbol and TV_Exchange populated.
+
+    Each worker thread owns its own TvDatafeed() WebSocket instance so calls
+    run concurrently without sharing mutable state.  All rows are collected in
+    memory first, then written to the DB in a single execute_batch + commit.
     """
-    logging.info(f"Starting TradingView download with period={tsperiod} and target_sec_id={target_sec_id}")
-    print(f"Starting TradingView download with period={tsperiod} and target_sec_id={target_sec_id}")
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    MAX_WORKERS = 5   # each worker holds one persistent WS connection
 
     if not tsperiod:
         tsperiod = "1m"
     tsperiod = str(tsperiod).lower().strip()
-
     n_bars = _period_to_n_bars(tsperiod)
 
+    logging.info(f"Starting TradingView download: period={tsperiod}, n_bars={n_bars}, "
+                 f"target_sec_id={target_sec_id}")
+    print(f"Starting TradingView download: period={tsperiod}, n_bars={n_bars}, "
+          f"target_sec_id={target_sec_id}")
+
+    # Thread-local _PersistentTvDatafeed instances.
+    # Each worker thread opens ONE WebSocket on first use (_connect()) and
+    # reuses it for every subsequent get_hist() call, eliminating the
+    # per-security TCP/TLS handshake that made the sequential version slow.
+    #
+    # We also track every instance in _tv_instances so we can close their
+    # WebSocket connections explicitly *before* the ThreadPoolExecutor exits.
+    # Without this, pool.shutdown(wait=True) triggers thread-local GC cleanup
+    # which calls WebSocket.__del__() → WebSocket.close() on each thread — a
+    # blocking TCP close-handshake that serialises across all 5 workers and
+    # adds several seconds after the last security is logged.
+    _tv_local     = threading.local()
+    _tv_instances: list = []
+    _tv_lock      = threading.Lock()
+    _connect_lock = threading.Lock()   # serialise initial WS connections
+
+    def _get_tv():
+        if not hasattr(_tv_local, 'tv'):
+            # Hold the lock while connecting so all MAX_WORKERS threads don't
+            # hammer TradingView simultaneously — that triggers HTTP 429.
+            with _connect_lock:
+                time.sleep(0.5)        # stagger: give TV time between connections
+                # Pass connect_lock so that mid-batch reconnects (in get_hist)
+                # also serialise through the same lock and avoid HTTP 429.
+                tv = _PersistentTvDatafeed(connect_lock=_connect_lock)
+                tv._connect()          # lock is already held — no re-entry needed
+                _tv_local.tv = tv
+                with _tv_lock:
+                    _tv_instances.append(tv)
+        return _tv_local.tv
+
+    def _fetch(sec_id, sec_name, tv_symbol, tv_exchange):
+        """Fetch OHLCV history for one security; returns (sec_id, sec_name, symbol, rows, error)."""
+        try:
+            df = _get_tv().get_hist(
+                symbol=tv_symbol,
+                exchange=tv_exchange,
+                interval=Interval.in_daily,
+                n_bars=n_bars,
+            )
+            if df is None or df.empty:
+                return sec_id, sec_name, tv_symbol, [], None
+            rows = []
+            for date, row in df.iterrows():
+                rows.append((
+                    int(sec_id),
+                    pd.Timestamp(date).strftime("%Y-%m-%d"),
+                    float(row["close"]),
+                    None if pd.isna(row["high"])   else float(row["high"]),
+                    None if pd.isna(row["low"])    else float(row["low"]),
+                    0    if pd.isna(row["volume"]) else int(row["volume"]),
+                ))
+            return sec_id, sec_name, tv_symbol, rows, None
+        except Exception as exc:
+            import traceback
+            return sec_id, sec_name, tv_symbol, [], f"{exc}\n{traceback.format_exc()}"
+
     conn = get_connection()
-    cur = conn.cursor()
+    cur  = conn.cursor()
 
     try:
-
         query = """
             SELECT Securities_Id, Securities_Name, TV_Symbol, TV_Exchange
-            FROM Securities
-            WHERE TV_Symbol IS NOT NULL
-              AND TV_Symbol != ''
-              AND TV_Exchange IS NOT NULL
-              AND TV_Exchange != ''
+            FROM   Securities
+            WHERE  TV_Symbol   IS NOT NULL AND TV_Symbol   != ''
+              AND  TV_Exchange IS NOT NULL AND TV_Exchange != ''
         """
-
         params = []
-
         if target_sec_id:
             query += " AND Securities_Id = %s"
             params.append(int(target_sec_id))
-
         query += " ORDER BY Securities_Name"
 
         cur.execute(query, params)
@@ -554,92 +837,83 @@ def download_historical_prices_from_tradingview(tsperiod="1m", target_sec_id=Non
             print("No securities with TV_Symbol/TV_Exchange found.")
             return
 
-        logging.info(f"Fetching {n_bars} bars for {len(securities)} securities")
-        print(f"Fetching {n_bars} bars for {len(securities)} securities")
+        total = len(securities)
+        logging.info(f"Fetching {n_bars} bars for {total} securities "
+                     f"(up to {MAX_WORKERS} in parallel)…")
+        print(f"Fetching {n_bars} bars for {total} securities "
+              f"(up to {MAX_WORKERS} in parallel)…")
 
-        tv = TvDatafeed()
+        # ── Parallel fetch ────────────────────────────────────────────────────
+        all_rows = []
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            futures = {
+                pool.submit(_fetch, sid, sname, sym, exch): sname
+                for sid, sname, sym, exch in securities
+            }
+            for f in as_completed(futures):
+                sec_id, sec_name, tv_symbol, rows, err = f.result()
+                if err:
+                    logging.error(f"Failed {tv_symbol}: {err}")
+                    print(f"  ⚠️ Failed {tv_symbol}: {err.splitlines()[0]}")
+                elif not rows:
+                    logging.warning(f"No data for {tv_symbol}")
+                    print(f"  ⚠️ No data for {tv_symbol}")
+                else:
+                    all_rows.extend(rows)
+                    logging.info(f"  ✔ {sec_name} ({tv_symbol}): {len(rows)} rows")
+                    print(f"  ✔ {sec_name} ({tv_symbol}): {len(rows)} rows")
 
-        sql = """
-            INSERT INTO Historical_Prices
-                (Securities_Id, Date, Close, High, Low, Volume)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            ON CONFLICT (Securities_Id, Date)
-            DO UPDATE SET
-                Close  = EXCLUDED.Close,
-                High   = EXCLUDED.High,
-                Low    = EXCLUDED.Low,
-                Volume = EXCLUDED.Volume
-        """
+            # Close all WebSocket connections explicitly before the executor
+            # exits.  If we leave this to thread-local GC (which happens
+            # inside pool.shutdown(wait=True)), WebSocket.__del__() blocks on
+            # the TCP close-handshake for each of the MAX_WORKERS threads —
+            # serially — adding several seconds after the last security logs.
+            for _tv_inst in _tv_instances:
+                try:
+                    if _tv_inst.ws:
+                        _tv_inst.ws.close()
+                        _tv_inst.ws = None
+                except Exception:
+                    pass
 
-        for sec_id, sec_name, tv_symbol, tv_exchange in securities:
+        # ── Single batch upsert ───────────────────────────────────────────────
+        if all_rows:
+            execute_batch(cur, """
+                INSERT INTO Historical_Prices
+                    (Securities_Id, Date, Close, High, Low, Volume)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (Securities_Id, Date)
+                DO UPDATE SET
+                    Close  = EXCLUDED.Close,
+                    High   = EXCLUDED.High,
+                    Low    = EXCLUDED.Low,
+                    Volume = EXCLUDED.Volume
+            """, all_rows, page_size=500)
+            conn.commit()
 
-            try:
-                logging.info(f"Downloading {sec_name} ({tv_symbol}:{tv_exchange})")
-                print(f"Downloading {sec_name} ({tv_symbol}:{tv_exchange})")
-
-                df = tv.get_hist(
-                    symbol=tv_symbol,
-                    exchange=tv_exchange,
-                    interval=Interval.in_daily,
-                    n_bars=n_bars
-                )
-
-                if df is None or df.empty:
-                    logging.warning(f"No data for {tv_symbol}:{tv_exchange}")
-                    print(f"No data for {tv_symbol}:{tv_exchange}")
-                    continue
-
-                logging.info(f"{tv_symbol}: {len(df)} rows downloaded")
-                print(f"{tv_symbol}: {len(df)} rows downloaded")
-
-                rows_to_insert = []
-
-                for date, row in df.iterrows():
-                    rows_to_insert.append((
-                        int(sec_id),
-                        pd.Timestamp(date).strftime("%Y-%m-%d"),
-                        float(row["close"]),
-                        None if pd.isna(row["high"]) else float(row["high"]),
-                        None if pd.isna(row["low"]) else float(row["low"]),
-                        0 if pd.isna(row["volume"]) else int(row["volume"])
-                    ))
-
-                if not rows_to_insert:
-                    continue
-
-                execute_batch(cur, sql, rows_to_insert, page_size=500)
-                conn.commit()
-
-                logging.info(f"Completed {tv_symbol} ({len(rows_to_insert)} rows)")
-                print(f"Completed {tv_symbol} ({len(rows_to_insert)} rows)")
-
-            except Exception as sec_error:
-
-                conn.rollback()
-
-                import traceback
-                logging.error(f"Failed {tv_symbol}: {sec_error}\n{traceback.format_exc()}")
-                print(f"Failed {tv_symbol}: {sec_error}\n{traceback.format_exc()}")
-
-        logging.info("All TradingView imports completed.")
-        print("All TradingView imports completed.")
+        logging.info(
+            f"TradingView price download complete — {len(all_rows)} rows upserted "
+            f"for {total} securities."
+        )
+        print(
+            f"TradingView price download complete — {len(all_rows)} rows upserted "
+            f"for {total} securities."
+        )
 
     except Exception as e:
-
         conn.rollback()
-        logging.error(f"Global error: {e}")
+        logging.error(f"Global error in TradingView download: {e}")
         print(f"Global error: {e}")
-
         try:
             st.error(f"❌ Error: {e}")
-        except:
+        except Exception:
             pass
 
     finally:
         cur.close()
         conn.close()
 
-    refresh_materialized_views()
+    _refresh_materialized_views_async()
 
 
 def download_bond_prices_from_solidus():
