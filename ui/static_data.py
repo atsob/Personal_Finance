@@ -49,28 +49,44 @@ def render_static_data():
     # ── Institutions ──────────────────────────────────────────────────────────
     with t1:
         with get_db() as conn:
-            df = pd.read_sql("SELECT Institutions_Id, Institutions_Name, Institutions_Type, BIC_Code, Moodys, S_P, Fitch, Contact, Phone, Email, Website, Notes, embedding FROM Institutions ORDER BY Institutions_Name ASC", conn)
+            df = pd.read_sql("""
+                SELECT Institutions_Id, Institutions_Name, Institutions_Type,
+                       BIC_Code, Moodys, S_P, Fitch,
+                       Contact, Phone, Email, Website, Notes, embedding
+                FROM   Institutions
+                ORDER  BY Institutions_Name ASC
+            """, conn)
         edited_inst = st.data_editor(
             df,
             num_rows="dynamic",
             key="sd_inst",
             column_config={
-                "institutions_id": None,
+                "institutions_id":   None,
                 "institutions_name": st.column_config.TextColumn("Institution Name", width="medium"),
                 "institutions_type": st.column_config.SelectboxColumn(
                     "Institution Type",
-                    options=['Bank', 'Credit Union', 'Insurance', 'Pension Fund', 'Broker', 'Crypto Exchange', 'Internal', 'Other']
+                    options=['Bank', 'Credit Union', 'Insurance', 'Pension Fund',
+                             'Broker', 'Crypto Exchange', 'Internal', 'Other'],
                 ),
-                "bic_code":  st.column_config.TextColumn("BIC Code", width="small"),
-                "moodys":    st.column_config.SelectboxColumn("Moody's", options=list(moodys_options.keys()), format_func=lambda x: moodys_options.get(x, "Unknown"), width="small"),
-                "s_p":       st.column_config.SelectboxColumn("S&P",     options=list(s_p_options.keys()),    format_func=lambda x: s_p_options.get(x, "Unknown"),    width="small"),
-                "fitch":     st.column_config.SelectboxColumn("Fitch",   options=list(fitch_options.keys()),  format_func=lambda x: fitch_options.get(x, "Unknown"),  width="small"),
-                "contact":   st.column_config.TextColumn("Contact Info",    width="small"),
-                "phone":     st.column_config.TextColumn("Phone",           width="small"),
-                "email":     st.column_config.TextColumn("Email Address",   width="medium"),
-                "website":   st.column_config.TextColumn("Website",         width="small"),
-                "embedding": None,
-            }
+                "bic_code":          st.column_config.TextColumn("BIC Code",  width="small"),
+                "moodys":            st.column_config.SelectboxColumn(
+                    "Moody's", options=list(moodys_options.keys()),
+                    format_func=lambda x: moodys_options.get(x, "Unknown"), width="small",
+                ),
+                "s_p":               st.column_config.SelectboxColumn(
+                    "S&P", options=list(s_p_options.keys()),
+                    format_func=lambda x: s_p_options.get(x, "Unknown"), width="small",
+                ),
+                "fitch":             st.column_config.SelectboxColumn(
+                    "Fitch", options=list(fitch_options.keys()),
+                    format_func=lambda x: fitch_options.get(x, "Unknown"), width="small",
+                ),
+                "contact":           st.column_config.TextColumn("Contact Info",  width="small"),
+                "phone":             st.column_config.TextColumn("Phone",         width="small"),
+                "email":             st.column_config.TextColumn("Email Address", width="medium"),
+                "website":           st.column_config.TextColumn("Website",       width="small"),
+                "embedding":         None,
+            },
         )
         if not edited_inst.equals(df):
             save_changes(df, edited_inst, "Institutions", "institutions_id")
@@ -93,7 +109,28 @@ def render_static_data():
         with get_db() as conn:
             df_cat_list = pd.read_sql(query_cat_hierarchy, conn)
             cat_options = df_cat_list.set_index('categories_id')['full_path'].to_dict()
-            df = pd.read_sql("SELECT c.*, COALESCE((SELECT COUNT(*) FROM Splits WHERE Categories_Id = c.Categories_Id), 0) as transactions_count FROM Categories c WHERE Categories_Name NOT IN (SELECT Accounts_Name FROM Accounts) ORDER BY c.Categories_Id", conn)
+            df = pd.read_sql("""
+                WITH RECURSIVE Descendants AS (
+                    SELECT Categories_Id AS root_id, Categories_Id AS child_id
+                    FROM   Categories
+                    UNION ALL
+                    SELECT d.root_id, c.Categories_Id
+                    FROM   Categories c
+                    JOIN   Descendants d ON c.Categories_Id_Parent = d.child_id
+                ),
+                SplitCounts AS (
+                    SELECT d.root_id AS Categories_Id, COUNT(*) AS cnt
+                    FROM   Splits s
+                    JOIN   Descendants d ON s.Categories_Id = d.child_id
+                    GROUP  BY d.root_id
+                )
+                SELECT c.*,
+                       COALESCE(sc.cnt, 0) AS transactions_count
+                FROM   Categories c
+                LEFT JOIN SplitCounts sc ON sc.Categories_Id = c.Categories_Id
+                WHERE  c.Categories_Name NOT IN (SELECT Accounts_Name FROM Accounts)
+                ORDER  BY c.Categories_Id
+            """, conn)
 
         _cat_sort_labels = {
             "categories_id_parent": "Parent Category",

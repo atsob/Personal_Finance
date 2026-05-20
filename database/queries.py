@@ -2637,7 +2637,7 @@ def get_budget_vs_actual(year: int, ref_years: int = 2):
             JOIN Currencies cur ON cur.Currencies_Id  = a.Currencies_Id
             LEFT JOIN fx        ON fx.Currencies_Id_1 = a.Currencies_Id
             WHERE t.Transfers_Id IS NULL
-              AND c.Categories_Type NOT IN ('Income', 'Transfer', 'Trading', 'Investment')
+              AND c.Categories_Type NOT IN ('Income', 'Transfer', 'Trading', 'Investment', 'Interest', 'Dividend')
               AND EXTRACT(year FROM t.Date) >= EXTRACT(year FROM CURRENT_DATE) - %(ref_years)s
               AND EXTRACT(year FROM t.Date) <  EXTRACT(year FROM CURRENT_DATE)
             GROUP BY s.Categories_Id, EXTRACT(year FROM t.Date)
@@ -2661,7 +2661,7 @@ def get_budget_vs_actual(year: int, ref_years: int = 2):
             JOIN Currencies cur ON cur.Currencies_Id  = a.Currencies_Id
             LEFT JOIN fx        ON fx.Currencies_Id_1 = a.Currencies_Id
             WHERE t.Transfers_Id IS NULL
-              AND c.Categories_Type NOT IN ('Income', 'Transfer', 'Trading', 'Investment')
+              AND c.Categories_Type NOT IN ('Income', 'Transfer', 'Trading', 'Investment', 'Interest', 'Dividend')
               AND EXTRACT(year FROM t.Date) = %(year)s
             GROUP BY s.Categories_Id
         ),
@@ -2678,7 +2678,7 @@ def get_budget_vs_actual(year: int, ref_years: int = 2):
             JOIN Currencies cur ON cur.Currencies_Id  = a.Currencies_Id
             LEFT JOIN fx        ON fx.Currencies_Id_1 = a.Currencies_Id
             WHERE t.Transfers_Id IS NULL
-              AND c.Categories_Type NOT IN ('Income', 'Transfer', 'Trading', 'Investment')
+              AND c.Categories_Type NOT IN ('Income', 'Transfer', 'Trading', 'Investment', 'Interest', 'Dividend')
               AND EXTRACT(year FROM t.Date) = %(year)s - 1
             GROUP BY s.Categories_Id
         ),
@@ -2711,7 +2711,7 @@ def get_budget_vs_actual(year: int, ref_years: int = 2):
                OR ay.Categories_Id IS NOT NULL
                OR py.Categories_Id IS NOT NULL
                OR b.Categories_Id  IS NOT NULL)
-          AND c.Categories_Type NOT IN ('Income', 'Transfer', 'Trading', 'Investment')
+          AND c.Categories_Type NOT IN ('Income', 'Transfer', 'Trading', 'Investment', 'Interest', 'Dividend')
         ORDER BY c.full_path
     """, conn, params={"year": year, "ref_years": ref_years})
     conn.close()
@@ -2761,7 +2761,7 @@ def get_ytd_expense_transactions(year: int):
         JOIN Currencies cur  ON cur.Currencies_Id = a.Currencies_Id
         LEFT JOIN fx         ON fx.Currencies_Id_1 = a.Currencies_Id
         WHERE t.Transfers_Id IS NULL
-          AND cp.Categories_Type NOT IN ('Income', 'Transfer', 'Trading', 'Investment')
+          AND cp.Categories_Type NOT IN ('Income', 'Transfer', 'Trading', 'Investment', 'Interest', 'Dividend')
           AND EXTRACT(year FROM t.Date) = %(year)s
         ORDER BY cp.full_path, t.Date DESC
     """, conn, params={"year": year})

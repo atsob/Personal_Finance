@@ -30,6 +30,9 @@ def startup_db_maintenance():
             SET Analyst_Rating = NULL
             WHERE LOWER(TRIM(Analyst_Rating)) IN ('none', 'n/a', 'na', '');
         """)
+        # Drop Wikipedia columns that were added experimentally and are no longer used.
+        cursor.execute("ALTER TABLE Institutions DROP COLUMN IF EXISTS Wikipedia_Title;")
+        cursor.execute("ALTER TABLE Institutions DROP COLUMN IF EXISTS Ratings_Updated;")
     conn.commit()
     return True
 
