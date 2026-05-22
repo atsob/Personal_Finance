@@ -506,6 +506,7 @@ def render_market_data():
 
                                 st.write(f"**Preview** — {len(df_import):,} rows parsed (showing first 20):")
                                 st.dataframe(df_import.head(20), width='stretch')
+                                copy_df_button(df_import, key="mkt_dl_import_preview")
 
                                 if st.button("⬆️ Import into Database", key="mkt_do_import", type="primary"):
                                     from database.connection import get_connection as _get_conn
@@ -648,6 +649,7 @@ def render_market_data():
                             "Cur. Value":     st.column_config.NumberColumn(format="%,.2f"),
                             "Unrealised P&L": st.column_config.NumberColumn(format="%,.2f"),
                         })
+                    copy_df_button(_df_hold_disp, key=f"mkt_dl_holdings_{inv_sec_id}")
 
                 st.markdown(f"**All Transactions ({len(df_inv_det):,})**")
                 if not df_inv_det.empty:
@@ -659,6 +661,7 @@ def render_market_data():
                             "Commission":   st.column_config.NumberColumn(format="%,.4f"),
                             "Total Amount": st.column_config.NumberColumn(format="%,.2f"),
                         })
+                    copy_df_button(df_inv_det, key=f"mkt_dl_inv_txns_{inv_sec_id}")
                 else:
                     st.info("No investment transactions recorded for this security.")
 

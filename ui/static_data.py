@@ -4,6 +4,7 @@ from database.connection import get_db
 from database.crud import save_changes
 from database.crud import update_payee_default_category
 from data.downloaders import download_securities_info_from_yahoo
+from ui.components import copy_df_button
 
 
 # render_settings() was removed — superseded by render_static_data() and render_market_data()
@@ -263,6 +264,7 @@ def render_static_data():
                 "accounts_name_target": st.column_config.TextColumn("Target Account", width="medium"),
                 "total_amount_target": st.column_config.NumberColumn("Target Amount", format="%,.2f", width="small"),
             })
+            copy_df_button(df_cat_preview, key="sd_dl_cat_preview")
 
             if _cat_to_id:
                 _from_cat_name = _from_cat_options.get(_cat_from_id, "")
@@ -398,6 +400,7 @@ def render_static_data():
                 "accounts_name_target": st.column_config.TextColumn("Target Account", width="medium"),
                 "total_amount_target": st.column_config.NumberColumn("Target Amount", format="%,.2f", width="small"),
             })
+            copy_df_button(df_payee_preview, key="sd_dl_payee_preview")
 
             if _payee_to_id:
                 _from_payee_name = _from_payee_options.get(_payee_from_id, "")

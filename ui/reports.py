@@ -14,10 +14,10 @@ from database.queries import (
     get_sector_allocation_data, get_allocation_targets, save_allocation_targets,
     get_fx_exposure_data, get_bond_schedule_data,
     get_savings_rate_data,
-    upsert_budget, delete_budget, get_budget_vs_actual,
+    upsert_budget, delete_budget, get_budget_vs_actual, get_annual_income,
     get_ytd_expense_transactions,
     get_spending_trends,
-    get_investment_income_report,
+    get_investment_income_report, get_bank_interest_report,
     get_capital_gains_report, get_tax_loss_opportunities,
     get_goals, upsert_goal, delete_goal,
     get_price_returns,
@@ -1201,10 +1201,10 @@ def render_reports():
                 st.write("---")
 
                 # ── Bar chart: Annual YOC per account ─────────────────────────
-                df_chart = df_savings[df_savings['annual_yoc_pct'] != 0].copy()
+                df_chart = df_savings[df_savings['annual_yoc_pct'] != 0].sort_values('annual_yoc_pct', ascending=True).copy()
                 if not df_chart.empty:
                     fig_yoc = px.bar(
-                        df_chart.sort_values('annual_yoc_pct', ascending=True),
+                        df_chart,
                         x='annual_yoc_pct',
                         y='accounts_name',
                         orientation='h',
@@ -1213,8 +1213,9 @@ def render_reports():
                         labels={'annual_yoc_pct': 'Annual YOC (%)', 'accounts_name': 'Account'},
                         title='Annual Yield over Cost (%) per Savings Account',
                         template='plotly_dark',
-                        text=df_chart['annual_yoc_pct'].apply(lambda x: f"{x:.2f}%"),
+                        text='annual_yoc_pct',
                     )
+                    fig_yoc.update_traces(texttemplate="%{x:.2f}%")
                     fig_yoc.update_traces(textposition='outside')
                     fig_yoc.update_layout(
                         coloraxis_showscale=False,
@@ -2936,6 +2937,7 @@ def render_sector_allocation():
             'actual_pct': st.column_config.NumberColumn('Weight %',   format='%.2f%%'),
         }
     )
+    copy_df_button(df_sector, key="dl_rpt_sector_by_sector")
 
     # ── Industry-level detail ─────────────────────────────────────────────────
     st.divider()
@@ -3815,6 +3817,7 @@ def render_savings_rate():
         }).map(color_negative_red, subset=["Savings (€)"]),
         hide_index=True, width="stretch",
     )
+    copy_df_button(df_display, key="dl_rpt_budget_monthly")
 
 
 # ======================================================
@@ -3837,9 +3840,10 @@ def render_budget_vs_actual():
         help="Number of full past calendar years used to compute the Avg/Year column.",
     ))
 
-    ytd_label  = "YTD Actual (€)" if year == now.year else "Actual (€)"
-    prior_label = f"{year - 1} Actual (€)"
-    avg_col    = f"Avg/Year ({ref_years}y) €"
+    ytd_label    = "YTD Actual (€)"  if year == now.year else "Actual (€)"
+    ytd_inc_label = "YTD Income (€)" if year == now.year else "Income (€)"
+    prior_label  = f"{year - 1} Actual (€)"
+    avg_col      = f"Avg/Year ({ref_years}y) €"
 
     st.caption(
         f"Annual budget vs actual for **{year}**. "
@@ -3859,13 +3863,15 @@ def render_budget_vs_actual():
     total_budget = df["budget_amount"].sum()
     total_actual = df["actual_amount"].sum()
     variance     = total_budget - total_actual
+    total_income = get_annual_income(int(year))
 
-    sm1, sm2, sm3, sm4, sm5 = st.columns(5)
-    sm1.metric(f"Avg/Year ({ref_years}y)", f"€ {total_avg:,.2f}")
-    sm2.metric(f"{year - 1} Total",        f"€ {total_prior:,.2f}")
-    sm3.metric("Annual Budget",            f"€ {total_budget:,.2f}")
-    sm4.metric(ytd_label,                  f"€ {total_actual:,.2f}")
-    sm5.metric("Variance",                 f"€ {variance:,.2f}", delta=f"{variance:+,.2f}")
+    sm1, sm2, sm3, sm4, sm5, sm6 = st.columns(6)
+    sm1.metric(f"Avg/Year ({ref_years}y)", f"€ {total_avg:,.0f}")
+    sm2.metric(f"{year - 1} Total",        f"€ {total_prior:,.0f}")
+    sm3.metric("Annual Budget",            f"€ {total_budget:,.0f}")
+    sm4.metric(ytd_label,                  f"€ {total_actual:,.0f}")
+    sm5.metric("Variance",                 f"€ {variance:,.0f}", delta=f"{variance:+,.0f}")
+    sm6.metric(ytd_inc_label,              f"€ {total_income:,.0f}")
 
     # ---- Editable budget table ----
     st.markdown("#### Set Annual Budgets")
@@ -3976,6 +3982,7 @@ def render_budget_vs_actual():
                 "notes":      "Notes / Memo",
             },
         )
+        copy_df_button(df_cat, key="dl_rpt_bva_drilldown")
 
 
 # ======================================================
@@ -4112,6 +4119,7 @@ def render_capital_gains():
             "holding_type":    "Term",
         },
     )
+    copy_df_button(df_display, key="dl_rpt_capital_gains")
 
     fig = px.bar(
         df, x="securities_name", y="gain_loss_eur", color="holding_type",
@@ -4165,6 +4173,7 @@ def render_tax_loss_harvesting():
         }).map(color_negative_red, subset=["unrealized_loss_eur", "loss_pct"]),
         hide_index=True, width="stretch",
     )
+    copy_df_button(df, key="dl_rpt_tax_harvest")
 
 
 # ======================================================
@@ -4175,60 +4184,97 @@ def render_investment_income():
     """Render the Dividend & Interest Income report."""
     st.subheader("\U0001f4b0 Dividend & Interest Income")
     st.caption(
-        "Per-transaction income from dividends, interest (IntInc), and return-of-capital events for the selected tax year. "
-        "All amounts are converted to EUR using the linked cash transaction (most accurate) or the closest historical FX rate. "
-        "This income is typically taxed separately from capital gains — consult your tax advisor for the applicable rates."
+        "Taxable income for the selected tax year across two sources: "
+        "**Investment income** (dividends, interest, and return-of-capital events from your securities) "
+        "and **Bank & Savings interest** (interest credited to Checking, Savings, and Cash accounts). "
+        "All amounts are converted to EUR. Consult your tax advisor for the applicable rates."
     )
 
     current_year = datetime.now().year
     year_options = list(range(current_year, current_year - 5, -1))
     tax_year = st.selectbox("Tax Year", options=year_options, key="inc_tax_year",
-                            help="Select the tax year for which to report dividend and interest income.")
+                            help="Select the tax year for which to report income.")
 
-    df = get_investment_income_report(int(tax_year))
-    if df.empty:
-        st.info(f"No dividend or interest income found for {tax_year}.")
-        return
+    df_inv  = get_investment_income_report(int(tax_year))
+    df_bank = get_bank_interest_report(int(tax_year))
 
-    total_div  = df[df["action"] == "Dividend"]["amount_eur"].sum()
-    total_int  = df[df["action"] == "IntInc"]["amount_eur"].sum()
-    total_roc  = df[df["action"] == "RtrnCap"]["amount_eur"].sum()
-    total_all  = df["amount_eur"].sum()
+    total_div      = df_inv[df_inv["action"] == "Dividend"]["amount_eur"].sum()  if not df_inv.empty  else 0.0
+    total_int_inv  = df_inv[df_inv["action"] == "IntInc"]["amount_eur"].sum()    if not df_inv.empty  else 0.0
+    total_roc      = df_inv[df_inv["action"] == "RtrnCap"]["amount_eur"].sum()   if not df_inv.empty  else 0.0
+    total_bank     = df_bank["amount_eur"].sum()                                  if not df_bank.empty else 0.0
+    grand_total    = total_div + total_int_inv + total_roc + total_bank
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Total Dividends",         f"€ {total_div:,.2f}")
-    m2.metric("Total Interest",          f"€ {total_int:,.2f}")
-    m3.metric("Return of Capital",       f"€ {total_roc:,.2f}")
-    m4.metric("Total Income",            f"€ {total_all:,.2f}")
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Dividends",             f"€ {total_div:,.2f}")
+    m2.metric("Investment Interest",   f"€ {total_int_inv:,.2f}")
+    m3.metric("Return of Capital",     f"€ {total_roc:,.2f}")
+    m4.metric("Bank / Savings Interest", f"€ {total_bank:,.2f}")
+    m5.metric("Grand Total",           f"€ {grand_total:,.2f}")
 
-    df_display = df.copy()
-    df_display["date"] = df_display["date"].dt.strftime("%Y-%m-%d")
-    st.dataframe(
-        df_display.style.format({"amount_eur": "{:,.2f} €"}),
-        hide_index=True,
-        width="stretch",
-        column_config={
-            "securities_name": "Security",
-            "account_name":    "Account",
-            "date":            "Date",
-            "action":          "Type",
-            "amount_eur":      st.column_config.NumberColumn("Amount (€)", format="%,.2f €"),
-        },
-    )
+    # ── Section 1: Investment Income ─────────────────────────────────────────
+    st.markdown("#### 📈 Investment Income (Securities)")
+    if df_inv.empty:
+        st.info(f"No dividend or interest income from securities found for {tax_year}.")
+    else:
+        df_inv_disp = df_inv.copy()
+        df_inv_disp["date"] = df_inv_disp["date"].dt.strftime("%Y-%m-%d")
+        st.dataframe(
+            df_inv_disp.style.format({"amount_eur": "{:,.2f} €"}),
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "securities_name": "Security",
+                "account_name":    "Account",
+                "date":            "Date",
+                "action":          "Type",
+                "amount_eur":      st.column_config.NumberColumn("Amount (€)", format="%,.2f €"),
+            },
+        )
+        copy_df_button(df_inv_disp, key="dl_rpt_inv_income")
 
-    # Chart: income by security
-    df_by_sec = (
-        df.groupby(["securities_name", "action"], as_index=False)["amount_eur"].sum()
-    )
-    fig = px.bar(
-        df_by_sec, x="securities_name", y="amount_eur", color="action",
-        title="<b>Dividend & Interest Income by Security</b>",
-        template="plotly_dark",
-        labels={"amount_eur": "Amount (€)", "securities_name": "Security", "action": "Type"},
-        barmode="stack",
-    )
-    fig.update_layout(margin=dict(l=0, r=0, t=50, b=0))
-    pf_plotly_chart(fig)
+        df_by_sec = df_inv.groupby(["securities_name", "action"], as_index=False)["amount_eur"].sum()
+        fig = px.bar(
+            df_by_sec, x="securities_name", y="amount_eur", color="action",
+            title="<b>Investment Income by Security</b>",
+            template="plotly_dark",
+            labels={"amount_eur": "Amount (€)", "securities_name": "Security", "action": "Type"},
+            barmode="stack",
+        )
+        fig.update_layout(margin=dict(l=0, r=0, t=50, b=0))
+        pf_plotly_chart(fig)
+
+    # ── Section 2: Bank & Savings Interest ───────────────────────────────────
+    st.markdown("#### 🏦 Bank & Savings Interest")
+    if df_bank.empty:
+        st.info(f"No bank or savings interest found for {tax_year}.")
+    else:
+        df_bank_disp = df_bank.copy()
+        df_bank_disp["date"] = df_bank_disp["date"].dt.strftime("%Y-%m-%d")
+        st.dataframe(
+            df_bank_disp.style.format({"amount_eur": "{:,.2f} €"}),
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "date":         "Date",
+                "account_name": "Account",
+                "account_type": "Account Type",
+                "payee":        "Bank / Payee",
+                "category":     "Category",
+                "currency":     "Currency",
+                "amount_eur":   st.column_config.NumberColumn("Amount (€)", format="%,.2f €"),
+            },
+        )
+        copy_df_button(df_bank_disp, key="dl_rpt_bank_interest")
+
+        df_by_acc = df_bank.groupby("account_name", as_index=False)["amount_eur"].sum().sort_values("amount_eur", ascending=False)
+        fig2 = px.bar(
+            df_by_acc, x="account_name", y="amount_eur",
+            title="<b>Bank & Savings Interest by Account</b>",
+            template="plotly_dark",
+            labels={"amount_eur": "Amount (€)", "account_name": "Account"},
+        )
+        fig2.update_layout(margin=dict(l=0, r=0, t=50, b=0))
+        pf_plotly_chart(fig2)
 
 
 # ======================================================
@@ -4410,7 +4456,9 @@ def render_fire_calculator():
     swr_rates = [3.0, 3.5, 4.0, 4.5, 5.0]
     swr_data  = [{"SWR (%)": r, "FIRE Number (€)": f"€ {annual_expenses / (r / 100):,.0f}"} for r in swr_rates]
     st.markdown("#### Safe Withdrawal Rate Sensitivity")
-    st.dataframe(pd.DataFrame(swr_data), hide_index=True, width="stretch")
+    df_swr = pd.DataFrame(swr_data)
+    st.dataframe(df_swr, hide_index=True, width="stretch")
+    copy_df_button(df_swr, key="dl_rpt_fire_swr")
 
 
 # ======================================================
@@ -4499,6 +4547,7 @@ def render_loan_amortization():
         "Balance (€)":   "€ {:,.2f}",
     }
     st.dataframe(df_amort.style.format(fmts), hide_index=True, width="stretch")
+    copy_df_button(df_amort, key="dl_rpt_loan_amort")
 
 
 # ======================================================
@@ -4664,8 +4713,19 @@ def render_risk_metrics(account_ids: tuple = None):
 
     col_lb, col_bm = st.columns([2, 2])
     with col_lb:
-        lookback = st.slider("Lookback days", min_value=60, max_value=756, value=252, step=20, key="risk_lookback",
-                             help="Number of calendar days of price history to include. 252 ≈ 1 trading year.")
+        lookback = st.slider("Lookback days", min_value=60, max_value=3650, value=756, step=92, key="risk_lookback",
+                             help=(
+                                 "Number of **calendar days** of price history to include.\n\n"
+                                 "| Slider | Calendar | Trading days |\n"
+                                 "|--------|----------|--------------|\n"
+                                 "| 365 | 1 year | ~252 |\n"
+                                 "| 756 | ~3 years | ~540 |\n"
+                                 "| 1 260 | ~3.5 years | ~900 |\n"
+                                 "| 1 825 | 5 years | ~1 300 |\n"
+                                 "| 3 650 | 10 years | ~2 600 |\n\n"
+                                 "**Basel III** internal models require ≥ 1 000 trading days (~4 years). "
+                                 "**3 years is the practitioner minimum** for Historical Simulation VaR to capture a full market cycle."
+                             ))
     with col_bm:
         df_bm_cands = get_benchmark_candidates(min_days=30)
         bm_options  = {"— None —": None}
@@ -4681,7 +4741,10 @@ def render_risk_metrics(account_ids: tuple = None):
         return
 
     try:
-        daily_returns = df_prices.pct_change(fill_method=None).dropna()
+        # Forward-fill up to 5 trading days to bridge exchange-calendar gaps
+        # (e.g. Greek holidays absent from US price feed), then only drop rows
+        # where every security is still NaN — preserving the full date range.
+        daily_returns = df_prices.ffill(limit=5).pct_change(fill_method=None).dropna(how='all')
         if daily_returns.empty or len(daily_returns) < 10:
             st.info("Not enough return data to compute risk metrics.")
             return
@@ -4694,7 +4757,9 @@ def render_risk_metrics(account_ids: tuple = None):
             if avail:
                 w = pd.Series([wmap[t] for t in avail], index=avail)
                 w = w / w.sum()
-                port_returns = daily_returns[avail].dot(w)
+                # fillna(0): on days a security didn't trade, treat its return
+                # as 0% rather than propagating NaN into the portfolio return.
+                port_returns = daily_returns[avail].fillna(0).dot(w)
             else:
                 port_returns = daily_returns.mean(axis=1)
         else:
@@ -4744,6 +4809,18 @@ def render_risk_metrics(account_ids: tuple = None):
                         bench_ann_ret = (1 + bench_ret.mean()) ** 252 - 1
                         alpha = float(ann_return - (rf_rate + beta * (bench_ann_ret - rf_rate)))
 
+        n_days  = len(port_returns)
+        date_from = port_returns.index.min().strftime("%Y-%m-%d")
+        date_to   = port_returns.index.max().strftime("%Y-%m-%d")
+        if n_days < lookback * 0.5:   # actual data covers less than half the requested window
+            st.warning(
+                f"⚠️ Only **{n_days} trading days** of data available ({date_from} → {date_to}), "
+                f"covering less than half the requested {lookback}-day window. "
+                "Download more historical prices to extend the analysis."
+            )
+        else:
+            st.caption(f"Using **{n_days} trading days** of return data ({date_from} → {date_to}).")
+
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Ann. Volatility", f"{ann_vol * 100:.2f}%")
         m2.metric("Sharpe Ratio",    f"{sharpe:.2f}")
@@ -4790,8 +4867,8 @@ def render_correlation_matrix(account_ids: tuple = None):
     st.caption(
         "Shows how closely the daily price returns of your holdings move together over the selected period. "
         "Values range from **−1** (perfectly inverse) to **+1** (perfectly in sync), with **0** meaning no linear relationship.\n\n"
-        "- **Dark red (near +1):** the two assets tend to rise and fall together — low diversification benefit.\n"
-        "- **Dark blue (near −1):** the two assets tend to move in opposite directions — strong diversification benefit.\n"
+        "- **Dark blue (near +1):** the two assets tend to rise and fall together — low diversification benefit.\n"
+        "- **Dark red (near −1):** the two assets tend to move in opposite directions — strong diversification benefit.\n"
         "- **White / near 0:** weak or no linear relationship — good for portfolio diversification.\n\n"
         "A well-diversified portfolio should have many near-zero or negative off-diagonal entries. "
         "High positive correlations across all holdings mean the portfolio behaves like a single concentrated bet."
@@ -5034,7 +5111,9 @@ def render_monte_carlo(account_ids: tuple = None):
             for t in targets
         ]
         st.markdown("#### Probability of Reaching Target Amounts")
-        st.dataframe(pd.DataFrame(prob_data), hide_index=True, width="stretch")
+        df_prob = pd.DataFrame(prob_data)
+        st.dataframe(df_prob, hide_index=True, width="stretch")
+        copy_df_button(df_prob, key="dl_rpt_monte_prob")
 
     except Exception as e:
         st.info(f"Monte Carlo simulation error: {e}")

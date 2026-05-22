@@ -2719,6 +2719,35 @@ def get_budget_vs_actual(year: int, ref_years: int = 2):
 
 
 @st.cache_data(ttl=300)
+def get_annual_income(year: int) -> float:
+    """Total income (Income + Dividend + Interest categories) for the given year, in EUR.
+    Uses the latest available FX rate for non-EUR accounts."""
+    conn = get_connection()
+    df = pd.read_sql("""
+        WITH fx AS (
+            SELECT DISTINCT ON (Currencies_Id_1) Currencies_Id_1, FX_Rate
+            FROM Historical_FX ORDER BY Currencies_Id_1, Date DESC
+        )
+        SELECT COALESCE(SUM(
+            s.Amount *
+            CASE WHEN cur.Currencies_ShortName = 'EUR' THEN 1
+                 ELSE COALESCE(fx.FX_Rate, 1) END
+        ), 0) AS total_income_eur
+        FROM Splits s
+        JOIN Transactions t  ON t.Transactions_Id = s.Transactions_Id
+        JOIN Categories   c  ON c.Categories_Id   = s.Categories_Id
+        JOIN Accounts     a  ON a.Accounts_Id     = t.Accounts_Id
+        JOIN Currencies   cur ON cur.Currencies_Id = a.Currencies_Id
+        LEFT JOIN fx          ON fx.Currencies_Id_1 = a.Currencies_Id
+        WHERE t.Transfers_Id IS NULL
+          AND c.Categories_Type IN ('Income', 'Dividend', 'Interest')
+          AND EXTRACT(year FROM t.Date) = %(year)s
+    """, conn, params={"year": year})
+    conn.close()
+    return float(df["total_income_eur"].iloc[0])
+
+
+@st.cache_data(ttl=300)
 def get_ytd_expense_transactions(year: int):
     """All expense-category transactions for the selected year, with full category path."""
     conn = get_connection()
@@ -2958,6 +2987,52 @@ def get_investment_income_report(tax_year: int):
           AND EXTRACT(year FROM i.Date) = %(tax_year)s
           AND i.Total_Amount > 0
         ORDER BY i.Date DESC, s.Securities_Name
+    """, conn, params={"tax_year": tax_year})
+    conn.close()
+    if not df.empty:
+        df['date'] = pd.to_datetime(df['date'])
+    return df
+
+
+# ======================================================
+# A3c. BANK INTEREST REPORT
+# ======================================================
+
+@st.cache_data(ttl=300)
+def get_bank_interest_report(tax_year: int):
+    """Per-transaction interest income from non-investment accounts (Checking, Savings, Cash, etc.)
+    for a given tax year, converted to EUR using the closest historical FX rate on or before
+    the transaction date."""
+    conn = get_connection()
+    df = pd.read_sql("""
+        SELECT
+            t.Date                                                          AS date,
+            a.Accounts_Name                                                 AS account_name,
+            a.Accounts_Type                                                 AS account_type,
+            COALESCE(p.Payees_Name, '—')                                   AS payee,
+            c.Categories_Name                                               AS category,
+            cur.Currencies_ShortName                                        AS currency,
+            s.Amount *
+                CASE WHEN cur.Currencies_ShortName = 'EUR' THEN 1.0
+                     ELSE COALESCE(
+                         (SELECT hfx.FX_Rate FROM Historical_FX hfx
+                          WHERE hfx.Currencies_Id_1 = cur.Currencies_Id
+                            AND hfx.Date <= t.Date
+                          ORDER BY hfx.Date DESC LIMIT 1),
+                         1.0)
+                END                                                         AS amount_eur
+        FROM Splits s
+        JOIN Transactions t  ON t.Transactions_Id = s.Transactions_Id
+        JOIN Categories   c  ON c.Categories_Id   = s.Categories_Id
+        JOIN Accounts     a  ON a.Accounts_Id     = t.Accounts_Id
+        JOIN Currencies   cur ON cur.Currencies_Id = a.Currencies_Id
+        LEFT JOIN Payees  p  ON p.Payees_Id        = t.Payees_Id
+        WHERE t.Transfers_Id IS NULL
+          AND c.Categories_Type = 'Interest'
+          AND a.Accounts_Type NOT IN ('Brokerage', 'Pension', 'Other Investment', 'Margin')
+          AND EXTRACT(year FROM t.Date) = %(tax_year)s
+          AND s.Amount > 0
+        ORDER BY t.Date DESC, a.Accounts_Name
     """, conn, params={"tax_year": tax_year})
     conn.close()
     if not df.empty:

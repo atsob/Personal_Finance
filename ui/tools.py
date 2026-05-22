@@ -129,6 +129,7 @@ def _render_db_maintenance():
                 'tuples_fetched': st.column_config.NumberColumn('Tuples Fetched',  format='%,d'),
             },
         )
+        copy_df_button(df_idx, key="dl_tools_idx")
 
     st.divider()
 
@@ -312,6 +313,7 @@ def _render_db_maintenance():
             if not df_errors.empty:
                 st.warning(f"⚠️ {len(df_errors)} constraint(s) could not be checked (see below):")
                 st.dataframe(df_errors, hide_index=True, width='stretch')
+                copy_df_button(df_errors, key="dl_tools_ri_errors")
 
         if not df_clean.empty:
             with st.expander(f"✅ {len(df_clean)} clean constraint(s)"):
@@ -328,6 +330,7 @@ def _render_db_maintenance():
                         'orphaned_rows': 'Orphaned Rows',
                     },
                 )
+                copy_df_button(df_clean, key="dl_tools_ri_clean")
 
 
 def _render_sql_interface():

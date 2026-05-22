@@ -926,13 +926,21 @@ def _render_new_investment_form(acc_id, acc_type, df_accs, df_securities, get_db
                 if enable_linked and linked_acc_id and inv_action in LINKED_CAPABLE:
                     update_accounts_balances()
 
-                # Clear caches so the investment register and account list
-                # both reflect the newly saved row on the next render.
+                # Clear caches so the investment register, linked cash account
+                # register, and account list all reflect the newly saved row on
+                # the next render without requiring a full browser refresh.
                 # The register key includes sort column+direction, so clear all variants.
                 _inv_prefix = f"inv_reg_{acc_id}_"
                 for _k in [k for k in st.session_state if k.startswith(_inv_prefix) and k.endswith("_orig")]:
                     st.session_state.pop(_k, None)
+                # Also clear the linked account's register snapshot so the cash
+                # side shows the new transfer row immediately.
+                if enable_linked and linked_acc_id:
+                    _cash_prefix = f"set_reg_{linked_acc_id}_"
+                    for _k in [k for k in st.session_state if k.startswith(_cash_prefix) and k.endswith("_orig")]:
+                        st.session_state.pop(_k, None)
                 st.session_state.pop("df_accs", None)
+                st.cache_data.clear()   # flush all @st.cache_data queries (account register, balances, etc.)
 
                 st.session_state['inv_form_reset'] = rc + 1
                 st.rerun()

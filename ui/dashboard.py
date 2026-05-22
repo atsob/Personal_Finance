@@ -424,8 +424,9 @@ def render_dashboard(conn):
             else:
                 df_projected = pd.DataFrame(columns=['date', 'payee', 'amount_eur', 'category', 'type'])
 
-            # 3. Merge, sort, display
-            df_bills = pd.concat([df_confirmed, df_projected], ignore_index=True)
+            # 3. Merge, sort, display  (filter out empty frames to avoid dtype FutureWarning)
+            _frames = [df for df in [df_confirmed, df_projected] if not df.empty]
+            df_bills = pd.concat(_frames, ignore_index=True) if _frames else pd.DataFrame(columns=['date', 'payee', 'amount_eur', 'category', 'type'])
             df_bills  = df_bills.sort_values('date').reset_index(drop=True)
 
             if df_bills.empty:
@@ -446,6 +447,7 @@ def render_dashboard(conn):
                     },
                     column_order=["date", "payee", "amount_eur", "category", "type"],
                 )
+                copy_df_button(df_bills, key="dl_dashboard_bills")
                 _n_proj = len(df_projected)
                 if _n_proj:
                     st.caption(f"{_n_proj} projected payment(s) estimated from the last 3 months of recurring patterns.")
