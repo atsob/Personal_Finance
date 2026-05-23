@@ -19,6 +19,7 @@ from database.queries import (
     get_spending_trends,
     get_investment_income_report, get_bank_interest_report,
     get_capital_gains_report, get_tax_loss_opportunities,
+    get_all_inv_txns_for_gains,
     get_goals, upsert_goal, delete_goal,
     get_price_returns,
     get_portfolio_weights,
@@ -29,10 +30,481 @@ from database.queries import (
     get_benchmark_presets,
     upsert_benchmark_preset,
     delete_benchmark_preset,
+    get_investment_cashflows,
+    get_spending_by_payee,
+    get_payee_transactions,
+    update_split,
+    get_expense_categories,
+    get_custom_report_presets,
+    upsert_custom_report_preset,
+    delete_custom_report_preset,
+    get_all_payees,
+    get_custom_report_data,
+    get_custom_report_drill_down,
 )
 from data.downloaders import download_historical_fx, download_historical_prices_from_tradingview, download_historical_prices_from_yahoo, download_bond_prices_from_solidus, download_securities_info_from_yahoo, download_securities_info_from_tradingview
 from ui.components import color_negative_red, color_value, custom_metric, get_color, copy_df_button, pf_plotly_chart
 from datetime import datetime, timedelta
+
+def _period_to_dates(period_label: str, grouping: str):
+    """Convert a period label (e.g. '2023', '2023 Q3', '2023-07') to (date_from, date_to)."""
+    import calendar
+    if grouping == "year":
+        y = int(period_label)
+        return datetime(y, 1, 1).date(), datetime(y, 12, 31).date()
+    elif grouping == "quarter":
+        y, q = int(period_label.split(" Q")[0]), int(period_label.split(" Q")[1])
+        m1 = (q - 1) * 3 + 1
+        m2 = m1 + 2
+        return datetime(y, m1, 1).date(), datetime(y, m2, calendar.monthrange(y, m2)[1]).date()
+    else:  # month  "YYYY-MM"
+        y, m = int(period_label.split("-")[0]), int(period_label.split("-")[1])
+        return datetime(y, m, 1).date(), datetime(y, m, calendar.monthrange(y, m)[1]).date()
+
+
+def _build_hierarchical_pivot(pivot: "pd.DataFrame", periods: list) -> "pd.DataFrame":
+    """Convert a flat category×period pivot into a hierarchical display table."""
+    all_leaf_paths = list(pivot.index)
+
+    # Expand to all ancestor paths
+    all_paths: set = set(all_leaf_paths)
+    for path in all_leaf_paths:
+        parts = path.split(" : ")
+        for i in range(1, len(parts)):
+            all_paths.add(" : ".join(parts[:i]))
+
+    # Compute totals for every path (leaf + ancestor)
+    def _sum_for(path):
+        leaves = [p for p in all_leaf_paths if p == path or p.startswith(path + " : ")]
+        return {col: pivot.loc[[p for p in leaves if p in pivot.index], col].sum()
+                for col in periods + ["TOTAL"]}
+
+    path_totals = {p: _sum_for(p) for p in all_paths}
+
+    # Hierarchical sort: by top-level category, then full path
+    sorted_paths = sorted(all_paths, key=lambda p: (p.split(" : ")[0].lower(), p.lower()))
+
+    rows, parent_display_names = [], set()
+    for path in sorted_paths:
+        level  = path.count(" : ")
+        label  = "  " * level + path.split(" : ")[-1]
+        is_par = any(p.startswith(path + " : ") for p in all_paths if p != path)
+        if is_par:
+            parent_display_names.add(label)
+        row = {"Category": label, "_is_bold": is_par}
+        row.update(path_totals[path])
+        rows.append(row)
+
+    # Grand total
+    grand = {"Category": "OVERALL TOTAL", "_is_bold": True}
+    grand.update({col: pivot[col].sum() for col in periods + ["TOTAL"]})
+    rows.append(grand)
+
+    df = pd.DataFrame(rows)
+    return df, parent_display_names
+
+
+def render_custom_reports():
+    """Custom report builder with saveable presets."""
+    import json
+
+    st.subheader("\U0001f4cb Custom Reports")
+    st.caption(
+        "Build a spending report for any date range, accounts, categories, and payees. "
+        "Save the configuration as a named preset to reuse later."
+    )
+
+    # ── Preset management ─────────────────────────────────────────────────────
+    presets_df  = get_custom_report_presets()
+    preset_names = presets_df["preset_name"].tolist() if not presets_df.empty else []
+    preset_map: dict = {}
+    if not presets_df.empty:
+        for _, row in presets_df.iterrows():
+            cfg = row["config"]
+            if isinstance(cfg, str):
+                cfg = json.loads(cfg)
+            preset_map[row["preset_name"]] = (int(row["preset_id"]), cfg or {})
+
+    pp1, pp2, pp3, pp4 = st.columns([3, 3, 1, 1])
+    sel_preset = pp1.selectbox(
+        "Preset", ["(New Report)"] + sorted(preset_names), key="cr_preset_sel",
+    )
+    preset_name_input = pp2.text_input(
+        "Name", value="" if sel_preset == "(New Report)" else sel_preset,
+        placeholder="Preset name to save as…", key="cr_preset_name",
+        label_visibility="collapsed",
+    )
+    save_btn = pp3.button("\U0001f4be Save", key="cr_save_btn", use_container_width=True)
+    del_btn  = pp4.button("\U0001f5d1️ Delete", key="cr_del_btn",
+                          disabled=(sel_preset == "(New Report)"),
+                          use_container_width=True)
+
+    loaded_cfg: dict = {}
+    if sel_preset != "(New Report)" and sel_preset in preset_map:
+        loaded_cfg = preset_map[sel_preset][1]
+
+    # ── Date range ────────────────────────────────────────────────────────────
+    now = datetime.now()
+    DR_OPTIONS = ["Year to Date", "Last Year", "Last 12 Months", "Last 24 Months", "All Time", "Custom"]
+    default_dr = loaded_cfg.get("date_range_type", "Last 12 Months")
+    if default_dr not in DR_OPTIONS:
+        default_dr = "Last 12 Months"
+
+    dr1, dr2, dr3, dr4 = st.columns([2, 2, 2, 2])
+    date_range_type = dr1.selectbox(
+        "Date Range", DR_OPTIONS, index=DR_OPTIONS.index(default_dr),
+        key=f"cr_dr_type_{sel_preset}",
+    )
+    GROUPING_OPTIONS = ["Year", "Quarter", "Month"]
+    default_grp = loaded_cfg.get("column_grouping", "year").capitalize()
+    if default_grp not in GROUPING_OPTIONS:
+        default_grp = "Year"
+    grouping_str = dr2.selectbox(
+        "Column Grouping", GROUPING_OPTIONS, index=GROUPING_OPTIONS.index(default_grp),
+        key=f"cr_grouping_{sel_preset}",
+    )
+    grouping = grouping_str.lower()
+
+    if date_range_type == "Year to Date":
+        date_from = datetime(now.year, 1, 1).date()
+        date_to   = now.date()
+    elif date_range_type == "Last Year":
+        date_from = datetime(now.year - 1, 1, 1).date()
+        date_to   = datetime(now.year - 1, 12, 31).date()
+    elif date_range_type == "Last 12 Months":
+        date_from = (now - timedelta(days=365)).date()
+        date_to   = now.date()
+    elif date_range_type == "Last 24 Months":
+        date_from = (now - timedelta(days=730)).date()
+        date_to   = now.date()
+    elif date_range_type == "All Time":
+        date_from = datetime(2000, 1, 1).date()
+        date_to   = now.date()
+    else:  # Custom
+        saved_from = loaded_cfg.get("date_from")
+        saved_to   = loaded_cfg.get("date_to")
+        def_from = (datetime.strptime(saved_from, "%Y-%m-%d").date()
+                    if saved_from else datetime(now.year, 1, 1).date())
+        def_to   = (datetime.strptime(saved_to, "%Y-%m-%d").date()
+                    if saved_to else now.date())
+        date_from = dr3.date_input("From", value=def_from, key=f"cr_date_from_{sel_preset}",
+                                   min_value=datetime(2000, 1, 1).date(), max_value=now.date())
+        date_to   = dr4.date_input("To",   value=def_to,  key=f"cr_date_to_{sel_preset}",
+                                   min_value=datetime(2000, 1, 1).date(), max_value=now.date())
+
+    # ── Account filter ────────────────────────────────────────────────────────
+    with st.expander("\U0001f3e6 Accounts", expanded=bool(loaded_cfg.get("account_ids"))):
+        all_accts_df   = get_all_accounts_for_nwr()
+        acct_id_to_name = dict(zip(all_accts_df["accounts_id"], all_accts_df["accounts_name"]))
+        acct_name_to_id = {v: k for k, v in acct_id_to_name.items()}
+        all_acct_names  = sorted(all_accts_df["accounts_name"].tolist())
+        saved_acct_ids  = loaded_cfg.get("account_ids") or []
+
+        use_all_accts = st.radio(
+            "Accounts to include", ["All Accounts", "Selected Accounts"],
+            horizontal=True, key=f"cr_acct_mode_{sel_preset}",
+            index=0 if not saved_acct_ids else 1,
+        )
+        account_ids: list = []
+        if use_all_accts == "Selected Accounts":
+            def_accts = [acct_id_to_name[i] for i in saved_acct_ids if i in acct_id_to_name]
+            sel_acct_names = st.multiselect("Accounts", all_acct_names, default=def_accts,
+                                            key=f"cr_accts_{sel_preset}")
+            account_ids = [acct_name_to_id[n] for n in sel_acct_names if n in acct_name_to_id]
+
+    # ── Category filter ───────────────────────────────────────────────────────
+    with st.expander("\U0001f3f7️ Categories", expanded=bool(loaded_cfg.get("category_ids"))):
+        cat_hier_df = get_category_hierarchy()
+        EXCLUDED_TYPES = {"Income", "Transfer", "Trading", "Investment", "Interest", "Dividend"}
+        exp_cats = cat_hier_df[~cat_hier_df["categories_type"].isin(EXCLUDED_TYPES)].copy()
+        cat_path_to_id = dict(zip(exp_cats["full_path"], exp_cats["categories_id"]))
+        cat_id_to_path = {v: k for k, v in cat_path_to_id.items()}
+        all_cat_paths  = sorted(exp_cats["full_path"].tolist())
+        saved_cat_ids  = loaded_cfg.get("category_ids") or []
+
+        use_all_cats = st.radio(
+            "Categories to include", ["All Expense Categories", "Selected Categories"],
+            horizontal=True, key=f"cr_cat_mode_{sel_preset}",
+            index=0 if not saved_cat_ids else 1,
+        )
+        category_ids: list = []
+        if use_all_cats == "Selected Categories":
+            def_cats = [cat_id_to_path[i] for i in saved_cat_ids if i in cat_id_to_path]
+            sel_cat_paths = st.multiselect(
+                "Categories", all_cat_paths, default=def_cats,
+                key=f"cr_cats_{sel_preset}",
+                help="Selecting a parent category includes all its sub-categories in the results.",
+            )
+            category_ids = [cat_path_to_id[p] for p in sel_cat_paths if p in cat_path_to_id]
+
+    # ── Payee filter ──────────────────────────────────────────────────────────
+    with st.expander("\U0001f464 Payees", expanded=bool(loaded_cfg.get("payee_names"))):
+        all_payees_df   = get_all_payees()
+        all_payee_names = sorted(all_payees_df["payees_name"].tolist())
+        saved_payees    = loaded_cfg.get("payee_names") or []
+
+        use_all_payees = st.radio(
+            "Payees to include", ["All Payees", "Selected Payees"],
+            horizontal=True, key=f"cr_payee_mode_{sel_preset}",
+            index=0 if not saved_payees else 1,
+        )
+        payee_names: list = []
+        if use_all_payees == "Selected Payees":
+            sel_payees = st.multiselect(
+                "Payees", all_payee_names, default=saved_payees,
+                key=f"cr_payees_{sel_preset}",
+            )
+            payee_names = sel_payees
+
+    # ── Save / Delete ─────────────────────────────────────────────────────────
+    if save_btn:
+        pname = preset_name_input.strip()
+        if not pname or pname == "(New Report)":
+            st.warning("Enter a preset name before saving.")
+        else:
+            cfg = {
+                "date_range_type": date_range_type,
+                "date_from":       str(date_from),
+                "date_to":         str(date_to),
+                "column_grouping": grouping,
+                "account_ids":     account_ids,
+                "category_ids":    category_ids,
+                "payee_names":     payee_names,
+            }
+            upsert_custom_report_preset(pname, cfg)
+            get_custom_report_presets.clear()
+            st.toast(f"Preset '{pname}' saved.", icon="✅")
+            st.rerun()
+
+    _cr_del_key = f"cr_del_confirm_{sel_preset}"
+    if del_btn and sel_preset != "(New Report)":
+        st.session_state[_cr_del_key] = True
+        st.rerun()
+    if st.session_state.get(_cr_del_key):
+        st.warning(f"Delete preset **'{sel_preset}'**? This cannot be undone.")
+        dc1, dc2 = st.columns(2)
+        with dc1:
+            if st.button("Cancel", key="cr_del_cancel"):
+                st.session_state.pop(_cr_del_key, None)
+                st.rerun()
+        with dc2:
+            if st.button("Yes, delete", key="cr_del_yes", type="primary"):
+                delete_custom_report_preset(preset_map[sel_preset][0])
+                get_custom_report_presets.clear()
+                st.session_state.pop(_cr_del_key, None)
+                st.toast(f"Preset '{sel_preset}' deleted.", icon="\U0001f5d1️")
+                st.rerun()
+
+    # ── Run report ────────────────────────────────────────────────────────────
+    st.divider()
+    run_col, _ = st.columns([1, 4])
+    if run_col.button("▶️ Run Report", type="primary", key="cr_run",
+                      use_container_width=True):
+        if use_all_cats == "Selected Categories" and not category_ids:
+            st.warning("Select at least one category or switch to 'All Expense Categories'.")
+        elif use_all_accts == "Selected Accounts" and not account_ids:
+            st.warning("Select at least one account or switch to 'All Accounts'.")
+        else:
+            with st.spinner("Running report…"):
+                _df = get_custom_report_data(
+                    date_from, date_to, grouping,
+                    account_ids=account_ids or None,
+                    category_ids=category_ids or None,
+                    payee_names=payee_names or None,
+                )
+            st.session_state["cr_result_df"] = _df
+            st.session_state["cr_result_params"] = {
+                "date_from":    date_from,
+                "date_to":      date_to,
+                "grouping":     grouping,
+                "grouping_str": grouping_str,
+                "account_ids":  account_ids or None,
+                "category_ids": category_ids or None,
+                "payee_names":  payee_names or None,
+            }
+
+    # ── Display results (persist across interactions) ─────────────────────────
+    if "cr_result_df" not in st.session_state:
+        return
+
+    df     = st.session_state["cr_result_df"]
+    params = st.session_state["cr_result_params"]
+    grouping     = params["grouping"]
+    grouping_str = params["grouping_str"]
+
+    if df.empty:
+        st.info("No spending data found for the selected filters and date range.")
+        return
+
+    # ── Summary metrics ───────────────────────────────────────────────────────
+    df_by_period = df.groupby(["period", "period_order"])["amount_eur"].sum().reset_index()
+    df_by_period = df_by_period.sort_values("period_order")
+    total_all = df_by_period["amount_eur"].sum()
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Grand Total",  f"€ {total_all:,.2f}")
+    m2.metric("Periods",      str(len(df_by_period)))
+    m3.metric("Categories",   str(df["category"].nunique()))
+
+    # ── Bar chart ─────────────────────────────────────────────────────────────
+    fig = px.bar(
+        df_by_period, x="period", y="amount_eur",
+        title=f"<b>Total Spending by {grouping_str}</b>",
+        template="plotly_dark",
+        labels={"amount_eur": "Amount (€)", "period": grouping_str},
+        text="amount_eur",
+    )
+    fig.update_traces(texttemplate="€%{y:,.0f}", textposition="outside")
+    fig.update_layout(margin=dict(l=0, r=0, t=50, b=0))
+    pf_plotly_chart(fig)
+
+    # ── Hierarchical pivot table ──────────────────────────────────────────────
+    st.markdown("#### Spending by Category")
+
+    period_order_map = df.groupby("period")["period_order"].min().sort_values()
+    periods = period_order_map.index.tolist()
+
+    pivot = df.pivot_table(
+        index="category", columns="period", values="amount_eur",
+        aggfunc="sum", fill_value=0,
+    )
+    pivot = pivot.reindex(columns=periods, fill_value=0)
+    pivot["TOTAL"] = pivot.sum(axis=1)
+
+    df_hier, parent_labels = _build_hierarchical_pivot(pivot, periods)
+    parent_labels.add("OVERALL TOTAL")
+    bold_set = {lbl.strip() for lbl in parent_labels}
+
+    display_cols = ["Category"] + periods + ["TOTAL"]
+    df_display   = df_hier[display_cols].copy()
+
+    fmt = {col: "€ {:,.2f}" for col in periods + ["TOTAL"]}
+
+    def _style_pivot(row):
+        is_bold = row["Category"].strip() in bold_set
+        styles = []
+        for col in row.index:
+            css = "font-weight: bold; " if is_bold else ""
+            if col != "Category":
+                try:
+                    if float(row[col]) < 0:
+                        css += "color: #E74C3C;"
+                except (TypeError, ValueError):
+                    pass
+            styles.append(css)
+        return styles
+
+    st.dataframe(
+        df_display.style.format(fmt).apply(_style_pivot, axis=1),
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "Category": st.column_config.Column(pinned=True),
+        },
+    )
+    copy_df_button(df_display, key="dl_cr_report")
+
+    # ── Transaction drill-down ────────────────────────────────────────────────
+    st.markdown("#### \U0001f50d Transaction Drill-Down")
+    st.caption("Select a category and period to view and edit the underlying transactions.")
+
+    # Build hierarchical category list for the selectbox
+    drill_paths: set = set(df["category"].unique())
+    for _p in list(drill_paths):
+        parts = _p.split(" : ")
+        for i in range(1, len(parts)):
+            drill_paths.add(" : ".join(parts[:i]))
+    drill_paths_sorted = sorted(drill_paths, key=lambda p: (p.split(" : ")[0].lower(), p.lower()))
+
+    _ALL_CATS    = "— All Categories —"
+    _ALL_PERIODS = "— All Periods —"
+
+    path_to_label: dict = {_ALL_CATS: _ALL_CATS}
+    for _p in drill_paths_sorted:
+        lvl = _p.count(" : ")
+        path_to_label[_p] = " " * (lvl * 4) + _p.split(" : ")[-1]
+
+    dd_col1, dd_col2 = st.columns(2)
+    sel_cat = dd_col1.selectbox(
+        "Category", options=[_ALL_CATS] + drill_paths_sorted,
+        format_func=lambda p: path_to_label.get(p, p),
+        key="cr_dd_cat",
+    )
+    sel_period = dd_col2.selectbox(
+        "Period", options=[_ALL_PERIODS] + periods,
+        key="cr_dd_period",
+    )
+
+    if sel_period == _ALL_PERIODS:
+        dd_from, dd_to = params["date_from"], params["date_to"]
+    else:
+        dd_from, dd_to = _period_to_dates(sel_period, grouping)
+
+    cat_path_arg = None if sel_cat == _ALL_CATS else sel_cat
+
+    df_txn = get_custom_report_drill_down(
+        dd_from, dd_to,
+        category_path=cat_path_arg,
+        account_ids=params["account_ids"],
+        category_ids=params.get("category_ids"),
+        payee_names=params["payee_names"],
+    )
+
+    if df_txn.empty:
+        st.info("No transactions found for the selected category and period.")
+    else:
+        dd_total = df_txn["amount_eur"].sum()
+        st.caption(f"{len(df_txn)} transaction(s) · net total € {dd_total:,.2f}")
+
+        df_cats   = get_expense_categories()
+        cat_opts  = df_cats["full_path"].tolist()
+        cat_id_map = dict(zip(df_cats["full_path"], df_cats["categories_id"]))
+
+        df_edit = df_txn[["splits_id", "date", "payee", "category", "amount_eur", "notes"]].copy()
+        df_edit["date"] = df_edit["date"].dt.strftime("%Y-%m-%d")
+
+        edited = st.data_editor(
+            df_edit,
+            disabled=["splits_id", "date", "payee", "amount_eur"],
+            column_config={
+                "splits_id":  st.column_config.NumberColumn("ID",         format="%d"),
+                "date":       st.column_config.TextColumn("Date"),
+                "payee":      st.column_config.TextColumn("Payee"),
+                "category":   st.column_config.SelectboxColumn("Category", options=cat_opts, required=True),
+                "amount_eur": st.column_config.NumberColumn("Amount (€)", format="€ %,.2f"),
+                "notes":      st.column_config.TextColumn("Notes"),
+            },
+            hide_index=True,
+            use_container_width=True,
+            key=f"cr_dd_editor_{sel_cat}_{sel_period}",
+        )
+
+        # Enable Save only when the user has actually edited something.
+        _cats_changed  = not edited["category"].equals(df_edit["category"])
+        _notes_changed = not edited["notes"].fillna("").equals(df_edit["notes"].fillna(""))
+        _has_changes   = _cats_changed or _notes_changed
+
+        if st.button("\U0001f4be Save Changes", key="cr_dd_save", disabled=not _has_changes):
+            changes, errors = 0, []
+            for i, row in edited.iterrows():
+                orig        = df_txn.iloc[i]
+                new_cat_id  = cat_id_map.get(row["category"])
+                orig_notes  = orig["notes"] or ""
+                new_notes   = row["notes"] or ""
+                if new_cat_id is None:
+                    errors.append(f"Row {i+1}: unknown category '{row['category']}'")
+                    continue
+                if new_cat_id != int(orig["categories_id"]) or new_notes != orig_notes:
+                    update_split(int(row["splits_id"]), new_cat_id, new_notes or None)
+                    changes += 1
+            for e in errors:
+                st.error(e)
+            if changes:
+                st.session_state.pop("cr_result_df", None)
+                st.success(f"Saved {changes} change(s). Re-run the report to refresh the table.")
+            elif not errors:
+                st.info("No changes detected.")
+
 
 def render_reports():
     """Render the Reports page."""
@@ -49,6 +521,7 @@ def render_reports():
             "Investment Tax Report",
             "Securities & Portfolio Analysis",
             "Budget & Spending",
+            "Custom Reports",
             "Financial Planning",
         ],
         key="hist_sub_nav"
@@ -257,9 +730,10 @@ def render_reports():
 
         _risk_acct_ids = _perf_sel_ids
 
-        tab_report, tab_movers, tab_savings, tab_dividends, tab_bonds, tab_bm, tab_risk, tab_corr, tab_monte = st.tabs([
+        tab_report, tab_movers, tab_savings, tab_dividends, tab_bonds, tab_bm, tab_risk, tab_corr, tab_monte, tab_returns = st.tabs([
             "📊 P&L Report", "🚀 Top Movers", "💰 Savings", "💸 Dividend Tracker",
             "📋 Bond Schedule", "📈 Benchmark", "⚡ Risk Metrics", "🔗 Correlation", "🎲 Monte Carlo",
+            "📐 TWR / MWR",
         ])
         
         with tab_report:
@@ -1343,6 +1817,9 @@ def render_reports():
         with tab_monte:
             render_monte_carlo(account_ids=_risk_acct_ids)
 
+        with tab_returns:
+            render_twr_mwr(account_ids=_risk_acct_ids)
+
     elif hist_sub_menu == "Securities & Portfolio Analysis":
         # 1. Tabs
         tab_change, tab_volat, tab_inv_signals, tab_port_signals = st.tabs(["📈 Price Change %", "🌊 Volatility", "🎯 Investment Signals", "📢 Portfolio Action Signals"])
@@ -1706,6 +2183,9 @@ def render_reports():
 
     elif hist_sub_menu == "Budget & Spending":
         render_budget_and_spending()
+
+    elif hist_sub_menu == "Custom Reports":
+        render_custom_reports()
 
     elif hist_sub_menu == "Investment Tax Report":
         render_tax_report()
@@ -2648,19 +3128,21 @@ def render_cash_flow_forecast():
     chart_rows = []
     if not df_f.empty:
         for _, row in df_f.iterrows():
+            amt = float(row['amount_eur']) if row['amount_eur'] is not None else 0.0
             chart_rows.append({
                 'date':       row['date'],
-                'amount_eur': row['amount_eur'],
+                'amount_eur': amt,
                 'source':     'Scheduled',
-                'flow':       'Income' if row['amount_eur'] >= 0 else 'Expense',
+                'flow':       'Income' if amt >= 0 else 'Expense',
             })
     if not df_recur_proj.empty:
         for _, row in df_recur_proj.iterrows():
+            amt = float(row['amount_eur']) if row['amount_eur'] is not None else 0.0
             chart_rows.append({
                 'date':       row['date'],
-                'amount_eur': row['amount_eur'],
+                'amount_eur': amt,
                 'source':     'Recurring (est.)',
-                'flow':       'Income' if row['amount_eur'] >= 0 else 'Expense',
+                'flow':       'Income' if amt >= 0 else 'Expense',
             })
 
     # ── Combined chart + metrics ──────────────────────────────────────────────
@@ -3763,12 +4245,12 @@ def render_savings_rate():
         "A rate above 20% is generally considered healthy; above 50% is excellent for building long-term wealth."
     )
 
-    months = st.sidebar.slider(
-        "Months back", min_value=6, max_value=36, value=12, key="sr_months",
+    ctrl1, ctrl2, ctrl3 = st.columns([3, 3, 1])
+    months = ctrl1.slider(
+        "Months back", min_value=3, max_value=60, value=12, key="sr_months",
         help="How many complete past calendar months to include in the chart.",
     )
-    col_btn, _ = st.columns([1, 4])
-    if col_btn.button("\U0001f504 Refresh", key="sr_refresh"):
+    if ctrl3.button("\U0001f504 Refresh", key="sr_refresh"):
         get_savings_rate_data.clear()
         st.rerun()
 
@@ -3779,7 +4261,7 @@ def render_savings_rate():
 
     avg_income   = df["income_eur"].mean()
     avg_expenses = df["expenses_eur"].mean()
-    avg_rate     = df["savings_rate_pct"].mean()
+    avg_rate     = ((avg_income - avg_expenses) / avg_income * 100) if avg_income > 0 else 0
 
     m1, m2, m3 = st.columns(3)
     m1.metric("Avg Monthly Income",   f"€ {avg_income:,.2f}")
@@ -3998,8 +4480,15 @@ def render_spending_trends():
         "Use the **Year-over-Year** section below to compare the same month across different years for a selected category."
     )
 
-    months = st.sidebar.slider("Months back", min_value=6, max_value=48, value=24, key="st_months",
-                               help="Number of complete past calendar months to include.")
+    ctrl1, ctrl2, ctrl3 = st.columns([3, 3, 1])
+    months = ctrl1.slider(
+        "Months back", min_value=3, max_value=60, value=24, key="st_months",
+        help="Number of complete past calendar months to include.",
+    )
+    if ctrl3.button("\U0001f504 Refresh", key="st_refresh"):
+        get_spending_trends.clear()
+        get_spending_by_payee.clear()
+        st.rerun()
 
     df = get_spending_trends(months)
     if df.empty:
@@ -4037,6 +4526,121 @@ def render_spending_trends():
     fig_yoy.update_layout(margin=dict(l=0, r=0, t=50, b=0))
     pf_plotly_chart(fig_yoy)
 
+    # ── Payee breakdown ───────────────────────────────────────────────────────
+    st.markdown("#### Payee Breakdown")
+    st.caption("Top payees within the selected category over the same lookback window.")
+
+    df_payee = get_spending_by_payee(selected_category, months)
+    if df_payee.empty:
+        st.info("No payee data for this category.")
+        return
+
+    col_tbl, col_chart = st.columns([1, 1])
+
+    with col_tbl:
+        df_pay_disp = df_payee.copy()
+        df_pay_disp['first_seen'] = df_pay_disp['first_seen'].dt.strftime("%Y-%m-%d")
+        df_pay_disp['last_seen']  = df_pay_disp['last_seen'].dt.strftime("%Y-%m-%d")
+        df_pay_disp['share_pct']  = (df_pay_disp['amount_eur'] / df_pay_disp['amount_eur'].sum() * 100).round(1)
+        st.dataframe(
+            df_pay_disp.style.format({
+                "amount_eur": "{:,.2f} €",
+                "share_pct":  "{:.1f}%",
+            }),
+            hide_index=True, use_container_width=True,
+            column_config={
+                "payee":      "Payee",
+                "tx_count":   st.column_config.NumberColumn("# Txns", format="%d"),
+                "amount_eur": st.column_config.NumberColumn("Total (€)", format="%,.2f €"),
+                "share_pct":  st.column_config.NumberColumn("Share",    format="%.1f%%"),
+                "first_seen": "First",
+                "last_seen":  "Last",
+            },
+        )
+        copy_df_button(df_pay_disp, key="dl_spending_payee_drill")
+
+    with col_chart:
+        top_n = df_payee.head(15)
+        fig_pay = px.bar(
+            top_n.sort_values('amount_eur'),
+            x='amount_eur', y='payee', orientation='h',
+            title=f"<b>Top Payees — {selected_category}</b>",
+            template="plotly_dark",
+            labels={"amount_eur": "Total (€)", "payee": ""},
+            text='amount_eur',
+        )
+        fig_pay.update_traces(texttemplate="€%{x:,.0f}", textposition="outside")
+        fig_pay.update_layout(margin=dict(l=0, r=0, t=50, b=0), showlegend=False)
+        pf_plotly_chart(fig_pay)
+
+    # ── Payee transaction detail + edit ──────────────────────────────────────
+    st.markdown("#### Transaction Detail & Edit")
+    st.caption(
+        "Select a payee to view individual transactions. "
+        "You can change the **Category** or edit the **Notes** inline and press **Save Changes**."
+    )
+
+    payees_list = df_payee["payee"].tolist()
+    selected_payee = st.selectbox(
+        "Select Payee", payees_list, key="st_payee_select",
+        help="Transactions for this payee over the same lookback window (including current month).",
+    )
+
+    df_txn = get_payee_transactions(selected_payee, selected_category, months)
+    if df_txn.empty:
+        st.info("No transactions found for this payee in the selected period.")
+        return
+
+    df_cats = get_expense_categories()
+    cat_options = df_cats["full_path"].tolist()
+    cat_id_map  = dict(zip(df_cats["full_path"], df_cats["categories_id"]))
+
+    total = df_txn["amount_eur"].sum()
+    st.caption(f"{len(df_txn)} transaction(s) · total € {total:,.2f}")
+
+    df_edit = df_txn[["splits_id", "date", "category", "amount_eur", "notes"]].copy()
+    df_edit["date"] = df_edit["date"].dt.strftime("%Y-%m-%d")
+
+    edited = st.data_editor(
+        df_edit,
+        disabled=["splits_id", "date", "amount_eur"],
+        column_config={
+            "splits_id":  st.column_config.NumberColumn("ID",          format="%d"),
+            "date":       st.column_config.TextColumn("Date"),
+            "category":   st.column_config.SelectboxColumn("Category", options=cat_options, required=True),
+            "amount_eur": st.column_config.NumberColumn("Amount (€)",  format="€ %,.2f"),
+            "notes":      st.column_config.TextColumn("Notes"),
+        },
+        hide_index=True,
+        use_container_width=True,
+        key=f"st_txn_editor_{selected_payee}_{selected_category}",
+    )
+
+    if st.button("\U0001f4be Save Changes", key="st_save_txn"):
+        changes = 0
+        errors  = []
+        for i, row in edited.iterrows():
+            orig         = df_txn.iloc[i]
+            orig_cat_id  = int(orig["categories_id"])
+            orig_notes   = orig["notes"] or ""
+            new_cat_id   = cat_id_map.get(row["category"])
+            new_notes    = row["notes"] or ""
+            if new_cat_id is None:
+                errors.append(f"Row {i+1}: unknown category '{row['category']}'")
+                continue
+            if new_cat_id != orig_cat_id or new_notes != orig_notes:
+                update_split(int(row["splits_id"]), new_cat_id, new_notes or None)
+                changes += 1
+        for e in errors:
+            st.error(e)
+        if changes:
+            get_spending_trends.clear()
+            get_spending_by_payee.clear()
+            st.success(f"Saved {changes} change(s).")
+            st.rerun()
+        elif not errors:
+            st.info("No changes detected.")
+
 
 # ======================================================
 # B6. BUDGET & SPENDING PAGE
@@ -4062,74 +4666,398 @@ def render_budget_and_spending():
 # B7. CAPITAL GAINS
 # ======================================================
 
+def _compute_lot_gains(df_all: pd.DataFrame, tax_year: int,
+                       method: str = 'FIFO') -> pd.DataFrame:
+    """Compute capital gains using FIFO or LIFO lot matching.
+
+    Processes ALL transactions (not just the tax year) so that lot queues are
+    correct for positions opened before the tax year.  Only sells that fall
+    within *tax_year* are included in the returned DataFrame.
+
+    method: 'FIFO' — consume oldest lots first (default)
+            'LIFO' — consume most-recently-added lots first
+    """
+    from collections import deque
+
+    BUY_ACTIONS  = {'Buy', 'Reinvest', 'ShrIn', 'CashIn'}
+    SELL_ACTIONS = {'Sell', 'Expire', 'ShrOut', 'CashOut'}
+    is_lifo = (method == 'LIFO')
+
+    results = []
+
+    for (sec_id, acc_id), grp in df_all.groupby(['securities_id', 'accounts_id'], sort=False):
+        lot_q: deque = deque()   # items: {'date': pd.Timestamp, 'qty': float, 'cost_ps': float}
+
+        for _, row in grp.sort_values(['date', 'investments_id']).iterrows():
+            action = row['action']
+            qty    = float(row['quantity'])   if pd.notna(row['quantity'])   else 0.0
+            amount = float(row['amount_eur']) if pd.notna(row['amount_eur']) else 0.0
+
+            if action in BUY_ACTIONS and qty > 1e-9:
+                lot_q.append({'date': row['date'], 'qty': qty,
+                               'cost_ps': amount / qty})
+
+            elif action in SELL_ACTIONS and qty > 1e-9:
+                sell_date = row['date']
+                qty_left  = qty
+                cost_basis = 0.0
+                first_buy_date = None   # date of the first lot consumed (oldest for FIFO, newest for LIFO)
+
+                while qty_left > 1e-9 and lot_q:
+                    # LIFO: take from the right (newest); FIFO: take from the left (oldest)
+                    lot = lot_q[-1] if is_lifo else lot_q[0]
+                    if first_buy_date is None:
+                        first_buy_date = lot['date']
+                    consumed = min(lot['qty'], qty_left)
+                    cost_basis += consumed * lot['cost_ps']
+                    lot['qty']  -= consumed
+                    qty_left    -= consumed
+                    if lot['qty'] < 1e-9:
+                        if is_lifo:
+                            lot_q.pop()
+                        else:
+                            lot_q.popleft()
+
+                if sell_date.year == tax_year:
+                    days_held  = (sell_date - first_buy_date).days if first_buy_date else 0
+                    gain_loss  = amount - cost_basis
+                    results.append({
+                        'securities_name':  row['securities_name'],
+                        'account_name':     row['account_name'],
+                        'sell_date':        sell_date,
+                        'quantity':         qty,
+                        'sell_price':       row.get('price_per_share'),
+                        'sell_amount_eur':  amount,
+                        'cost_basis_eur':   cost_basis,
+                        'gain_loss_eur':    gain_loss,
+                        'days_held':        days_held,
+                        'holding_type':     'Long-term' if days_held >= 365 else 'Short-term',
+                        'is_tax_exempt':    bool(row.get('is_tax_exempt', False)),
+                        'instrument_type':  row.get('instrument_type'),
+                        'securities_type':  row.get('securities_type'),
+                    })
+
+    return pd.DataFrame(results) if results else pd.DataFrame(
+        columns=['securities_name','account_name','sell_date','quantity',
+                 'sell_price','sell_amount_eur','cost_basis_eur','gain_loss_eur',
+                 'days_held','holding_type','is_tax_exempt','instrument_type',
+                 'securities_type'])
+
+
 def render_capital_gains():
     """Render the Capital Gains report."""
     st.subheader("\U0001f4cb Capital Gains Report")
     st.caption(
         "Lists all sell transactions for the selected tax year, showing the realised gain or loss per position. "
-        "**Short-term** gains (held ≤ 1 year) are typically taxed at a higher rate than **Long-term** gains (held > 1 year) — "
-        "check the applicable rules for your jurisdiction. "
-        "Cost basis is computed using the Weighted Average Cost method from your buy history; "
-        "for T-Bills, CDs, and bonds it falls back to the recorded purchase price."
+        "**Short-term** gains (held ≤ 1 year) are typically taxed at a higher rate than **Long-term** gains (held > 1 year). "
+        "**WAC** (Weighted Average Cost) uses the average cost of all open lots. "
+        "**FIFO** (First-In First-Out) matches the oldest lots first. "
+        "**LIFO** (Last-In First-Out) matches the most recently purchased lots first — "
+        "often produces the largest cost basis for recently-bought positions."
     )
 
     current_year = datetime.now().year
-    year_options = list(range(current_year, current_year - 5, -1))
-    tax_year     = st.selectbox("Tax Year", options=year_options, key="cg_tax_year",
-                                help="Select the tax year for which to report realised gains and losses.")
+    year_options = list(range(current_year, current_year - 10, -1))
 
-    df = get_capital_gains_report(int(tax_year))
+    c1, c2, c3 = st.columns([1, 1, 1])
+    with c1:
+        tax_year = st.selectbox("Tax Year", options=year_options, key="cg_tax_year",
+                                help="Select the tax year for which to report realised gains and losses.")
+    with c2:
+        method = st.radio(
+            "Cost Basis Method",
+            ["WAC (Weighted Avg)", "FIFO (First-In First-Out)", "LIFO (Last-In First-Out)"],
+            key="cg_method", horizontal=True,
+            help=(
+                "WAC: average cost of all open lots (single pool). "
+                "FIFO: oldest lots consumed first — maximises holding period for long-held positions. "
+                "LIFO: newest lots consumed first — reflects the cost of the most recent purchase."
+            ),
+        )
+    with c3:
+        tax_rate = st.number_input(
+            "Derivatives Tax Rate (%)",
+            min_value=0.0, max_value=100.0,
+            value=15.0, step=0.5, key="cg_tax_rate",
+            help=(
+                "Applied to net gains from **CFDs** (Category 2) and **precious-metal FX spots** "
+                "(Category 3). Greek rate is 15% (Art. 42, L.4172/2013). "
+                "Real shares & UCITS funds (Category 1) are always 0% CGT in Greece."
+            ),
+        )
+
+    use_lot_method = method.startswith("FIFO") or method.startswith("LIFO")
+    lot_method = "LIFO" if method.startswith("LIFO") else "FIFO"
+
+    if use_lot_method:
+        df_all = get_all_inv_txns_for_gains()
+        if df_all.empty:
+            st.info("No investment transactions found.")
+            return
+        df = _compute_lot_gains(df_all, int(tax_year), method=lot_method)
+    else:
+        df = get_capital_gains_report(int(tax_year))
+        # Add days_held to WAC results using sell_date and last_buy_date proxy
+        # (holding_type already set by the query; derive days_held from it for display)
+        if not df.empty and 'days_held' not in df.columns:
+            df['days_held'] = df['holding_type'].map({'Short-term': 180, 'Long-term': 400})
+
     if df.empty:
         st.info(f"No sell transactions found for {tax_year}.")
         return
 
-    total_gains  = df[df["gain_loss_eur"] > 0]["gain_loss_eur"].sum()
-    total_losses = df[df["gain_loss_eur"] < 0]["gain_loss_eur"].sum()
-    net_gl       = df["gain_loss_eur"].sum()
-    st_total     = df[df["holding_type"] == "Short-term"]["gain_loss_eur"].sum()
-    lt_total     = df[df["holding_type"] == "Long-term"]["gain_loss_eur"].sum()
+    # ── Guard: ensure all classification columns exist ────────────────────────
+    for _col, _default in [('is_tax_exempt', False), ('instrument_type', None),
+                            ('securities_type', None)]:
+        if _col not in df.columns:
+            df[_col] = _default
 
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Total Gains",   f"€ {total_gains:,.2f}")
-    m2.metric("Total Losses",  f"€ {total_losses:,.2f}")
-    m3.metric("Net G/L",       f"€ {net_gl:,.2f}")
-    m4.metric("Short-term",    f"€ {st_total:,.2f}")
-    m5.metric("Long-term",     f"€ {lt_total:,.2f}")
+    # ── Greek CGT category classification ─────────────────────────────────────
+    # Priority: Instrument_Type on the transaction (explicit) →
+    #           fallback to Securities_Type on the master record (when blank).
+    #
+    # Cat 1: real shares / UCITS / bonds  → 0% CGT (E1 Codes 867–868)
+    # Cat 2: CfdOn* / CFD                 → 15%    (E1 Codes 865–866 / 869–870)
+    # Cat 3: FxSpot                       → 15%    (same E1 codes as Cat 2)
+    #
+    # IMPORTANT: is_tax_exempt is irrelevant for Cat 2/3 — trading a tax-exempt
+    # security as a CFD or FxSpot makes the gain fully taxable.
 
-    df_display = df.copy()
-    df_display["sell_date"] = df_display["sell_date"].dt.strftime("%Y-%m-%d")
-    st.dataframe(
-        df_display.style.format({
-            "quantity":        "{:,.4f}",
-            "sell_price":      "{:,.4f}",
-            "sell_amount_eur": "{:,.2f} €",
-            "cost_basis_eur":  "{:,.2f} €",
-            "gain_loss_eur":   "{:+,.2f} €",
-        }).map(color_negative_red, subset=["gain_loss_eur"]),
-        hide_index=True, width="stretch",
-        column_config={
-            "securities_name": "Security",
-            "account_name":    "Account",
-            "sell_date":       "Sell Date",
-            "quantity":        st.column_config.NumberColumn("Quantity",      format="%,.4f"),
-            "sell_price":      st.column_config.NumberColumn("Sell Price",    format="%,.4f"),
-            "sell_amount_eur": st.column_config.NumberColumn("Proceeds (€)",  format="%,.2f €"),
-            "cost_basis_eur":  st.column_config.NumberColumn("Cost Basis (€)", format="%,.2f €"),
-            "gain_loss_eur":   st.column_config.NumberColumn("Gain / Loss (€)", format="%+,.2f €"),
-            "holding_type":    "Term",
-        },
+    def _classify(row) -> int:
+        instr = (row.get('instrument_type') or '').strip().lower()
+        stype = (row.get('securities_type') or '').strip().lower()
+        # Transaction-level instrument type takes priority
+        if instr.startswith('cfdon') or instr == 'cfd':
+            return 2
+        if instr == 'fxspot':
+            return 3
+        # Fallback to security master type when instrument_type is not recorded
+        if stype == 'cfd':
+            return 2
+        if stype == 'fx spot':
+            return 3
+        return 1
+
+    df['_tax_cat'] = df.apply(_classify, axis=1)
+
+    # ── Split into exempt / taxable ───────────────────────────────────────────
+    # CFD/FxSpot trades are ALWAYS taxable — instrument type overrides is_tax_exempt.
+    # Only Cat 1 rows of tax-exempt securities go to the exempt bucket.
+    _is_derivative = df['_tax_cat'].isin([2, 3])
+    df_exempt  = df[ df['is_tax_exempt'] & ~_is_derivative].copy()
+    df_taxable = df[~df['is_tax_exempt'] |  _is_derivative].copy()
+    df_cat1  = df_taxable[df_taxable['_tax_cat'] == 1].copy()
+    df_cat2  = df_taxable[df_taxable['_tax_cat'] == 2].copy()
+    df_cat3  = df_taxable[df_taxable['_tax_cat'] == 3].copy()
+    df_deriv = df_taxable[df_taxable['_tax_cat'].isin([2, 3])].copy()
+
+    if not df_exempt.empty:
+        st.success(
+            f"✅ **{len(df_exempt)} tax-exempt sale(s) excluded** "
+            f"(€ {df_exempt['gain_loss_eur'].sum():+,.2f} net G/L) — shown in expander below."
+        )
+
+    # ── Top headline: key numbers at a glance ─────────────────────────────────
+    net_cat1  = df_cat1['gain_loss_eur'].sum()  if not df_cat1.empty  else 0.0
+    net_deriv = df_deriv['gain_loss_eur'].sum() if not df_deriv.empty else 0.0
+    tax_est   = max(net_deriv, 0) * (tax_rate / 100)
+
+    hm1, hm2, hm3 = st.columns(3)
+    hm1.metric("🟢 Cat 1 Net G/L — Real Shares",     f"€ {net_cat1:+,.2f}",
+               help="Direct equity / UCITS positions — 0% CGT in Greece.")
+    hm2.metric("🔴 Cat 2+3 Net G/L — Derivatives",   f"€ {net_deriv:+,.2f}",
+               help="CFDs and precious-metal FX spots — taxed at the rate shown.")
+    hm3.metric(f"Est. Derivatives Tax @ {tax_rate:.0f}%", f"€ {tax_est:,.2f}",
+               help="Only on net positive derivative gains. Category 1 is always 0%.")
+
+    st.divider()
+
+    # ── Shared table helper ────────────────────────────────────────────────────
+    def _gains_table(data: pd.DataFrame, key: str):
+        disp = data.copy()
+        disp['sell_date'] = pd.to_datetime(disp['sell_date']).dt.strftime('%Y-%m-%d')
+        fmt = {'quantity': '{:,.4f}', 'sell_amount_eur': '{:,.2f} €',
+               'cost_basis_eur': '{:,.2f} €', 'gain_loss_eur': '{:+,.2f} €'}
+        if 'sell_price' in disp.columns:
+            fmt['sell_price'] = '{:,.4f}'
+        _has_instr = (
+            'instrument_type' in disp.columns
+            and disp['instrument_type'].notna().any()
+            and (disp['instrument_type'].astype(str).str.strip() != '').any()
+        )
+        col_cfg = {
+            'securities_name':  'Security',
+            'account_name':     'Account',
+            'sell_date':        'Sell Date',
+            'quantity':         st.column_config.NumberColumn('Quantity',        format='%,.4f'),
+            'sell_price':       st.column_config.NumberColumn('Sell Price',      format='%,.4f'),
+            'sell_amount_eur':  st.column_config.NumberColumn('Proceeds (€)',    format='%,.2f €'),
+            'cost_basis_eur':   st.column_config.NumberColumn('Cost Basis (€)',  format='%,.2f €'),
+            'gain_loss_eur':    st.column_config.NumberColumn('Gain / Loss (€)', format='%+,.2f €'),
+            'days_held':        st.column_config.NumberColumn('Days Held',       format='%d'),
+            'holding_type':     'Term',
+            'instrument_type':  st.column_config.TextColumn(
+                                    'Instrument', width='small',
+                                    help='Specific traded instrument (e.g. CFDOnETF, Stock, ETF).'
+                                ) if _has_instr else None,
+            # Classification / internal columns — hidden from display
+            'is_tax_exempt':    None,
+            '_tax_cat':         None,
+            'securities_type':  None,
+        }
+        st.dataframe(
+            disp.style.format(fmt).map(color_negative_red, subset=['gain_loss_eur']),
+            hide_index=True, use_container_width=True, column_config=col_cfg,
+        )
+        copy_df_button(disp, key=key)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # CATEGORY 1 — Real Shares & UCITS Funds (0% CGT)
+    # ══════════════════════════════════════════════════════════════════════════
+    st.markdown('### 🟢 Category 1 — Real Shares & UCITS Funds (0% CGT)')
+    st.caption(
+        'Direct investments in equities, ETFs, UCITS funds and bonds. '
+        'Capital gains are **0% tax-free** in Greece for individual investors holding < 0.5% of the company '
+        '(Art. 42, L.4172/2013). '
+        'Net profits must still be declared in **E1 Table 4E, Codes 867–868** to clear *τεκμήρια* '
+        '(living-standard presumptions).'
     )
-    copy_df_button(df_display, key="dl_rpt_capital_gains")
+    if df_cat1.empty:
+        st.info(f'No Category 1 sell transactions found for {tax_year}.')
+    else:
+        g1  = df_cat1[df_cat1['gain_loss_eur'] > 0]['gain_loss_eur'].sum()
+        l1  = df_cat1[df_cat1['gain_loss_eur'] < 0]['gain_loss_eur'].sum()
+        st1 = df_cat1[df_cat1['holding_type'] == 'Short-term']['gain_loss_eur'].sum()
+        lt1 = df_cat1[df_cat1['holding_type'] == 'Long-term']['gain_loss_eur'].sum()
+        c1a, c1b, c1c, c1d, c1e, c1f = st.columns(6)
+        c1a.metric('Total Gains',  f'€ {g1:,.2f}')
+        c1b.metric('Total Losses', f'€ {l1:,.2f}')
+        c1c.metric('Net G/L',      f'€ {net_cat1:+,.2f}')
+        c1d.metric('Short-term',   f'€ {st1:+,.2f}')
+        c1e.metric('Long-term',    f'€ {lt1:+,.2f}')
+        c1f.metric('Tax',          '€ 0.00', help='Category 1 is always 0% CGT in Greece.')
+        _gains_table(df_cat1, 'dl_rpt_cg_cat1')
+        if len(df_cat1) > 1:
+            fig1 = px.bar(
+                df_cat1, x='securities_name', y='gain_loss_eur', color='holding_type',
+                title='<b>Category 1 — Gains / Losses by Security</b>',
+                template='plotly_dark',
+                labels={'gain_loss_eur': 'Gain / Loss (€)', 'securities_name': 'Security'},
+                barmode='group',
+            )
+            fig1.update_layout(margin=dict(l=0, r=0, t=50, b=0))
+            pf_plotly_chart(fig1)
 
-    fig = px.bar(
-        df, x="securities_name", y="gain_loss_eur", color="holding_type",
-        title="<b>Gains / Losses by Security</b>",
-        template="plotly_dark",
-        labels={"gain_loss_eur": "Gain / Loss (€)", "securities_name": "Security"},
-        barmode="group",
+    st.divider()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # CATEGORY 2 — CFDs & Financial Derivatives (15%)
+    # ══════════════════════════════════════════════════════════════════════════
+    st.markdown(f'### 🔴 Category 2 — CFDs & Financial Derivatives ({tax_rate:.0f}% Tax)')
+    st.caption(
+        'Contracts for Difference on any underlying — stocks, ETFs, indices, commodities. '
+        'Even if the underlying is a UCITS ETF, trading it **as a CFD** removes the 0% exemption. '
+        f'Net gains taxed at **{tax_rate:.0f}%**. '
+        'E1 reporting: **net profit → Codes 865–866** · **net loss → Codes 869–870** '
+        '(carry-forward up to 5 years).'
     )
-    fig.update_layout(margin=dict(l=0, r=0, t=50, b=0))
-    pf_plotly_chart(fig)
+    if df_cat2.empty:
+        st.info(f'No Category 2 (CFD) sell transactions found for {tax_year}.')
+    else:
+        g2   = df_cat2[df_cat2['gain_loss_eur'] > 0]['gain_loss_eur'].sum()
+        l2   = df_cat2[df_cat2['gain_loss_eur'] < 0]['gain_loss_eur'].sum()
+        net2 = df_cat2['gain_loss_eur'].sum()
+        c2a, c2b, c2c = st.columns(3)
+        c2a.metric('Total Gains',  f'€ {g2:,.2f}')
+        c2b.metric('Total Losses', f'€ {l2:,.2f}')
+        c2c.metric('Net G/L',      f'€ {net2:+,.2f}')
+        _gains_table(df_cat2, 'dl_rpt_cg_cat2')
+
+    st.divider()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # CATEGORY 3 — FX Precious Metal Spots (15%)
+    # ══════════════════════════════════════════════════════════════════════════
+    st.markdown(f'### ⚠️ Category 3 — FX Precious Metal Spots ({tax_rate:.0f}% Tax)')
+    st.caption(
+        'Transactions recorded with **Instrument Type = FxSpot** — precious-metal spot contracts '
+        '(e.g. Silver, Gold) traded on Saxo or similar platforms. '
+        'Treated as financial commodity derivatives under Greek law — '
+        f'same **{tax_rate:.0f}%** rate and same E1 form codes as Category 2: '
+        '**net profit → Codes 865–866** · **net loss → Codes 869–870**.'
+    )
+    if df_cat3.empty:
+        st.info(f'No Category 3 (FX precious metal) sell transactions found for {tax_year}.')
+    else:
+        g3   = df_cat3[df_cat3['gain_loss_eur'] > 0]['gain_loss_eur'].sum()
+        l3   = df_cat3[df_cat3['gain_loss_eur'] < 0]['gain_loss_eur'].sum()
+        net3 = df_cat3['gain_loss_eur'].sum()
+        c3a, c3b, c3c = st.columns(3)
+        c3a.metric('Total Gains',  f'€ {g3:,.2f}')
+        c3b.metric('Total Losses', f'€ {l3:,.2f}')
+        c3c.metric('Net G/L',      f'€ {net3:+,.2f}')
+        _gains_table(df_cat3, 'dl_rpt_cg_cat3')
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # COMBINED DERIVATIVES SUMMARY (Cat 2 + Cat 3 share the same E1 codes)
+    # ══════════════════════════════════════════════════════════════════════════
+    if not df_deriv.empty:
+        st.divider()
+        st.markdown('### 📊 Combined Derivatives Summary (Categories 2 + 3)')
+        st.caption(
+            'Categories 2 and 3 are **netted together** on the Greek tax return '
+            '(they share the same E1 form codes).'
+        )
+        net_d2 = df_cat2['gain_loss_eur'].sum() if not df_cat2.empty else 0.0
+        net_d3 = df_cat3['gain_loss_eur'].sum() if not df_cat3.empty else 0.0
+        tax_d  = max(net_deriv, 0) * (tax_rate / 100)
+        sd1, sd2, sd3, sd4 = st.columns(4)
+        sd1.metric('CFDs Net G/L (Cat 2)',            f'€ {net_d2:+,.2f}')
+        sd2.metric('Precious Metals Net G/L (Cat 3)', f'€ {net_d3:+,.2f}')
+        sd3.metric('Combined Net G/L',                f'€ {net_deriv:+,.2f}')
+        sd4.metric(f'Est. Tax @ {tax_rate:.0f}%',     f'€ {tax_d:,.2f}',
+                   help='Applied only on net positive combined derivative gains.')
+        if net_deriv >= 0:
+            st.success(
+                f'📝 **E1 Declaration (Derivatives):** Report **€ {net_deriv:,.2f}** net profit '
+                f'in **Table 4E, Codes 865–866**.'
+            )
+        else:
+            st.warning(
+                f'📝 **E1 Declaration (Derivatives):** Report **€ {abs(net_deriv):,.2f}** net loss '
+                f'in **Table 4E, Codes 869–870** — carry-forward for up to 5 years.'
+            )
+
+    # ── Tax-exempt gains (expander) ───────────────────────────────────────────
+    if not df_exempt.empty:
+        st.divider()
+        net_ex = df_exempt['gain_loss_eur'].sum()
+        with st.expander(
+            f'🟢 Tax-Exempt Sales — {len(df_exempt)} transaction(s), '
+            f'€ {net_ex:+,.2f} net G/L (excluded from all totals)',
+            expanded=False,
+        ):
+            st.caption(
+                'These securities are marked **Tax Exempt** in the Securities master data '
+                '(e.g. Hellenic T-Bills purchased at primary market). '
+                'Shown here for reference only — not included in any category above.'
+            )
+            _gains_table(df_exempt, 'dl_rpt_capital_gains_exempt')
+
+    # ── Reference note ────────────────────────────────────────────────────────
+    st.info(
+        'ℹ️ **Greek CGT Quick Reference (L.4172/2013, Art. 42):** '
+        '**Cat 1** — Direct purchase (Instrument Type blank or non-derivative; '
+        'falls back to Security Type when Instrument Type is not set): **0% CGT**; '
+        'declare profits in E1 Codes **867–868**. '
+        '**Cat 2** — Instrument Type **CfdOn*** or **CFD** (or Security Type = CFD): **15%**. '
+        '**Cat 3** — Instrument Type **FxSpot** (or Security Type = FX Spot): **15%**, same codes as Cat 2. '
+        'Note: trading a **tax-exempt** security (e.g. T-Bill) as a CFD or FxSpot makes the gain **fully taxable** — '
+        'instrument type always overrides the tax-exempt flag. '
+        'Categories 2 & 3 are netted together: profits → E1 Codes **865–866** · '
+        'losses → E1 Codes **869–870** (carry-forward ≤ 5 years). '
+        'All figures are indicative — consult a certified Greek tax advisor.'
+    )
 
 
 # ======================================================
@@ -4185,8 +5113,10 @@ def render_investment_income():
     st.subheader("\U0001f4b0 Dividend & Interest Income")
     st.caption(
         "Taxable income for the selected tax year across two sources: "
-        "**Investment income** (dividends, interest, and return-of-capital events from your securities) "
+        "**Investment income** (dividends, reinvested dividends, and interest from your securities) "
         "and **Bank & Savings interest** (interest credited to Checking, Savings, and Cash accounts). "
+        "**Return of Capital (RtrnCap)** events are listed for reference only — they are not taxable income "
+        "but reduce cost basis and affect capital gains on eventual sale. "
         "All amounts are converted to EUR. Consult your tax advisor for the applicable rates."
     )
 
@@ -4198,50 +5128,117 @@ def render_investment_income():
     df_inv  = get_investment_income_report(int(tax_year))
     df_bank = get_bank_interest_report(int(tax_year))
 
-    total_div      = df_inv[df_inv["action"] == "Dividend"]["amount_eur"].sum()  if not df_inv.empty  else 0.0
-    total_int_inv  = df_inv[df_inv["action"] == "IntInc"]["amount_eur"].sum()    if not df_inv.empty  else 0.0
-    total_roc      = df_inv[df_inv["action"] == "RtrnCap"]["amount_eur"].sum()   if not df_inv.empty  else 0.0
-    total_bank     = df_bank["amount_eur"].sum()                                  if not df_bank.empty else 0.0
-    grand_total    = total_div + total_int_inv + total_roc + total_bank
-
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Dividends",             f"€ {total_div:,.2f}")
-    m2.metric("Investment Interest",   f"€ {total_int_inv:,.2f}")
-    m3.metric("Return of Capital",     f"€ {total_roc:,.2f}")
-    m4.metric("Bank / Savings Interest", f"€ {total_bank:,.2f}")
-    m5.metric("Grand Total",           f"€ {grand_total:,.2f}")
-
-    # ── Section 1: Investment Income ─────────────────────────────────────────
-    st.markdown("#### 📈 Investment Income (Securities)")
-    if df_inv.empty:
-        st.info(f"No dividend or interest income from securities found for {tax_year}.")
+    # Split investment income into taxable and tax-exempt rows.
+    _income_actions = ["Dividend", "Reinvest", "IntInc"]
+    if not df_inv.empty:
+        df_inv_taxable = df_inv[~df_inv["is_tax_exempt"] & df_inv["action"].isin(_income_actions)]
+        df_inv_exempt  = df_inv[ df_inv["is_tax_exempt"] & df_inv["action"].isin(_income_actions)]
+        df_inv_roc     = df_inv[df_inv["action"] == "RtrnCap"]
     else:
-        df_inv_disp = df_inv.copy()
-        df_inv_disp["date"] = df_inv_disp["date"].dt.strftime("%Y-%m-%d")
+        df_inv_taxable = df_inv_exempt = df_inv_roc = df_inv
+
+    total_div     = df_inv_taxable[df_inv_taxable["action"].isin(["Dividend","Reinvest"])]["amount_eur"].sum() if not df_inv_taxable.empty else 0.0
+    total_int_inv = df_inv_taxable[df_inv_taxable["action"] == "IntInc"]["amount_eur"].sum()                   if not df_inv_taxable.empty else 0.0
+    total_exempt  = df_inv_exempt["amount_eur"].sum()                                                           if not df_inv_exempt.empty  else 0.0
+    total_roc     = df_inv_roc["amount_eur"].sum()                                                              if not df_inv_roc.empty     else 0.0
+    total_bank    = df_bank["amount_eur"].sum()                                                                 if not df_bank.empty        else 0.0
+    # Grand total = taxable investment income + bank interest (RtrnCap and tax-exempt excluded).
+    grand_total   = total_div + total_int_inv + total_bank
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Dividends (incl. Reinvested)", f"€ {total_div:,.2f}")
+    m2.metric("Investment Interest",          f"€ {total_int_inv:,.2f}")
+    m3.metric("Bank / Savings Interest",      f"€ {total_bank:,.2f}")
+    m4.metric("Taxable Total",                f"€ {grand_total:,.2f}")
+
+    if total_exempt:
+        st.success(
+            f"✅ **Tax-Exempt Investment Income: € {total_exempt:,.2f}** — "
+            "Income from securities marked **Tax Exempt** (e.g. Hellenic T-Bills at primary market) "
+            "is excluded from the Taxable Total above. "
+            "It is shown in a separate section below."
+        )
+    if total_roc:
+        st.info(
+            f"ℹ️ **Return of Capital (RtrnCap): € {total_roc:,.2f}** — "
+            "This is a return of your own invested capital, **not taxable income**. "
+            "It is shown below for reference only. "
+            "Each RtrnCap event reduces the cost basis of the holding; "
+            "the tax impact appears as a higher capital gain when you eventually sell."
+        )
+
+    # ── Section 1a: Taxable Investment Income ────────────────────────────────
+    st.markdown("#### 📈 Taxable Investment Income (Securities)")
+    if df_inv_taxable.empty:
+        st.info(f"No taxable dividend or interest income from securities found for {tax_year}.")
+    else:
+        df_t_disp = df_inv_taxable.copy()
+        df_t_disp["date"] = df_t_disp["date"].dt.strftime("%Y-%m-%d")
         st.dataframe(
-            df_inv_disp.style.format({"amount_eur": "{:,.2f} €"}),
+            df_t_disp.style.format({"amount_eur": "{:,.2f} €"}),
             hide_index=True,
-            width="stretch",
+            use_container_width=True,
             column_config={
                 "securities_name": "Security",
                 "account_name":    "Account",
                 "date":            "Date",
                 "action":          "Type",
                 "amount_eur":      st.column_config.NumberColumn("Amount (€)", format="%,.2f €"),
+                "is_tax_exempt":   None,
             },
         )
-        copy_df_button(df_inv_disp, key="dl_rpt_inv_income")
+        copy_df_button(df_t_disp, key="dl_rpt_inv_income_taxable")
 
-        df_by_sec = df_inv.groupby(["securities_name", "action"], as_index=False)["amount_eur"].sum()
+        df_by_sec = df_inv_taxable.groupby(["securities_name", "action"], as_index=False)["amount_eur"].sum()
         fig = px.bar(
             df_by_sec, x="securities_name", y="amount_eur", color="action",
-            title="<b>Investment Income by Security</b>",
+            title="<b>Taxable Investment Income by Security</b>",
             template="plotly_dark",
             labels={"amount_eur": "Amount (€)", "securities_name": "Security", "action": "Type"},
             barmode="stack",
         )
         fig.update_layout(margin=dict(l=0, r=0, t=50, b=0))
         pf_plotly_chart(fig)
+
+    # ── Section 1b: Tax-Exempt Investment Income ──────────────────────────────
+    if not df_inv_exempt.empty:
+        st.markdown("#### 🟢 Tax-Exempt Investment Income (reference only — not included in taxable total)")
+        df_e_disp = df_inv_exempt.copy()
+        df_e_disp["date"] = df_e_disp["date"].dt.strftime("%Y-%m-%d")
+        st.dataframe(
+            df_e_disp.style.format({"amount_eur": "{:,.2f} €"}),
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "securities_name": "Security",
+                "account_name":    "Account",
+                "date":            "Date",
+                "action":          "Type",
+                "amount_eur":      st.column_config.NumberColumn("Amount (€)", format="%,.2f €"),
+                "is_tax_exempt":   None,
+            },
+        )
+        copy_df_button(df_e_disp, key="dl_rpt_inv_income_exempt")
+
+    # ── Section 1c: Return of Capital (reference) ────────────────────────────
+    if not df_inv_roc.empty:
+        with st.expander(f"🔄 Return of Capital events — € {total_roc:,.2f} (not taxable income)"):
+            df_r_disp = df_inv_roc.copy()
+            df_r_disp["date"] = df_r_disp["date"].dt.strftime("%Y-%m-%d")
+            st.dataframe(
+                df_r_disp.style.format({"amount_eur": "{:,.2f} €"}),
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "securities_name": "Security",
+                    "account_name":    "Account",
+                    "date":            "Date",
+                    "action":          "Type",
+                    "amount_eur":      st.column_config.NumberColumn("Amount (€)", format="%,.2f €"),
+                    "is_tax_exempt":   None,
+                },
+            )
+            copy_df_button(df_r_disp, key="dl_rpt_inv_roc")
 
     # ── Section 2: Bank & Savings Interest ───────────────────────────────────
     st.markdown("#### 🏦 Bank & Savings Interest")
@@ -4940,6 +5937,177 @@ def render_correlation_matrix(account_ids: tuple = None):
 # ======================================================
 # B16. MONTE CARLO
 # ======================================================
+
+def _xirr(cashflows: list, dates: list) -> float | None:
+    """Compute annualised XIRR given cashflows and matching dates.
+
+    cashflows : list of floats  (negative = money out, positive = money in)
+    dates     : list of datetime-like objects
+    Returns annualised rate or None if no solution found.
+    """
+    from scipy.optimize import brentq
+    import datetime as _dt
+
+    if len(cashflows) < 2:
+        return None
+
+    t0 = min(dates)
+
+    def day_frac(d):
+        delta = d - t0
+        days  = delta.days if hasattr(delta, 'days') else float(delta) / 86400
+        return days / 365.25
+
+    def npv(rate):
+        return sum(cf / (1.0 + rate) ** day_frac(d) for cf, d in zip(cashflows, dates))
+
+    try:
+        return brentq(npv, -0.9999, 100.0, maxiter=1000)
+    except Exception:
+        return None
+
+
+def render_twr_mwr(account_ids: tuple = None):
+    """Render Time-Weighted Return (TWR) and Money-Weighted Return (MWR / XIRR)."""
+    st.subheader("📐 Time-Weighted & Money-Weighted Return")
+    st.caption(
+        "Two complementary measures of portfolio performance:\n\n"
+        "- **TWR (Time-Weighted Return)**: eliminates the effect of *when* you deposited or withdrew money. "
+        "It measures the portfolio manager's performance — directly comparable to an index return.\n"
+        "- **MWR (Money-Weighted Return / XIRR)**: reflects *your actual experience* — the return you "
+        "personally earned given the size and timing of your deposits and withdrawals. "
+        "If you invested heavily before a downturn, MWR will be lower than TWR.\n\n"
+        "TWR is computed from daily price-based portfolio returns. "
+        "MWR uses all recorded Buy/Sell/Dividend/IntInc cash flows plus the current portfolio value."
+    )
+
+    lookback_twr = st.slider(
+        "TWR lookback (calendar days)", min_value=30, max_value=3650, value=756, step=92,
+        key="twr_lookback",
+        help="Number of calendar days of price history to use for TWR. MWR always uses all available history."
+    )
+
+    # ── TWR ───────────────────────────────────────────────────────────────────
+    df_prices  = get_price_returns(lookback_twr, account_ids)
+    df_weights = get_portfolio_weights(account_ids)
+
+    twr = None
+    twr_ann = None
+    n_days = 0
+
+    if df_prices is not None and not df_prices.empty:
+        try:
+            dr = df_prices.ffill(limit=5).pct_change(fill_method=None).dropna(how='all')
+            if not dr.empty:
+                if not df_weights.empty:
+                    wmap  = dict(zip(df_weights["ticker"], df_weights["weight"]))
+                    avail = [c for c in dr.columns if c in wmap]
+                    if avail:
+                        w = pd.Series([wmap[t] for t in avail], index=avail)
+                        w = w / w.sum()
+                        port_ret = dr[avail].fillna(0).dot(w)
+                    else:
+                        port_ret = dr.mean(axis=1)
+                else:
+                    port_ret = dr.mean(axis=1)
+
+                n_days   = len(port_ret)
+                twr      = float((1 + port_ret).prod() - 1)
+                # Annualise: (1 + twr)^(252/n_days) - 1
+                twr_ann  = float((1 + twr) ** (252.0 / n_days) - 1) if n_days > 0 else None
+
+                # Cumulative TWR chart
+                cum = (1 + port_ret).cumprod()
+                df_cum = cum.reset_index()
+                df_cum.columns = ['date', 'value']
+                df_cum['twr_pct'] = (df_cum['value'] - 1) * 100
+
+        except Exception as e:
+            st.warning(f"TWR computation error: {e}")
+
+    # ── MWR / XIRR ───────────────────────────────────────────────────────────
+    mwr    = None
+    cf_count = 0
+    df_cf  = pd.DataFrame()
+
+    try:
+        df_cf = get_investment_cashflows(account_ids)
+        portfolio_value = get_investable_portfolio_value(account_ids)
+
+        if not df_cf.empty and portfolio_value > 0:
+            cf_dates  = list(df_cf['date'])
+            cf_values = list(df_cf['cashflow_eur'].astype(float))
+            cf_count  = len(cf_dates)
+
+            # Add current portfolio value as final positive cash flow (today)
+            cf_dates.append(pd.Timestamp.today())
+            cf_values.append(portfolio_value)
+
+            mwr = _xirr(cf_values, cf_dates)
+    except Exception as e:
+        st.warning(f"MWR computation error: {e}")
+
+    # ── Metrics ───────────────────────────────────────────────────────────────
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric(
+        f"TWR ({lookback_twr}d window)",
+        f"{twr*100:+.2f}%" if twr is not None else "—",
+        help="Cumulative time-weighted return over the selected lookback period."
+    )
+    m2.metric(
+        "TWR (Annualised)",
+        f"{twr_ann*100:+.2f}%" if twr_ann is not None else "—",
+        help="TWR scaled to an annual rate using (1+r)^(252/n_days) − 1."
+    )
+    m3.metric(
+        "MWR / XIRR (All-time)",
+        f"{mwr*100:+.2f}%" if mwr is not None else "—",
+        help=f"Internal rate of return across all {cf_count} recorded cash flows. "
+             "Reflects your personal experience accounting for investment timing."
+    )
+    m4.metric(
+        "Trading Days Used (TWR)",
+        f"{n_days}",
+        help="Number of daily return observations used to compute TWR."
+    )
+
+    # ── Cumulative TWR chart ──────────────────────────────────────────────────
+    if twr is not None and 'df_cum' in locals():
+        fig = px.line(
+            df_cum, x='date', y='twr_pct',
+            title="<b>Cumulative Time-Weighted Return (%)</b>",
+            template="plotly_dark",
+            labels={'twr_pct': 'TWR (%)', 'date': 'Date'},
+        )
+        fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
+        fig.update_layout(margin=dict(l=0, r=0, t=50, b=0))
+        pf_plotly_chart(fig)
+
+    # ── Cash flow table ───────────────────────────────────────────────────────
+    if not df_cf.empty:
+        with st.expander("📋 Cash Flow Detail (MWR inputs)", expanded=False):
+            df_cf_disp = df_cf.copy()
+            df_cf_disp['date'] = df_cf_disp['date'].dt.strftime("%Y-%m-%d")
+            df_cf_disp['cashflow_eur'] = df_cf_disp['cashflow_eur'].astype(float)
+            st.dataframe(
+                df_cf_disp.style.format({"cashflow_eur": "{:+,.2f} €"})
+                    .map(color_negative_red, subset=['cashflow_eur']),
+                hide_index=True, use_container_width=True,
+                column_config={
+                    "date":         "Date",
+                    "action":       "Action",
+                    "cashflow_eur": st.column_config.NumberColumn("Cash Flow (€)", format="%+,.2f €"),
+                },
+            )
+            copy_df_button(df_cf_disp, key="dl_mwr_cashflows")
+
+    st.info(
+        "**Interpretation guide:** "
+        "If TWR > MWR, you tended to invest more capital *before* underperforming periods. "
+        "If MWR > TWR, your larger investments coincided with stronger performance — "
+        "good market timing added personal value beyond the portfolio's intrinsic return."
+    )
+
 
 def render_monte_carlo(account_ids: tuple = None):
     """Render the Monte Carlo simulation."""

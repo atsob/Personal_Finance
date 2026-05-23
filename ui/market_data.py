@@ -160,6 +160,7 @@ def render_market_data():
             df_sec = pd.read_sql("""
                 SELECT Securities_Id, Ticker, Securities_Name, Securities_Type, Currencies_Id,
                        Sector, Industry, Analyst_Rating, Analyst_Target_Price, Is_Active,
+                       COALESCE(Is_Tax_Exempt, FALSE) AS Is_Tax_Exempt,
                        Yahoo_Ticker, TV_Symbol, TV_Exchange, ISIN, Maturity_Date, Coupon_Rate,
                        Face_Value, Coupon_Frequency, embedding,
                        COALESCE(
@@ -196,8 +197,9 @@ def render_market_data():
                 "ticker":               st.column_config.TextColumn("Ticker Symbol",  width="medium", pinned=True),
                 "securities_name":      st.column_config.TextColumn("Security Name",  width="medium", pinned=True),
                 "securities_type":      st.column_config.SelectboxColumn("Type",
-                    options=['Stock','ETF','Bond','CD','Emp. Stock Opt.','FX Spot','Market Index',
-                             'Mutual Fund','Crypto','Option','Commodity','PF_Unit','Other'],
+                    options=['Stock','ETF','Bond','CD','CFD','Closed-End Fund',
+                             'Emp. Stock Opt.','FX Spot','Market Index','Mutual Fund',
+                             'Crypto','Option','Commodity','PF_Unit','Other'],
                     width="small"),
                 "currencies_id":        st.column_config.SelectboxColumn("Currency",
                     options=list(curr_options.keys()),
@@ -207,6 +209,9 @@ def render_market_data():
                 "analyst_rating":       st.column_config.TextColumn("Rating",           width="small"),
                 "analyst_target_price": st.column_config.NumberColumn("Target Price",   width="auto", format="%,.2f"),
                 "is_active":            st.column_config.CheckboxColumn("Is Active",    width="small"),
+                "is_tax_exempt":        st.column_config.CheckboxColumn("Tax Exempt",   width="small",
+                    help="Income (dividends, interest) from this security is exempt from "
+                         "income tax — e.g. Hellenic T-Bills purchased at the primary market."),
                 "yahoo_ticker":         st.column_config.TextColumn("Yahoo Ticker",     width="small"),
                 "tv_symbol":            st.column_config.TextColumn("TV Symbol",        width="small"),
                 "tv_exchange":          st.column_config.TextColumn("TV Exchange",      width="small"),
@@ -438,7 +443,7 @@ def render_market_data():
                     else:
                         st.caption(f"ℹ️ No TradingView symbol defined for {selected_inv_sec['securities_name']}")
 
-                    if st.button("🚀 Download Bond Prices from Solidus", key="mkt_dl_solidus", width="stretch"):
+                    if st.button("🚀 Download Greek Bond Prices from Solidus", key="mkt_dl_solidus", width="stretch"):
                         download_bond_prices_from_solidus()
                         st.rerun()
 

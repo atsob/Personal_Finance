@@ -2055,7 +2055,7 @@ def get_dividend_tracker_data(start_date: str, end_date: str):
             JOIN Securities s ON i.Securities_Id = s.Securities_Id
             JOIN Accounts   a ON i.Accounts_Id   = a.Accounts_Id
             LEFT JOIN fx      ON fx.Currencies_Id_1 = a.Currencies_Id
-            WHERE i.Action IN ('Dividend','IntInc','Reinvest','RtrnCap','MiscExp')
+            WHERE i.Action IN ('Dividend','IntInc','Reinvest','RtrnCap')
               AND i.Date BETWEEN %(start_date)s AND %(end_date)s
             GROUP BY i.Date, i.Securities_Id, s.Securities_Name, s.Securities_Type,
                      a.Accounts_Name, a.Currencies_Id, i.Action
@@ -2920,7 +2920,7 @@ def get_spending_trends(months: int = 24):
                    COALESCE(p.Categories_Name, c.Categories_Name) AS top_category
             FROM Categories c
             LEFT JOIN Categories p ON p.Categories_Id = c.Categories_Id_Parent
-            WHERE c.Categories_Type NOT IN ('Income', 'Transfer', 'Trading', 'Investment')
+            WHERE c.Categories_Type NOT IN ('Income', 'Transfer', 'Trading', 'Investment', 'Interest', 'Dividend')
         )
         SELECT
             DATE_TRUNC('month', t.Date)::date AS month,
@@ -2935,7 +2935,7 @@ def get_spending_trends(months: int = 24):
         JOIN Accounts a     ON a.Accounts_Id      = t.Accounts_Id
         JOIN Currencies cur ON cur.Currencies_Id  = a.Currencies_Id
         LEFT JOIN fx        ON fx.Currencies_Id_1 = a.Currencies_Id
-        WHERE c.Categories_Type NOT IN ('Income', 'Transfer', 'Trading', 'Investment')
+        WHERE c.Categories_Type NOT IN ('Income', 'Transfer', 'Trading', 'Investment', 'Interest', 'Dividend')
           AND t.Transfers_Id IS NULL
           AND t.Date >= DATE_TRUNC('month', CURRENT_DATE) - (%(months)s || ' months')::INTERVAL
           AND t.Date < DATE_TRUNC('month', CURRENT_DATE)
@@ -2963,6 +2963,7 @@ def get_investment_income_report(tax_year: int):
             a.Accounts_Name                                                 AS account_name,
             i.Date                                                          AS date,
             i.Action                                                        AS action,
+            COALESCE(s.Is_Tax_Exempt, FALSE)                               AS is_tax_exempt,
             CASE
                 WHEN i.Transactions_Id IS NOT NULL AND t_cash.Total_Amount IS NOT NULL
                     THEN ABS(t_cash.Total_Amount)
@@ -2983,7 +2984,7 @@ def get_investment_income_report(tax_year: int):
         JOIN Accounts     a      ON a.Accounts_Id        = i.Accounts_Id
         JOIN Currencies   c      ON c.Currencies_Id      = s.Currencies_Id
         LEFT JOIN Transactions t_cash ON t_cash.Transactions_Id = i.Transactions_Id
-        WHERE i.Action IN ('Dividend', 'IntInc', 'RtrnCap')
+        WHERE i.Action IN ('Dividend', 'IntInc', 'Reinvest', 'RtrnCap')
           AND EXTRACT(year FROM i.Date) = %(tax_year)s
           AND i.Total_Amount > 0
         ORDER BY i.Date DESC, s.Securities_Name
@@ -3028,7 +3029,11 @@ def get_bank_interest_report(tax_year: int):
         JOIN Currencies   cur ON cur.Currencies_Id = a.Currencies_Id
         LEFT JOIN Payees  p  ON p.Payees_Id        = t.Payees_Id
         WHERE t.Transfers_Id IS NULL
-          AND c.Categories_Type = 'Interest'
+          AND (
+              c.Categories_Type = 'Interest'
+              OR (c.Categories_Type IN ('Income', 'Dividend')
+                  AND LOWER(c.Categories_Name) LIKE '%%interest%%')
+          )
           AND a.Accounts_Type NOT IN ('Brokerage', 'Pension', 'Other Investment', 'Margin')
           AND EXTRACT(year FROM t.Date) = %(tax_year)s
           AND s.Amount > 0
@@ -3193,7 +3198,10 @@ def get_capital_gains_report(tax_year: int):
                      OR (i.Date - lb.last_buy_date) < 365
                 THEN 'Short-term'
                 ELSE 'Long-term'
-            END                                                             AS holding_type
+            END                                                             AS holding_type,
+            COALESCE(s.Is_Tax_Exempt, FALSE)                               AS is_tax_exempt,
+            i.Instrument_Type                                               AS instrument_type,
+            s.Securities_Type                                               AS securities_type
         FROM Investments i
         JOIN txn_with_eur        itf ON itf.Investments_Id = i.Investments_Id
         JOIN Securities          s   ON s.Securities_Id    = i.Securities_Id
@@ -3483,5 +3491,1071 @@ def delete_benchmark_preset(preset_id: int):
     conn = get_connection()
     with conn.cursor() as cur:
         cur.execute("DELETE FROM Benchmark_Presets WHERE Preset_Id = %s", (preset_id,))
+    conn.commit()
+    conn.close()
+
+
+# ======================================================
+# A9. SPENDING PAYEE DRILL-DOWN
+# ======================================================
+
+@st.cache_data(ttl=300)
+def get_spending_by_payee(category: str, months: int = 24):
+    """Top payees within a given expense category for the last N complete months."""
+    conn = get_connection()
+    df = pd.read_sql("""
+        WITH fx AS (
+            SELECT DISTINCT ON (Currencies_Id_1) Currencies_Id_1, FX_Rate
+            FROM Historical_FX ORDER BY Currencies_Id_1, Date DESC
+        ),
+        root_cat AS (
+            SELECT c.Categories_Id,
+                   COALESCE(p.Categories_Name, c.Categories_Name) AS top_category
+            FROM Categories c
+            LEFT JOIN Categories p ON p.Categories_Id = c.Categories_Id_Parent
+        )
+        SELECT
+            COALESCE(py.Payees_Name, '(Unknown)') AS payee,
+            COUNT(DISTINCT t.Transactions_Id)      AS tx_count,
+            ABS(SUM(s.Amount *
+                CASE WHEN cur.Currencies_ShortName = 'EUR' THEN 1
+                     ELSE COALESCE(fx.FX_Rate, 1) END)) AS amount_eur,
+            MIN(t.Date) AS first_seen,
+            MAX(t.Date) AS last_seen
+        FROM Splits s
+        JOIN Transactions t  ON t.Transactions_Id = s.Transactions_Id
+        JOIN Categories   c  ON c.Categories_Id   = s.Categories_Id
+        JOIN root_cat     rc ON rc.Categories_Id   = s.Categories_Id
+        JOIN Accounts     a  ON a.Accounts_Id      = t.Accounts_Id
+        JOIN Currencies   cur ON cur.Currencies_Id = a.Currencies_Id
+        LEFT JOIN fx          ON fx.Currencies_Id_1 = a.Currencies_Id
+        LEFT JOIN Payees  py  ON py.Payees_Id       = t.Payees_Id
+        WHERE rc.top_category = %(category)s
+          AND c.Categories_Type NOT IN ('Income', 'Transfer', 'Trading', 'Investment')
+          AND t.Transfers_Id IS NULL
+          AND t.Date >= DATE_TRUNC('month', CURRENT_DATE) - (%(months)s || ' months')::INTERVAL
+          AND t.Date < DATE_TRUNC('month', CURRENT_DATE)
+        GROUP BY COALESCE(py.Payees_Name, '(Unknown)')
+        ORDER BY amount_eur DESC
+    """, conn, params={"category": category, "months": months})
+    conn.close()
+    if not df.empty:
+        df['first_seen'] = pd.to_datetime(df['first_seen'])
+        df['last_seen']  = pd.to_datetime(df['last_seen'])
+    return df
+
+
+# ======================================================
+# A10. PAYEE TRANSACTION DETAIL + MUTATIONS
+# ======================================================
+
+def get_payee_transactions(payee: str, category: str, months: int):
+    """Individual transactions for a payee within a top-level category over the lookback window."""
+    conn = get_connection()
+    df = pd.read_sql("""
+        WITH fx AS (
+            SELECT DISTINCT ON (Currencies_Id_1) Currencies_Id_1, FX_Rate
+            FROM Historical_FX ORDER BY Currencies_Id_1, Date DESC
+        ),
+        cat_path AS (
+            SELECT c.Categories_Id,
+                   COALESCE(p.Categories_Name || ' : ', '') || c.Categories_Name AS full_path,
+                   COALESCE(p.Categories_Name, c.Categories_Name) AS top_category,
+                   c.Categories_Type
+            FROM Categories c
+            LEFT JOIN Categories p ON p.Categories_Id = c.Categories_Id_Parent
+        )
+        SELECT
+            s.Splits_Id                                                AS splits_id,
+            t.Transactions_Id                                          AS transaction_id,
+            t.Date                                                     AS date,
+            COALESCE(py.Payees_Name, '(Unknown)')                     AS payee,
+            cp.full_path                                               AS category,
+            s.Categories_Id                                            AS categories_id,
+            ABS(s.Amount * CASE WHEN cur.Currencies_ShortName = 'EUR' THEN 1
+                                 ELSE COALESCE(fx.FX_Rate, 1) END)   AS amount_eur,
+            COALESCE(s.Memo, t.Description)                           AS notes
+        FROM Splits s
+        JOIN Transactions t  ON t.Transactions_Id = s.Transactions_Id
+        JOIN cat_path cp     ON cp.Categories_Id  = s.Categories_Id
+        JOIN Accounts a      ON a.Accounts_Id     = t.Accounts_Id
+        JOIN Currencies cur  ON cur.Currencies_Id = a.Currencies_Id
+        LEFT JOIN fx         ON fx.Currencies_Id_1 = a.Currencies_Id
+        LEFT JOIN Payees py  ON py.Payees_Id       = t.Payees_Id
+        WHERE cp.top_category = %(category)s
+          AND COALESCE(py.Payees_Name, '(Unknown)') = %(payee)s
+          AND t.Transfers_Id IS NULL
+          AND cp.Categories_Type NOT IN ('Income', 'Transfer', 'Trading', 'Investment')
+          AND t.Date >= DATE_TRUNC('month', CURRENT_DATE) - (%(months)s || ' months')::INTERVAL
+          AND t.Date <= CURRENT_DATE
+        ORDER BY t.Date DESC
+    """, conn, params={"payee": payee, "category": category, "months": months})
+    conn.close()
+    if not df.empty:
+        df["date"] = pd.to_datetime(df["date"])
+    return df
+
+
+def update_split(split_id: int, category_id: int, memo: str = None):
+    """Update the category and memo of a split."""
+    conn = get_connection()
+    with conn.cursor() as cur:
+        memo_val = memo.strip() if memo and memo.strip() else None
+        cur.execute(
+            "UPDATE Splits SET Categories_Id = %s, Memo = %s WHERE Splits_Id = %s",
+            (category_id, memo_val, split_id),
+        )
+    conn.commit()
+    conn.close()
+
+
+@st.cache_data(ttl=3600)
+def get_expense_categories():
+    """All expense/non-income categories with IDs and full paths for the category dropdown."""
+    conn = get_connection()
+    df = pd.read_sql("""
+        WITH RECURSIVE cat_path AS (
+            SELECT Categories_Id,
+                   Categories_Name::TEXT AS full_path,
+                   Categories_Type,
+                   Categories_Id_Parent
+            FROM Categories WHERE Categories_Id_Parent IS NULL
+            UNION ALL
+            SELECT c.Categories_Id,
+                   cp.full_path || ' : ' || c.Categories_Name,
+                   c.Categories_Type,
+                   c.Categories_Id_Parent
+            FROM Categories c JOIN cat_path cp ON c.Categories_Id_Parent = cp.Categories_Id
+        )
+        SELECT Categories_Id AS categories_id, full_path, Categories_Type AS categories_type
+        FROM cat_path
+        WHERE Categories_Type NOT IN ('Income', 'Transfer', 'Trading', 'Investment', 'Interest', 'Dividend')
+        ORDER BY full_path
+    """, conn)
+    conn.close()
+    return df
+
+
+# ======================================================
+# A11. CUSTOM REPORT PRESETS
+# ======================================================
+
+def _ensure_custom_reports_table(conn):
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS Custom_Report_Presets (
+                Preset_Id   SERIAL PRIMARY KEY,
+                Preset_Name VARCHAR(100) UNIQUE NOT NULL,
+                Config      JSONB NOT NULL DEFAULT '{}',
+                Created_At  TIMESTAMP DEFAULT NOW(),
+                Updated_At  TIMESTAMP DEFAULT NOW()
+            )
+        """)
+    conn.commit()
+
+
+@st.cache_data(ttl=300)
+def get_custom_report_presets():
+    """Fetch all saved custom report presets ordered by name."""
+    conn = get_connection()
+    _ensure_custom_reports_table(conn)
+    df = pd.read_sql("""
+        SELECT Preset_Id AS preset_id, Preset_Name AS preset_name, Config AS config
+        FROM Custom_Report_Presets ORDER BY Preset_Name
+    """, conn)
+    conn.close()
+    return df
+
+
+def upsert_custom_report_preset(name: str, config: dict):
+    """Insert or update a custom report preset (upsert on name)."""
+    import json
+    conn = get_connection()
+    _ensure_custom_reports_table(conn)
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO Custom_Report_Presets (Preset_Name, Config, Updated_At)
+            VALUES (%s, %s::jsonb, NOW())
+            ON CONFLICT (Preset_Name) DO UPDATE
+                SET Config = EXCLUDED.Config, Updated_At = NOW()
+        """, (name, json.dumps(config)))
+    conn.commit()
+    conn.close()
+
+
+def delete_custom_report_preset(preset_id: int):
+    """Delete a custom report preset by ID."""
+    conn = get_connection()
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM Custom_Report_Presets WHERE Preset_Id = %s", (preset_id,))
+    conn.commit()
+    conn.close()
+
+
+@st.cache_data(ttl=3600)
+def get_all_payees():
+    """All payees for use in the custom report filter."""
+    conn = get_connection()
+    df = pd.read_sql("SELECT Payees_Id AS payees_id, Payees_Name AS payees_name FROM Payees ORDER BY Payees_Name", conn)
+    conn.close()
+    return df
+
+
+def get_custom_report_data(date_from, date_to, grouping: str,
+                           account_ids=None, category_ids=None, payee_names=None):
+    """Execute a custom spending report query and return a flat (period, category, amount) frame."""
+    conn = get_connection()
+
+    if grouping == 'year':
+        period_sql   = "TO_CHAR(t.Date, 'YYYY')"
+        period_order = "DATE_TRUNC('year',    t.Date)"
+    elif grouping == 'quarter':
+        period_sql   = "TO_CHAR(t.Date, 'YYYY') || ' Q' || EXTRACT(QUARTER FROM t.Date)::int::text"
+        period_order = "DATE_TRUNC('quarter', t.Date)"
+    else:
+        period_sql   = "TO_CHAR(t.Date, 'YYYY-MM')"
+        period_order = "DATE_TRUNC('month',   t.Date)"
+
+    # Account filter (IDs are ints — safe for f-string)
+    acct_filter = (
+        f"AND a.Accounts_Id IN ({','.join(str(int(i)) for i in account_ids)})"
+        if account_ids else ""
+    )
+
+    # Category filter — recursive expansion of selected IDs + their descendants
+    if category_ids:
+        id_list = ','.join(str(int(i)) for i in category_ids)
+        expanded_cats_cte = f"""
+        expanded_cats AS (
+            SELECT Categories_Id FROM Categories WHERE Categories_Id IN ({id_list})
+            UNION ALL
+            SELECT c.Categories_Id FROM Categories c
+            JOIN expanded_cats ec ON c.Categories_Id_Parent = ec.Categories_Id
+        ),"""
+        cat_filter = "AND s.Categories_Id IN (SELECT Categories_Id FROM expanded_cats)"
+    else:
+        expanded_cats_cte = ""
+        cat_filter = (
+            "AND cp.Categories_Type NOT IN "
+            "('Income','Transfer','Trading','Investment','Interest','Dividend')"
+        )
+
+    params: dict = {"date_from": date_from, "date_to": date_to}
+    payee_filter = ""
+    if payee_names:
+        payee_filter = (
+            "AND COALESCE(py.Payees_Name, '(No Payee)') = ANY(%(payee_names)s::text[])"
+        )
+        params["payee_names"] = list(payee_names)
+
+    query = f"""
+        WITH RECURSIVE
+        {expanded_cats_cte}
+        fx AS (
+            SELECT DISTINCT ON (Currencies_Id_1) Currencies_Id_1, FX_Rate
+            FROM Historical_FX ORDER BY Currencies_Id_1, Date DESC
+        ),
+        cat_path AS (
+            SELECT Categories_Id, Categories_Name::TEXT AS full_path, Categories_Type
+            FROM Categories WHERE Categories_Id_Parent IS NULL
+            UNION ALL
+            SELECT c.Categories_Id,
+                   cp.full_path || ' : ' || c.Categories_Name,
+                   c.Categories_Type
+            FROM Categories c JOIN cat_path cp ON c.Categories_Id_Parent = cp.Categories_Id
+        )
+        SELECT
+            {period_sql}   AS period,
+            {period_order} AS period_order,
+            cp.full_path   AS category,
+            SUM(s.Amount *
+                CASE WHEN cur.Currencies_ShortName = 'EUR' THEN 1
+                     ELSE COALESCE(fx.FX_Rate, 1) END) AS amount_eur
+        FROM Splits s
+        JOIN Transactions t ON t.Transactions_Id = s.Transactions_Id
+        JOIN cat_path cp    ON cp.Categories_Id  = s.Categories_Id
+        JOIN Accounts a     ON a.Accounts_Id     = t.Accounts_Id
+        JOIN Currencies cur ON cur.Currencies_Id = a.Currencies_Id
+        LEFT JOIN fx        ON fx.Currencies_Id_1 = a.Currencies_Id
+        LEFT JOIN Payees py ON py.Payees_Id       = t.Payees_Id
+        WHERE t.Transfers_Id IS NULL
+          AND t.Date >= %(date_from)s
+          AND t.Date <= %(date_to)s
+          {acct_filter}
+          {cat_filter}
+          {payee_filter}
+        GROUP BY period, period_order, cp.full_path
+        ORDER BY cp.full_path, period_order
+    """
+
+    df = pd.read_sql(query, conn, params=params)
+    conn.close()
+    if not df.empty:
+        # DATE_TRUNC returns timestamptz in PostgreSQL → always parse as UTC
+        df["period_order"] = pd.to_datetime(df["period_order"], utc=True)
+    return df
+
+
+def get_custom_report_drill_down(date_from, date_to, category_path=None,
+                                  account_ids=None, category_ids=None, payee_names=None):
+    """Individual transactions for a category (and subcategories) over a date range.
+
+    category_ids restricts results to the report's own category selection (and their
+    descendants). category_path further narrows to a specific category chosen in the
+    drill-down UI. Both filters are applied together (AND).
+    """
+    conn = get_connection()
+
+    acct_filter = (
+        f"AND a.Accounts_Id IN ({','.join(str(int(i)) for i in account_ids)})"
+        if account_ids else ""
+    )
+
+    params: dict = {"date_from": date_from, "date_to": date_to}
+
+    # Expand report-level category_ids to include all descendants via recursive CTE.
+    if category_ids:
+        id_list = ','.join(str(int(i)) for i in category_ids)
+        expanded_cats_cte = f"""
+        expanded_cats AS (
+            SELECT Categories_Id FROM Categories WHERE Categories_Id IN ({id_list})
+            UNION ALL
+            SELECT c.Categories_Id FROM Categories c
+            JOIN expanded_cats ec ON c.Categories_Id_Parent = ec.Categories_Id
+        ),"""
+        cat_id_filter = "AND s.Categories_Id IN (SELECT Categories_Id FROM expanded_cats)"
+    else:
+        expanded_cats_cte = ""
+        cat_id_filter = (
+            "AND cp.Categories_Type NOT IN "
+            "('Income','Transfer','Trading','Investment','Interest','Dividend')"
+        )
+
+    # Additionally restrict to the drill-down's selected category path (and children).
+    if category_path:
+        cat_path_filter = (
+            "AND (cp.full_path = %(cat_path)s "
+            "OR cp.full_path LIKE %(cat_prefix)s)"
+        )
+        params["cat_path"]   = category_path
+        params["cat_prefix"] = category_path + " : %"
+    else:
+        cat_path_filter = ""
+
+    payee_filter = ""
+    if payee_names:
+        payee_filter = (
+            "AND COALESCE(py.Payees_Name, '(No Payee)') = ANY(%(payee_names)s::text[])"
+        )
+        params["payee_names"] = list(payee_names)
+
+    query = f"""
+        WITH RECURSIVE
+        {expanded_cats_cte}
+        fx AS (
+            SELECT DISTINCT ON (Currencies_Id_1) Currencies_Id_1, FX_Rate
+            FROM Historical_FX ORDER BY Currencies_Id_1, Date DESC
+        ),
+        cat_path AS (
+            SELECT Categories_Id, Categories_Name::TEXT AS full_path, Categories_Type
+            FROM Categories WHERE Categories_Id_Parent IS NULL
+            UNION ALL
+            SELECT c.Categories_Id,
+                   cp.full_path || ' : ' || c.Categories_Name,
+                   c.Categories_Type
+            FROM Categories c JOIN cat_path cp ON c.Categories_Id_Parent = cp.Categories_Id
+        )
+        SELECT
+            s.Splits_Id                                               AS splits_id,
+            t.Transactions_Id                                         AS transaction_id,
+            t.Date                                                    AS date,
+            COALESCE(py.Payees_Name, '(No Payee)')                   AS payee,
+            cp.full_path                                              AS category,
+            s.Categories_Id                                           AS categories_id,
+            s.Amount * CASE WHEN cur.Currencies_ShortName = 'EUR' THEN 1
+                            ELSE COALESCE(fx.FX_Rate, 1) END         AS amount_eur,
+            COALESCE(s.Memo, t.Description)                          AS notes
+        FROM Splits s
+        JOIN Transactions t ON t.Transactions_Id = s.Transactions_Id
+        JOIN cat_path cp    ON cp.Categories_Id  = s.Categories_Id
+        JOIN Accounts a     ON a.Accounts_Id     = t.Accounts_Id
+        JOIN Currencies cur ON cur.Currencies_Id = a.Currencies_Id
+        LEFT JOIN fx        ON fx.Currencies_Id_1 = a.Currencies_Id
+        LEFT JOIN Payees py ON py.Payees_Id       = t.Payees_Id
+        WHERE t.Transfers_Id IS NULL
+          AND t.Date >= %(date_from)s
+          AND t.Date <= %(date_to)s
+          {acct_filter}
+          {cat_id_filter}
+          {cat_path_filter}
+          {payee_filter}
+        ORDER BY t.Date DESC, t.Transactions_Id
+    """
+
+    df = pd.read_sql(query, conn, params=params)
+    conn.close()
+    if not df.empty:
+        df["date"] = pd.to_datetime(df["date"])
+    return df
+
+
+# ======================================================
+# A12. CAPITAL GAINS — ALL TRANSACTIONS (for FIFO)
+# ======================================================
+
+@st.cache_data(ttl=300)
+def get_all_inv_txns_for_gains():
+    """All buy/sell investment transactions with EUR amounts for client-side FIFO computation."""
+    conn = get_connection()
+    df = pd.read_sql("""
+        WITH txn_with_eur AS (
+            SELECT
+                i.Investments_Id,
+                i.Securities_Id,
+                i.Accounts_Id,
+                i.Date,
+                i.Action,
+                i.Instrument_Type,
+                ABS(COALESCE(i.Quantity, 0)) AS quantity,
+                i.Price_Per_Share,
+                CASE
+                    WHEN i.Transactions_Id IS NOT NULL AND t_cash.Total_Amount IS NOT NULL
+                        THEN ABS(t_cash.Total_Amount)
+                    WHEN c.Currencies_ShortName != 'EUR'
+                        THEN ABS(i.Total_Amount) * COALESCE(
+                            (SELECT fx.FX_Rate FROM Historical_FX fx
+                             WHERE fx.Currencies_Id_1 = c.Currencies_Id
+                               AND fx.Date <= i.Date
+                             ORDER BY fx.Date DESC LIMIT 1), 1.0)
+                    ELSE ABS(i.Total_Amount)
+                END AS amount_eur
+            FROM Investments i
+            JOIN Securities s   ON s.Securities_Id = i.Securities_Id
+            JOIN Currencies c   ON c.Currencies_Id = s.Currencies_Id
+            LEFT JOIN Transactions t_cash ON t_cash.Transactions_Id = i.Transactions_Id
+            WHERE i.Action IN ('Buy','Sell','Reinvest','ShrIn','ShrOut','Expire','CashIn','CashOut')
+              AND i.Total_Amount IS NOT NULL
+        )
+        SELECT
+            te.*,
+            s.Securities_Name                  AS securities_name,
+            a.Accounts_Name                    AS account_name,
+            COALESCE(s.Is_Tax_Exempt, FALSE)   AS is_tax_exempt,
+            s.Securities_Type                  AS securities_type
+        FROM txn_with_eur te
+        JOIN Securities s ON s.Securities_Id = te.Securities_Id
+        JOIN Accounts   a ON a.Accounts_Id   = te.Accounts_Id
+        ORDER BY te.Securities_Id, te.Accounts_Id, te.Date, te.Investments_Id
+    """, conn)
+    conn.close()
+    if not df.empty:
+        df['date'] = pd.to_datetime(df['date'])
+    return df
+
+
+# ======================================================
+# A11. PORTFOLIO CASH FLOWS (for MWR / XIRR)
+# ======================================================
+
+@st.cache_data(ttl=300)
+def get_investment_cashflows(account_ids: tuple = None):
+    """All investment cash flows for MWR/XIRR computation.
+
+    Sign convention (investor perspective):
+      Negative = money leaves your pocket into the portfolio  (Buy, CashIn, MiscExp)
+      Positive = money returned to you from the portfolio      (Sell, Dividend, IntInc, RtrnCap, CashOut)
+    Uses the linked EUR cash transaction when available, else historical FX.
+    """
+    conn = get_connection()
+    acct_filter = (
+        f"AND i.Accounts_Id IN ({', '.join(str(int(x)) for x in account_ids)})"
+        if account_ids else ""
+    )
+    df = pd.read_sql(f"""
+        SELECT
+            i.Date   AS date,
+            i.Action AS action,
+            CASE WHEN i.Action IN ('Buy','CashIn','MiscExp') THEN -1 ELSE 1 END
+            * CASE
+                WHEN i.Transactions_Id IS NOT NULL AND t_cash.Total_Amount IS NOT NULL
+                    THEN ABS(t_cash.Total_Amount)
+                WHEN c.Currencies_ShortName != 'EUR'
+                    THEN ABS(i.Total_Amount) * COALESCE(
+                        (SELECT fx.FX_Rate FROM Historical_FX fx
+                         WHERE fx.Currencies_Id_1 = c.Currencies_Id
+                           AND fx.Date <= i.Date
+                         ORDER BY fx.Date DESC LIMIT 1), 1.0)
+                ELSE ABS(i.Total_Amount)
+            END AS cashflow_eur
+        FROM Investments i
+        JOIN Securities s ON s.Securities_Id = i.Securities_Id
+        JOIN Currencies c ON c.Currencies_Id = s.Currencies_Id
+        LEFT JOIN Transactions t_cash ON t_cash.Transactions_Id = i.Transactions_Id
+        WHERE i.Action IN ('Buy','Sell','Dividend','IntInc','RtrnCap','CashIn','CashOut','MiscExp')
+          AND i.Total_Amount IS NOT NULL
+          {acct_filter}
+        ORDER BY i.Date
+    """, conn)
+    conn.close()
+    if not df.empty:
+        df['date'] = pd.to_datetime(df['date'])
+    return df
+
+
+# ======================================================
+# A12. IMPORT PROFILES, PAYEE RULES, RECONCILIATION
+# ======================================================
+
+def _ensure_import_tables(conn):
+    """Create import / reconciliation tables and add Reconciled column if missing."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS Import_Profiles (
+                Profile_Id          SERIAL PRIMARY KEY,
+                Profile_Name        VARCHAR(100) UNIQUE NOT NULL,
+                Bank_Name           VARCHAR(100),
+                File_Type           VARCHAR(10)  DEFAULT 'xlsx',
+                Date_Column         VARCHAR(100),
+                Description_Column  VARCHAR(100),
+                Debit_Column        VARCHAR(100),
+                Credit_Column       VARCHAR(100),
+                Amount_Column       VARCHAR(100),
+                Balance_Column      VARCHAR(100),
+                Date_Format         VARCHAR(30)  DEFAULT '%%d/%%m/%%Y',
+                Encoding            VARCHAR(20)  DEFAULT 'utf-8',
+                Skip_Rows           INTEGER      DEFAULT 0,
+                Decimal_Separator   VARCHAR(1)   DEFAULT '.',
+                Thousands_Separator VARCHAR(1)   DEFAULT ',',
+                Sign_Convention     VARCHAR(20)  DEFAULT 'debit_credit',
+                Invert_Amounts      BOOLEAN      DEFAULT FALSE,
+                Created_At          TIMESTAMP    DEFAULT NOW()
+            )
+        """)
+        # Migrate existing tables that pre-date added columns
+        cur.execute("""
+            ALTER TABLE Import_Profiles
+            ADD COLUMN IF NOT EXISTS Invert_Amounts BOOLEAN DEFAULT FALSE
+        """)
+        cur.execute("""
+            ALTER TABLE Import_Profiles
+            ADD COLUMN IF NOT EXISTS Installment_Column VARCHAR(100) DEFAULT ''
+        """)
+        cur.execute("""
+            ALTER TABLE Import_Profiles
+            ADD COLUMN IF NOT EXISTS Secondary_Date_Column VARCHAR(100) DEFAULT ''
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS Payee_Rules (
+                Rule_Id       SERIAL PRIMARY KEY,
+                Pattern       VARCHAR(500) NOT NULL,
+                Match_Type    VARCHAR(20)  DEFAULT 'contains',
+                Payees_Id     INTEGER REFERENCES Payees(Payees_Id)     ON DELETE SET NULL,
+                Categories_Id INTEGER REFERENCES Categories(Categories_Id) ON DELETE SET NULL,
+                Priority      INTEGER      DEFAULT 0,
+                Created_At    TIMESTAMP    DEFAULT NOW()
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS Reconciliation_Sessions (
+                Session_Id         SERIAL PRIMARY KEY,
+                Accounts_Id        INTEGER REFERENCES Accounts(Accounts_Id) ON DELETE CASCADE,
+                Session_Date       TIMESTAMP    DEFAULT NOW(),
+                Statement_Date     DATE,
+                Statement_Balance  NUMERIC(18,2),
+                App_Balance        NUMERIC(18,2),
+                Difference         NUMERIC(18,2),
+                Transactions_Count INTEGER,
+                Status             VARCHAR(20)  DEFAULT 'completed',
+                Notes              TEXT
+            )
+        """)
+        cur.execute("ALTER TABLE Transactions ADD COLUMN IF NOT EXISTS Reconciled BOOLEAN DEFAULT FALSE")
+        cur.execute("""
+            ALTER TABLE Transactions
+            ADD COLUMN IF NOT EXISTS Reconciliation_Session_Id INTEGER
+                REFERENCES Reconciliation_Sessions(Session_Id) ON DELETE SET NULL
+        """)
+        # Statement-line action history: remembers Reconcile / Import / Skip decisions
+        # so future imports of the same account can pre-fill actions automatically.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS Import_Statement_History (
+                History_Id      SERIAL PRIMARY KEY,
+                Accounts_Id     INTEGER NOT NULL REFERENCES Accounts(Accounts_Id) ON DELETE CASCADE,
+                Description_Key TEXT    NOT NULL,
+                Amount_Sign     SMALLINT NOT NULL DEFAULT 0,
+                Last_Action     VARCHAR(20) NOT NULL,
+                Payees_Id       INTEGER REFERENCES Payees(Payees_Id)         ON DELETE SET NULL,
+                Categories_Id   INTEGER REFERENCES Categories(Categories_Id) ON DELETE SET NULL,
+                Last_Seen       TIMESTAMP DEFAULT NOW(),
+                Seen_Count      INTEGER DEFAULT 1,
+                UNIQUE (Accounts_Id, Description_Key, Amount_Sign)
+            )
+        """)
+    conn.commit()
+
+
+@st.cache_data(ttl=60)
+def get_import_profiles():
+    conn = get_connection()
+    _ensure_import_tables(conn)
+    df = pd.read_sql("""
+        SELECT Profile_Id AS profile_id, Profile_Name AS profile_name,
+               Bank_Name AS bank_name, File_Type AS file_type,
+               Date_Column AS date_column, Description_Column AS description_column,
+               Debit_Column AS debit_column, Credit_Column AS credit_column,
+               Amount_Column AS amount_column, Balance_Column AS balance_column,
+               Date_Format AS date_format, Encoding AS encoding,
+               Skip_Rows AS skip_rows, Decimal_Separator AS decimal_separator,
+               Thousands_Separator AS thousands_separator,
+               Sign_Convention AS sign_convention,
+               COALESCE(Invert_Amounts, FALSE) AS invert_amounts,
+               COALESCE(Installment_Column, '')      AS installment_column,
+               COALESCE(Secondary_Date_Column, '')   AS secondary_date_column
+        FROM Import_Profiles ORDER BY Profile_Name
+    """, conn)
+    conn.close()
+    return df
+
+
+@st.cache_data(ttl=300)
+def get_top_categories_for_payee(payee_id: int, limit: int = 5) -> list:
+    """Return full-path category names ordered by frequency of use with the given payee.
+
+    Returns paths like 'Food : Super Market' so they match the full-path category
+    lists used throughout the UI (Import, Rules, Custom Reports).
+    """
+    conn = get_connection()
+    df = pd.read_sql("""
+        WITH RECURSIVE ch AS (
+            SELECT Categories_Id, Categories_Name::TEXT AS full_path
+            FROM Categories WHERE Categories_Id_Parent IS NULL
+            UNION ALL
+            SELECT c.Categories_Id, ch.full_path || ' : ' || c.Categories_Name
+            FROM Categories c JOIN ch ON c.Categories_Id_Parent = ch.Categories_Id
+        )
+        SELECT ch.full_path AS category_name, COUNT(*) AS usage_count
+        FROM Transactions t
+        JOIN Splits s ON s.Transactions_Id = t.Transactions_Id
+        JOIN ch          ON ch.Categories_Id = s.Categories_Id
+        WHERE t.Payees_Id = %(payee_id)s
+        GROUP BY ch.full_path
+        ORDER BY usage_count DESC
+        LIMIT %(limit)s
+    """, conn, params={"payee_id": int(payee_id), "limit": limit})
+    conn.close()
+    return df["category_name"].tolist() if not df.empty else []
+
+
+def save_import_profile(p: dict):
+    """Upsert an import profile."""
+    conn = get_connection()
+    _ensure_import_tables(conn)
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO Import_Profiles
+                (Profile_Name, Bank_Name, File_Type, Date_Column, Description_Column,
+                 Debit_Column, Credit_Column, Amount_Column, Balance_Column,
+                 Date_Format, Encoding, Skip_Rows, Decimal_Separator,
+                 Thousands_Separator, Sign_Convention, Invert_Amounts,
+                 Installment_Column, Secondary_Date_Column)
+            VALUES (%(profile_name)s,%(bank_name)s,%(file_type)s,%(date_column)s,
+                    %(description_column)s,%(debit_column)s,%(credit_column)s,
+                    %(amount_column)s,%(balance_column)s,%(date_format)s,
+                    %(encoding)s,%(skip_rows)s,%(decimal_separator)s,
+                    %(thousands_separator)s,%(sign_convention)s,%(invert_amounts)s,
+                    %(installment_column)s,%(secondary_date_column)s)
+            ON CONFLICT (Profile_Name) DO UPDATE SET
+                Bank_Name              = EXCLUDED.Bank_Name,
+                File_Type              = EXCLUDED.File_Type,
+                Date_Column            = EXCLUDED.Date_Column,
+                Description_Column     = EXCLUDED.Description_Column,
+                Debit_Column           = EXCLUDED.Debit_Column,
+                Credit_Column          = EXCLUDED.Credit_Column,
+                Amount_Column          = EXCLUDED.Amount_Column,
+                Balance_Column         = EXCLUDED.Balance_Column,
+                Date_Format            = EXCLUDED.Date_Format,
+                Encoding               = EXCLUDED.Encoding,
+                Skip_Rows              = EXCLUDED.Skip_Rows,
+                Decimal_Separator      = EXCLUDED.Decimal_Separator,
+                Thousands_Separator    = EXCLUDED.Thousands_Separator,
+                Sign_Convention        = EXCLUDED.Sign_Convention,
+                Invert_Amounts         = EXCLUDED.Invert_Amounts,
+                Installment_Column     = EXCLUDED.Installment_Column,
+                Secondary_Date_Column  = EXCLUDED.Secondary_Date_Column
+        """, {
+            "profile_name": p.get("profile_name",""),
+            "bank_name":    p.get("bank_name",""),
+            "file_type":    p.get("file_type","xlsx"),
+            "date_column":  p.get("date_column",""),
+            "description_column": p.get("description_column",""),
+            "debit_column": p.get("debit_column",""),
+            "credit_column":p.get("credit_column",""),
+            "amount_column":p.get("amount_column",""),
+            "balance_column":p.get("balance_column",""),
+            "date_format":  p.get("date_format","%d/%m/%Y"),
+            "encoding":     p.get("encoding","utf-8"),
+            "skip_rows":    p.get("skip_rows",0),
+            "decimal_separator":  p.get("decimal_separator","."),
+            "thousands_separator":p.get("thousands_separator",","),
+            "sign_convention":       p.get("sign_convention","debit_credit"),
+            "invert_amounts":        bool(p.get("invert_amounts", False)),
+            "installment_column":    p.get("installment_column", ""),
+            "secondary_date_column": p.get("secondary_date_column", ""),
+        })
+    conn.commit()
+    conn.close()
+    get_import_profiles.clear()
+
+
+def delete_import_profile(profile_id: int):
+    conn = get_connection()
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM Import_Profiles WHERE Profile_Id = %s", (profile_id,))
+    conn.commit()
+    conn.close()
+    get_import_profiles.clear()
+
+
+@st.cache_data(ttl=60)
+def get_payee_rules():
+    conn = get_connection()
+    _ensure_import_tables(conn)
+    df = pd.read_sql("""
+        WITH RECURSIVE ch AS (
+            SELECT Categories_Id, Categories_Name::TEXT AS full_path
+            FROM Categories WHERE Categories_Id_Parent IS NULL
+            UNION ALL
+            SELECT c.Categories_Id, ch.full_path || ' : ' || c.Categories_Name
+            FROM Categories c JOIN ch ON c.Categories_Id_Parent = ch.Categories_Id
+        )
+        SELECT pr.Rule_Id    AS rule_id,
+               pr.Pattern    AS pattern,
+               pr.Match_Type AS match_type,
+               pr.Priority   AS priority,
+               py.Payees_Name AS payee_name,  pr.Payees_Id    AS payees_id,
+               ch.full_path   AS category_name, pr.Categories_Id AS categories_id
+        FROM Payee_Rules pr
+        LEFT JOIN Payees py ON py.Payees_Id     = pr.Payees_Id
+        LEFT JOIN ch        ON ch.Categories_Id = pr.Categories_Id
+        ORDER BY pr.Priority DESC, pr.Rule_Id
+    """, conn)
+    conn.close()
+    return df
+
+
+def save_payee_rule(pattern: str, match_type: str = 'contains',
+                    payees_id: int = None, categories_id: int = None, priority: int = 0):
+    conn = get_connection()
+    _ensure_import_tables(conn)
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO Payee_Rules (Pattern, Match_Type, Payees_Id, Categories_Id, Priority)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (pattern, match_type, payees_id, categories_id, priority))
+    conn.commit()
+    conn.close()
+    get_payee_rules.clear()
+
+
+def update_payee_rule(rule_id: int, pattern: str, match_type: str = 'contains',
+                      payees_id: int = None, categories_id: int = None, priority: int = 0):
+    conn = get_connection()
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE Payee_Rules
+            SET Pattern = %s, Match_Type = %s, Payees_Id = %s,
+                Categories_Id = %s, Priority = %s
+            WHERE Rule_Id = %s
+        """, (pattern, match_type, payees_id, categories_id, priority, int(rule_id)))
+    conn.commit()
+    conn.close()
+    get_payee_rules.clear()
+
+
+def delete_payee_rule(rule_id: int):
+    conn = get_connection()
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM Payee_Rules WHERE Rule_Id = %s", (rule_id,))
+    conn.commit()
+    conn.close()
+    get_payee_rules.clear()
+
+
+def apply_payee_rules(description: str, rules_df: pd.DataFrame):
+    """Match description against rules (ordered by priority desc). Returns (payees_id, categories_id)."""
+    if rules_df.empty or not description:
+        return None, None
+    import re
+    desc_up = description.upper()
+    for _, rule in rules_df.iterrows():
+        pat  = str(rule['pattern']).upper()
+        mtyp = str(rule.get('match_type', 'contains')).lower()
+        hit  = False
+        if   mtyp == 'contains':    hit = pat in desc_up
+        elif mtyp == 'starts_with': hit = desc_up.startswith(pat)
+        elif mtyp == 'exact':       hit = desc_up == pat
+        elif mtyp == 'regex':       hit = bool(re.search(rule['pattern'], description, re.IGNORECASE))
+        if hit:
+            pid = int(rule['payees_id'])    if pd.notna(rule.get('payees_id'))    else None
+            cid = int(rule['categories_id'])if pd.notna(rule.get('categories_id'))else None
+            return pid, cid
+    return None, None
+
+
+def save_reconciliation_session(accounts_id: int, statement_date, statement_balance,
+                                 app_balance: float, tx_count: int, notes: str = None) -> int:
+    """statement_balance may be None when the statement does not include a balance."""
+    conn = get_connection()
+    _ensure_import_tables(conn)
+    difference = (
+        round(float(statement_balance) - float(app_balance), 2)
+        if statement_balance is not None else None
+    )
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO Reconciliation_Sessions
+                (Accounts_Id, Statement_Date, Statement_Balance, App_Balance,
+                 Difference, Transactions_Count, Notes)
+            VALUES (%s,%s,%s,%s,%s,%s,%s)
+            RETURNING Session_Id
+        """, (accounts_id, statement_date, statement_balance, app_balance,
+              difference, tx_count, notes))
+        session_id = cur.fetchone()[0]
+    conn.commit()
+    conn.close()
+    return session_id
+
+
+def get_account_transactions_for_reconciliation(account_id: int, date_from, date_to) -> pd.DataFrame:
+    """Load existing app transactions for a date range, including category for editing."""
+    conn = get_connection()
+    df = pd.read_sql("""
+        WITH cat_paths AS (
+            WITH RECURSIVE ch AS (
+                SELECT Categories_Id,
+                       Categories_Name::TEXT AS full_path
+                FROM   Categories
+                WHERE  Categories_Id_Parent IS NULL
+                UNION ALL
+                SELECT c.Categories_Id,
+                       ch.full_path || ' : ' || c.Categories_Name
+                FROM   Categories c
+                JOIN   ch ON c.Categories_Id_Parent = ch.Categories_Id
+            )
+            SELECT Categories_Id, full_path FROM ch
+        )
+        SELECT
+            t.Transactions_Id                       AS transactions_id,
+            t.Date                                  AS date,
+            COALESCE(py.Payees_Name, '')             AS payee,
+            COALESCE(t.Description, '')              AS description,
+            t.Total_Amount                           AS amount,
+            t.Cleared                                AS cleared,
+            t.Reconciled                             AS reconciled,
+            sp.Categories_Id                         AS categories_id,
+            COALESCE(cp.full_path, '')               AS category
+        FROM Transactions t
+        LEFT JOIN Payees py ON py.Payees_Id = t.Payees_Id
+        LEFT JOIN LATERAL (
+            SELECT Categories_Id
+            FROM   Splits
+            WHERE  Transactions_Id = t.Transactions_Id
+            ORDER  BY Splits_Id
+            LIMIT  1
+        ) sp ON TRUE
+        LEFT JOIN cat_paths cp ON cp.Categories_Id = sp.Categories_Id
+        WHERE t.Accounts_Id = %(aid)s
+          AND t.Date BETWEEN %(d0)s AND %(d1)s
+          AND t.Transfers_Id IS NULL
+        ORDER BY t.Date, t.Transactions_Id
+    """, conn, params={"aid": int(account_id), "d0": date_from, "d1": date_to})
+    conn.close()
+    if not df.empty:
+        df["date"]         = pd.to_datetime(df["date"]).dt.date
+        df["amount"]       = df["amount"].astype(float)
+        df["categories_id"] = pd.to_numeric(df["categories_id"], errors="coerce")
+    return df
+
+
+def update_transaction_description(transaction_id: int, description: str):
+    """Update the Description field of a transaction."""
+    conn = get_connection()
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE Transactions SET Description = %s WHERE Transactions_Id = %s",
+            (description.strip(), int(transaction_id)),
+        )
+    conn.commit()
+    conn.close()
+
+
+def update_transaction_amount(transaction_id: int, amount: float):
+    """Update Total_Amount on the transaction and sync the primary split amount."""
+    conn = get_connection()
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE Transactions SET Total_Amount = %s WHERE Transactions_Id = %s",
+            (float(amount), int(transaction_id)),
+        )
+        # Keep the primary split in sync so split totals stay consistent.
+        cur.execute("""
+            UPDATE Splits SET Amount = %s
+            WHERE  Splits_Id = (
+                SELECT Splits_Id FROM Splits
+                WHERE  Transactions_Id = %s
+                ORDER  BY Splits_Id LIMIT 1
+            )
+        """, (float(amount), int(transaction_id)))
+    conn.commit()
+    conn.close()
+
+
+def update_transaction_category(transaction_id: int,
+                                 categories_id: int | None,
+                                 amount: float):
+    """Upsert the primary split category for a transaction.
+
+    Updates the first existing split (if any), or inserts a new one.
+    Passing ``categories_id=None`` removes the primary split entirely.
+    """
+    conn = get_connection()
+    with conn.cursor() as cur:
+        if categories_id is None:
+            cur.execute(
+                "DELETE FROM Splits WHERE Splits_Id = ("
+                "  SELECT Splits_Id FROM Splits"
+                "  WHERE  Transactions_Id = %s ORDER BY Splits_Id LIMIT 1"
+                ")",
+                (int(transaction_id),),
+            )
+        else:
+            cur.execute("""
+                UPDATE Splits
+                SET    Categories_Id = %s, Amount = %s
+                WHERE  Splits_Id = (
+                    SELECT Splits_Id FROM Splits
+                    WHERE  Transactions_Id = %s
+                    ORDER  BY Splits_Id LIMIT 1
+                )
+            """, (int(categories_id), float(amount), int(transaction_id)))
+            if cur.rowcount == 0:
+                cur.execute(
+                    "INSERT INTO Splits (Transactions_Id, Categories_Id, Amount)"
+                    " VALUES (%s, %s, %s)",
+                    (int(transaction_id), int(categories_id), float(amount)),
+                )
+    conn.commit()
+    conn.close()
+
+
+def mark_transactions_reconciled(tx_ids: list, session_id: int):
+    """Bulk-mark transactions as reconciled and link them to the session."""
+    if not tx_ids:
+        return
+    conn = get_connection()
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE Transactions
+            SET Reconciled = TRUE, Reconciliation_Session_Id = %s
+            WHERE Transactions_Id = ANY(%s)
+        """, (session_id, list(tx_ids)))
+    conn.commit()
+    conn.close()
+    st.cache_data.clear()
+
+
+@st.cache_data(ttl=60)
+def get_reconciliation_history(accounts_id: int):
+    conn = get_connection()
+    _ensure_import_tables(conn)
+    df = pd.read_sql("""
+        SELECT Session_Id AS session_id, Session_Date AS session_date,
+               Statement_Date AS statement_date, Statement_Balance AS statement_balance,
+               App_Balance AS app_balance, Difference AS difference,
+               Transactions_Count AS tx_count, Status AS status, Notes AS notes
+        FROM Reconciliation_Sessions
+        WHERE Accounts_Id = %(aid)s
+        ORDER BY Session_Date DESC
+    """, conn, params={"aid": accounts_id})
+    conn.close()
+    if not df.empty:
+        df['session_date']   = pd.to_datetime(df['session_date'])
+        df['statement_date'] = pd.to_datetime(df['statement_date'])
+    return df
+
+
+def get_statement_history_suggestions(accounts_id: int,
+                                       desc_keys: list[str]) -> dict[str, dict]:
+    """Return a dict of {description_key: {last_action, payees_id, categories_id, seen_count}}
+    for any keys that have been seen before for this account.
+
+    Only keys present in *desc_keys* are returned (avoids a full-table scan).
+    """
+    if not desc_keys:
+        return {}
+    conn = get_connection()
+    df = pd.read_sql("""
+        SELECT Description_Key  AS description_key,
+               Amount_Sign      AS amount_sign,
+               Last_Action      AS last_action,
+               Payees_Id        AS payees_id,
+               Categories_Id    AS categories_id,
+               Seen_Count       AS seen_count
+        FROM Import_Statement_History
+        WHERE Accounts_Id = %(aid)s
+          AND Description_Key = ANY(%(keys)s)
+    """, conn, params={"aid": int(accounts_id), "keys": list(set(desc_keys))})
+    conn.close()
+    result: dict[str, dict] = {}
+    for _, row in df.iterrows():
+        key = str(row['description_key'])
+        pid = int(row['payees_id'])    if pd.notna(row['payees_id'])    else None
+        cid = int(row['categories_id'])if pd.notna(row['categories_id'])else None
+        # If a description appears with both signs, prefer the entry with more history.
+        if key not in result or int(row['seen_count']) > result[key]['seen_count']:
+            result[key] = {
+                'last_action':   str(row['last_action']),
+                'payees_id':     pid,
+                'categories_id': cid,
+                'seen_count':    int(row['seen_count']),
+            }
+    return result
+
+
+def save_statement_history(accounts_id: int, rows: list[dict]):
+    """Upsert statement-line history entries.
+
+    Each entry in *rows* must have:
+        description_key : str   (normalised, lowercase)
+        amount_sign     : int   (-1 or 1)
+        last_action     : str   ('Reconcile' | 'Import' | 'Skip')
+        payees_id       : int | None
+        categories_id   : int | None
+    """
+    if not rows:
+        return
+    conn = get_connection()
+    with conn.cursor() as cur:
+        for entry in rows:
+            cur.execute("""
+                INSERT INTO Import_Statement_History
+                    (Accounts_Id, Description_Key, Amount_Sign,
+                     Last_Action, Payees_Id, Categories_Id)
+                VALUES (%(aid)s, %(dk)s, %(sign)s, %(action)s, %(pid)s, %(cid)s)
+                ON CONFLICT (Accounts_Id, Description_Key, Amount_Sign)
+                DO UPDATE SET
+                    Last_Action   = EXCLUDED.Last_Action,
+                    Payees_Id     = EXCLUDED.Payees_Id,
+                    Categories_Id = EXCLUDED.Categories_Id,
+                    Last_Seen     = NOW(),
+                    Seen_Count    = Import_Statement_History.Seen_Count + 1
+            """, {
+                'aid':    int(accounts_id),
+                'dk':     str(entry['description_key']),
+                'sign':   int(entry['amount_sign']),
+                'action': str(entry['last_action']),
+                'pid':    entry.get('payees_id'),
+                'cid':    entry.get('categories_id'),
+            })
     conn.commit()
     conn.close()

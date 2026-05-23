@@ -224,6 +224,38 @@ def execute_db_save(df_original, df_edited, table_name, id_col, current_acc_id=N
                             (mirror_total, mirror_total_target, int(transfers_id), tx_id),
                         )
 
+                # ── Single-split sync ──────────────────────────────────────────
+                # When a transaction with exactly one split has its total_amount
+                # changed in the register, keep that split's amount in sync so
+                # the "Splits balance correctly" check stays green.
+                for _, row in df_updates.iterrows():
+                    new_total  = _safe_val(row.get('total_amount'))
+                    if new_total is None:
+                        continue
+                    tx_id = int(row[id_col])
+                    orig_rows = df_original[df_original[id_col] == tx_id]
+                    if orig_rows.empty:
+                        continue
+                    orig_total = _safe_val(orig_rows.iloc[0].get('total_amount'))
+                    # Skip if amount is unchanged (use small tolerance for float safety)
+                    try:
+                        if abs(float(new_total) - float(orig_total)) < 0.0001:
+                            continue
+                    except (TypeError, ValueError):
+                        continue
+                    # Only auto-sync when there is exactly one split — multi-split
+                    # transactions need manual adjustment of the individual splits.
+                    cur.execute(
+                        "SELECT splits_id FROM Splits WHERE transactions_id = %s",
+                        (tx_id,)
+                    )
+                    split_ids = [r[0] for r in cur.fetchall()]
+                    if len(split_ids) == 1:
+                        cur.execute(
+                            "UPDATE Splits SET Amount = %s WHERE splits_id = %s",
+                            (float(new_total), split_ids[0])
+                        )
+
         # ── INSERT new rows ───────────────────────────────────────────────────
         if not df_new.empty:
             # Ensure the sequence is at least at max(existing id) to avoid drift

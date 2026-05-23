@@ -16,6 +16,7 @@ from ui.reports import render_reports
 from ui.market_data import render_market_data
 from ui.ai_assistant import render_ai_assistant
 from ui.tools import render_tools
+from ui.bank_import import render_bank_import
 from ui.static_data import render_static_data
 
 @st.cache_resource
@@ -33,6 +34,27 @@ def startup_db_maintenance():
         # Drop Wikipedia columns that were added experimentally and are no longer used.
         cursor.execute("ALTER TABLE Institutions DROP COLUMN IF EXISTS Wikipedia_Title;")
         cursor.execute("ALTER TABLE Institutions DROP COLUMN IF EXISTS Ratings_Updated;")
+        # Tax-exempt flag for securities whose income is not subject to income tax
+        # (e.g. Hellenic T-Bills purchased at primary market).
+        cursor.execute("""
+            ALTER TABLE Securities
+            ADD COLUMN IF NOT EXISTS Is_Tax_Exempt BOOLEAN DEFAULT FALSE
+        """)
+        # Instrument type at transaction level — captures the exact traded instrument
+        # (e.g. CFDOnETF, CFDOnStock, CFDOnIndex, CFDOnFutures, CFDOnFund) independently of the security master.
+        # Useful for Saxo Bank imports where the same underlying security may be traded
+        # as a regular ETF on one occasion and a CFD on another.
+        cursor.execute("""
+            ALTER TABLE Investments
+            ADD COLUMN IF NOT EXISTS Instrument_Type VARCHAR(50)
+        """)
+        # Extend the securities_type ENUM with new instrument categories.
+        # ADD VALUE IF NOT EXISTS is safe to run repeatedly; the label must be
+        # a literal in the DDL statement (parameters are not accepted here).
+        for _new_type in ('CFD', 'Closed-End Fund'):
+            cursor.execute(
+                f"ALTER TYPE securities_type ADD VALUE IF NOT EXISTS '{_new_type}'"
+            )
     conn.commit()
     return True
 
@@ -157,8 +179,9 @@ def main():
             "⏳ Reports",
             "📋 Static Data",
             "🌍 Market Data",
-            "🛠️ Tools",  
-            "🧠 AI Assistant",                      
+            "🏦 Bank Import",
+            "🛠️ Tools",
+            "🧠 AI Assistant",
         ]
     )
     
@@ -180,6 +203,8 @@ def main():
             render_static_data()
         elif menu == "🌍 Market Data":
             render_market_data()
+        elif menu == "🏦 Bank Import":
+            render_bank_import()
         elif menu == "🛠️ Tools":
             render_tools(conn)       
         elif menu == "🧠 AI Assistant":

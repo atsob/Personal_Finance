@@ -6,7 +6,7 @@ from database.connection import get_db
 from database.crud import save_changes, execute_db_save, update_accounts_balances, update_holdings, update_investment_balances, update_pension_balances
 from ui.components import copy_df_button
 
-def _render_transaction_table(acc_id, payee_options, acc_options, cat_options, tab_key):
+def _render_transaction_table(acc_id, payee_options, acc_options, cat_options, tab_key, acc_balance=0.0):
     """Render a filtered transaction register for one account.
 
     Filters reduce the dataset client-side — all matching rows are loaded into
@@ -16,6 +16,9 @@ def _render_transaction_table(acc_id, payee_options, acc_options, cat_options, t
 
     tab_key must be unique per call ('bank' / 'cash') to avoid widget key
     collisions when both tabs exist on the same page.
+
+    acc_balance: the account's current balance, used to anchor the per-row
+    running balance computation (balance after each transaction).
     """
     from datetime import date, timedelta
 
@@ -81,11 +84,42 @@ def _render_transaction_table(acc_id, payee_options, acc_options, cat_options, t
     elif _status == "Uncleared":
         _where += " AND Cleared = FALSE"
 
-    with get_db() as conn:
-        df = pd.read_sql(
-            f"SELECT * FROM Transactions {_where} ORDER BY Date DESC",
-            conn, params=_params
+    # Running balance: window function over ALL account transactions so the
+    # balance is correctly anchored to acc_balance regardless of date filter.
+    # Balance after row i (date-ascending order) =
+    #   acc_balance − (grand_total − cumulative_total_up_to_i)
+    _rb_sql = f"""
+        WITH all_txns AS (
+            SELECT
+                Transactions_Id,
+                SUM(Total_Amount) OVER (
+                    ORDER BY Date ASC, Transactions_Id ASC
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                ) AS cumulative_total,
+                SUM(Total_Amount) OVER () AS grand_total
+            FROM Transactions
+            WHERE Accounts_Id = %s
         )
+        SELECT t.*,
+               (%s::numeric - at.grand_total + at.cumulative_total) AS running_balance
+        FROM Transactions t
+        JOIN all_txns at ON at.Transactions_Id = t.Transactions_Id
+        {_where}
+        ORDER BY t.Date DESC, t.Transactions_Id DESC
+    """
+    # CTE needs acc_id first; balance scalar second; then the _where params.
+    _rb_params = [acc_id, float(acc_balance)] + _params
+    with get_db() as conn:
+        df = pd.read_sql(_rb_sql, conn, params=_rb_params)
+
+    # Place running_balance immediately before reconciliation_session_id so
+    # it appears in a logical position in the grid (after the editable fields,
+    # before the administrative columns at the end of the table).
+    if 'running_balance' in df.columns and 'reconciliation_session_id' in df.columns:
+        _cols = df.columns.tolist()
+        _cols.remove('running_balance')
+        _cols.insert(_cols.index('reconciliation_session_id'), 'running_balance')
+        df = df[_cols]
 
     # ── Stat cards ────────────────────────────────────────────────────────────
     s1, s2 = st.columns(2)
@@ -102,23 +136,28 @@ def _render_transaction_table(acc_id, payee_options, acc_options, cat_options, t
     with _sc1:
         _sort_col = st.selectbox(
             "Sort by",
-            options=["Date", "Payee", "Amount", "Target Account"],
+            options=["Date", "Transaction ID", "Payee", "Amount", "Description", "Target Account"],
             index=0,
             key=f"{_sk}_sort_col",
             label_visibility="collapsed",
         )
     with _sc2:
+        # Transaction ID naturally reads ascending (oldest→newest); every other
+        # column defaults to descending (newest/largest first).
+        _dir_default = 0 if _sort_col == "Transaction ID" else 1
         _sort_dir = st.radio(
             "Direction",
             options=["ASC", "DESC"],
-            index=1,
+            index=_dir_default,
             horizontal=True,
             key=f"{_sk}_sort_dir",
             label_visibility="collapsed",
         )
 
     _sort_asc = _sort_dir == "ASC"
-    if _sort_col == "Payee":
+    if _sort_col == "Transaction ID":
+        df = df.sort_values("transactions_id", ascending=_sort_asc, kind="stable").reset_index(drop=True)
+    elif _sort_col == "Payee":
         df["_sk"] = df["payees_id"].map(payee_options).fillna("")
         df = df.sort_values("_sk", ascending=_sort_asc, kind="stable").drop(columns=["_sk"]).reset_index(drop=True)
     elif _sort_col == "Target Account":
@@ -126,6 +165,8 @@ def _render_transaction_table(acc_id, payee_options, acc_options, cat_options, t
         df = df.sort_values("_sk", ascending=_sort_asc, kind="stable").drop(columns=["_sk"]).reset_index(drop=True)
     elif _sort_col == "Amount":
         df = df.sort_values("total_amount", ascending=_sort_asc, kind="stable").reset_index(drop=True)
+    elif _sort_col == "Description":
+        df = df.sort_values("description", ascending=_sort_asc, kind="stable").reset_index(drop=True)
     else:  # Date
         df = df.sort_values("date", ascending=_sort_asc, kind="stable").reset_index(drop=True)
 
@@ -176,6 +217,10 @@ def _render_transaction_table(acc_id, payee_options, acc_options, cat_options, t
         "total_amount_target": st.column_config.NumberColumn(
             "Target Amount", width="small", format="%,.2f"
         ),
+        "running_balance": st.column_config.NumberColumn(
+            "Balance", width="small", format="%,.2f", disabled=True,
+            help="Account balance after this transaction (anchored to current balance)"
+        ),
         "transfers_id": None,
         "embedding": None,
     }
@@ -194,8 +239,9 @@ def _render_transaction_table(acc_id, payee_options, acc_options, cat_options, t
     copy_df_button(_copy_txns, key=f"dl_reg_txns_{unique_key}")
 
     # ── Change detection & Save ───────────────────────────────────────────────
-    _orig_for_cmp   = df_original.drop(columns=["_selected"])
-    edited_for_save = edited_reg.drop(columns=["_selected"], errors="ignore")
+    # running_balance is a computed column — never saved to the DB.
+    _orig_for_cmp   = df_original.drop(columns=["_selected", "running_balance"], errors="ignore")
+    edited_for_save = edited_reg.drop(columns=["_selected", "running_balance"], errors="ignore")
 
     # Align dtypes before comparing — pd.read_sql and st.data_editor can produce
     # different dtypes for the same values (e.g. int64 vs object for nullable cols),
@@ -332,6 +378,15 @@ def _render_transaction_table(acc_id, payee_options, acc_options, cat_options, t
 
 
     # ── Move transactions ─────────────────────────────────────────────────────
+    def _clear_register_caches():
+        """Evict the data-editor snapshot and legacy caches for this account+tab."""
+        _pfx = f"set_reg_{acc_id}_{tab_key}_"
+        for _k in list(st.session_state.keys()):
+            if _k.startswith(_pfx) and _k.endswith("_orig"):
+                st.session_state.pop(_k, None)
+        for _k in ["df_accs", "register_df"]:
+            st.session_state.pop(_k, None)
+
     st.write("---")
     with st.expander("🔀 Move Transactions to Another Account"):
         st.caption("Tick ☑ on rows above, pick a target account, then click Move.")
@@ -441,8 +496,7 @@ def _render_transaction_table(acc_id, payee_options, acc_options, cat_options, t
                     f"✅ Moved all {len(_ids_to_move)} transaction(s) to "
                     f"**{_target_name}**."
                 )
-                for _k in ["df_accs", "register_df"]:
-                    st.session_state.pop(_k, None)
+                _clear_register_caches()
                 st.rerun()
 
         if _move_btn and _selected_ids:
@@ -479,8 +533,7 @@ def _render_transaction_table(acc_id, payee_options, acc_options, cat_options, t
                 f"✅ Moved {len(_selected_ids)} transaction(s) to "
                 f"**{_move_targets[_move_target_id]}**."
             )
-            for _k in ["df_accs", "register_df"]:
-                st.session_state.pop(_k, None)
+            _clear_register_caches()
             st.rerun()
 
 
@@ -759,6 +812,22 @@ def _render_new_investment_form(acc_id, acc_type, df_accs, df_securities, get_db
             help="Only securities in the account currency are shown.",
         )
 
+        _INSTRUMENT_TYPES = [
+            "", "Stock", "ETF", "Bond", "CFD", "CEF", "CFDOnETF", "CFDOnStock",
+            "CFDOnIndex", "CFDOnFutures", "CFDOnFund", "Fund", "Option", "Other",
+        ]
+        inv_instrument_type = st.selectbox(
+            "Instrument Type (optional)",
+            options=_INSTRUMENT_TYPES,
+            index=0,
+            key=f"inv_instr_{rc}",
+            help=(
+                "Capture the specific traded instrument, independent of the security master. "
+                "Useful when the same underlying is traded as both a regular security and a CFD "
+                "(e.g. Saxo: CFDOnETF, CFDOnStock, CFDOnIndex). Leave blank for standard trades."
+            ),
+        )
+
     with col2:
         inv_qty = st.number_input(
             "Quantity", min_value=0.0, value=0.0, step=0.0001, format="%.8f",
@@ -839,8 +908,9 @@ def _render_new_investment_form(acc_id, acc_type, df_accs, df_securities, get_db
                         """
                         INSERT INTO Investments
                             (Accounts_Id, Securities_Id, Date, Action,
-                             Quantity, Price_Per_Share, Commission, Total_Amount, Description)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                             Quantity, Price_Per_Share, Commission, Total_Amount,
+                             Description, Instrument_Type)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         RETURNING Investments_Id
                         """,
                         (
@@ -853,6 +923,7 @@ def _render_new_investment_form(acc_id, acc_type, df_accs, df_securities, get_db
                             inv_comm  if inv_comm  > 0 else None,
                             calc_total if calc_total != 0 else None,
                             inv_memo or None,
+                            inv_instrument_type or None,
                         ),
                     )
                     investments_id = cur.fetchone()[0]
@@ -1726,14 +1797,14 @@ def render_register():
                             st.error(f"Error saving transfer: {e}")
 
         with t_view:
-            _render_transaction_table(acc_id, payee_options, acc_options, cat_options, "bank")
+            _render_transaction_table(acc_id, payee_options, acc_options, cat_options, "bank", acc_balance)
     else:
         tab_inv_new, tab_inv_view, tab_view_hold, tab_edit_hold, cash_view = st.tabs([
             "➕ New Investment Transaction", "📓 Investment Register",
             "📊 Current Holdings", "✏️ Edit Holdings", "👁️ Cash Transaction Register",
         ])
         with cash_view:
-            _render_transaction_table(acc_id, payee_options, acc_options, cat_options, "cash")
+            _render_transaction_table(acc_id, payee_options, acc_options, cat_options, "cash", acc_balance)
 
         # ── New investment transaction form ────────────────────────────────────
         with tab_inv_new:
@@ -1775,8 +1846,9 @@ def render_register():
             if _inv_orig_key not in st.session_state:
                 _column_order = [
                     "investments_id", "accounts_id", "date", "securities_id",
-                    "action", "quantity", "price_per_share", "commission",
-                    "total_amount", "description", "transactions_id", "embedding",
+                    "action", "instrument_type", "quantity", "price_per_share",
+                    "commission", "total_amount", "description",
+                    "transactions_id", "embedding",
                 ]
                 with get_db() as conn:
                     _df_fresh = pd.read_sql(
@@ -1821,6 +1893,14 @@ def render_register():
                         "Action",
                         options=['Buy', 'Sell', 'Dividend', 'Reinvest', 'Split', 'ShrIn', 'ShrOut', 'IntInc', 'CashIn', 'CashOut', 'Vest', 'Expire', 'Grant', 'Exercise', 'MiscExp', 'RtrnCap'],
                         required=True
+                    ),
+                    "instrument_type": st.column_config.SelectboxColumn(
+                        "Instrument Type",
+                        options=["", "Stock", "ETF", "Bond", "CFD", "CEF", "CFDOnETF", "CFDOnStock",
+                                 "CFDOnIndex", "CFDOnFutures", "CFDOnFund", "Fund", "Option", "Other"],
+                        width="small",
+                        help="Specific traded instrument (e.g. CFDOnETF for Saxo CFD trades). "
+                             "Leave blank for standard transactions.",
                     ),
                     "quantity": st.column_config.NumberColumn(
                         "Quantity",

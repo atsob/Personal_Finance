@@ -266,15 +266,39 @@ def render_static_data():
             })
             copy_df_button(df_cat_preview, key="sd_dl_cat_preview")
 
+            # Show any deferred post-merge message (persisted across the rerun)
+            if 'sd_merge_post_msg' in st.session_state:
+                _pm_level, _pm_text = st.session_state.pop('sd_merge_post_msg')
+                if _pm_level == 'warning':
+                    st.warning(_pm_text)
+                else:
+                    st.success(_pm_text)
+
             if _cat_to_id:
                 _from_cat_name = _from_cat_options.get(_cat_from_id, "")
                 _to_cat_name   = _to_cat_options.get(_cat_to_id, "")
                 _splits_count  = int(df_cats_with_splits.loc[df_cats_with_splits["categories_id"] == _cat_from_id, "splits_count"].iloc[0])
+
+                _also_delete = st.checkbox(
+                    "Also delete source category after merge",
+                    key="sd_merge_cat_also_delete",
+                    help=(
+                        "After all splits are moved, permanently delete the source category. "
+                        "Requires the category to have no sub-categories. "
+                        "Any associated budget entries and payee-default references are cleaned up automatically."
+                    ),
+                )
+
                 if st.button("▶️ Merge Category Splits", type="primary", key="sd_merge_cat_btn"):
                     st.session_state['sd_merge_cat_confirm'] = True
 
                 if st.session_state.get('sd_merge_cat_confirm'):
-                    st.warning(f"⚠️ This will move **{_splits_count} split(s)** from **{_from_cat_name}** → **{_to_cat_name}**. This cannot be undone.")
+                    _delete_note = " and permanently **delete** the source category" if _also_delete else ""
+                    st.warning(
+                        f"⚠️ This will move **{_splits_count} split(s)** from "
+                        f"**{_from_cat_name}** → **{_to_cat_name}**{_delete_note}. "
+                        "This cannot be undone."
+                    )
                     _cn, _cy, _ = st.columns([1, 1, 3])
                     with _cn:
                         if st.button("✖ Cancel", key="sd_merge_cat_cancel", width="stretch"):
@@ -284,11 +308,75 @@ def render_static_data():
                         if st.button("✔ Yes, merge", type="primary", key="sd_merge_cat_yes", width="stretch"):
                             with st.spinner(f"Moving {_splits_count} splits…"):
                                 try:
+                                    # 1. Reassign all splits
                                     with get_db() as conn:
                                         cur = conn.cursor()
-                                        cur.execute("UPDATE Splits SET Categories_Id = %s WHERE Categories_Id = %s", (_cat_to_id, _cat_from_id))
+                                        cur.execute(
+                                            "UPDATE Splits SET Categories_Id = %s WHERE Categories_Id = %s",
+                                            (_cat_to_id, _cat_from_id),
+                                        )
+
                                     st.session_state['sd_merge_cat_confirm'] = False
-                                    st.success(f"✅ {_splits_count} split(s) moved from **{_from_cat_name}** to **{_to_cat_name}** successfully.")
+                                    st.toast(
+                                        f"✅ {_splits_count} split(s) moved from "
+                                        f"**{_from_cat_name}** to **{_to_cat_name}**.",
+                                        icon="✅",
+                                    )
+
+                                    # 2. Optionally delete the source category
+                                    if _also_delete:
+                                        with get_db() as conn:
+                                            cur = conn.cursor()
+                                            cur.execute(
+                                                "SELECT COUNT(*) FROM Categories WHERE Categories_Id_Parent = %s",
+                                                (_cat_from_id,),
+                                            )
+                                            _child_count = cur.fetchone()[0]
+
+                                        if _child_count > 0:
+                                            st.session_state['sd_merge_post_msg'] = (
+                                                'warning',
+                                                f"⚠️ **{_from_cat_name}** was NOT deleted: "
+                                                f"it has {_child_count} sub-categor"
+                                                f"{'y' if _child_count == 1 else 'ies'}. "
+                                                "Delete or reassign them first, then remove this category manually.",
+                                            )
+                                        else:
+                                            # Remove budget entries (best-effort — table may not exist yet)
+                                            try:
+                                                with get_db() as conn:
+                                                    cur = conn.cursor()
+                                                    cur.execute(
+                                                        "DELETE FROM Annual_Budgets WHERE Categories_Id = %s",
+                                                        (_cat_from_id,),
+                                                    )
+                                            except Exception:
+                                                pass
+
+                                            # Clear payee default-category reference, then delete
+                                            try:
+                                                with get_db() as conn:
+                                                    cur = conn.cursor()
+                                                    cur.execute(
+                                                        "UPDATE Payees SET categories_id_default = NULL "
+                                                        "WHERE categories_id_default = %s",
+                                                        (_cat_from_id,),
+                                                    )
+                                                    cur.execute(
+                                                        "DELETE FROM Categories WHERE Categories_Id = %s",
+                                                        (_cat_from_id,),
+                                                    )
+                                                st.toast(
+                                                    f"🗑️ Category '{_from_cat_name}' deleted.",
+                                                    icon="🗑️",
+                                                )
+                                            except Exception as _del_err:
+                                                st.session_state['sd_merge_post_msg'] = (
+                                                    'warning',
+                                                    f"⚠️ Splits merged but could not delete "
+                                                    f"**{_from_cat_name}**: {_del_err}",
+                                                )
+
                                     st.rerun()
                                 except Exception as e:
                                     st.error(f"❌ Error during merge: {e}")
