@@ -131,7 +131,7 @@ def render_custom_reports():
     )
     preset_name_input = pp2.text_input(
         "Name", value="" if sel_preset == "(New Report)" else sel_preset,
-        placeholder="Preset name to save as…", key="cr_preset_name",
+        placeholder="Preset name to save as…", key=f"cr_preset_name_{sel_preset}",
         label_visibility="collapsed",
     )
     save_btn = pp3.button("\U0001f4be Save", key="cr_save_btn", use_container_width=True)
@@ -165,6 +165,10 @@ def render_custom_reports():
     )
     grouping = grouping_str.lower()
 
+    # initialised here so the save block can always reference them
+    date_from_is_today = False
+    date_to_is_today   = False
+
     if date_range_type == "Year to Date":
         date_from = datetime(now.year, 1, 1).date()
         date_to   = now.date()
@@ -181,16 +185,46 @@ def render_custom_reports():
         date_from = datetime(2000, 1, 1).date()
         date_to   = now.date()
     else:  # Custom
-        saved_from = loaded_cfg.get("date_from")
-        saved_to   = loaded_cfg.get("date_to")
+        saved_from          = loaded_cfg.get("date_from")
+        saved_to            = loaded_cfg.get("date_to")
+        date_from_is_today  = loaded_cfg.get("date_from_is_today", False)
+        date_to_is_today    = loaded_cfg.get("date_to_is_today",   False)
         def_from = (datetime.strptime(saved_from, "%Y-%m-%d").date()
                     if saved_from else datetime(now.year, 1, 1).date())
         def_to   = (datetime.strptime(saved_to, "%Y-%m-%d").date()
                     if saved_to else now.date())
-        date_from = dr3.date_input("From", value=def_from, key=f"cr_date_from_{sel_preset}",
-                                   min_value=datetime(2000, 1, 1).date(), max_value=now.date())
-        date_to   = dr4.date_input("To",   value=def_to,  key=f"cr_date_to_{sel_preset}",
-                                   min_value=datetime(2000, 1, 1).date(), max_value=now.date())
+
+        with dr3:
+            date_from_is_today = st.checkbox(
+                "Use today", value=date_from_is_today,
+                key=f"cr_from_today_{sel_preset}",
+                help="When saved, this preset will always use today's date as the From date.",
+            )
+            if date_from_is_today:
+                date_from = now.date()
+                st.date_input("From", value=date_from, disabled=True,
+                              key=f"cr_date_from_dis_{sel_preset}")
+            else:
+                date_from = st.date_input(
+                    "From", value=def_from, key=f"cr_date_from_{sel_preset}",
+                    min_value=datetime(2000, 1, 1).date(), max_value=now.date(),
+                )
+
+        with dr4:
+            date_to_is_today = st.checkbox(
+                "Use today", value=date_to_is_today,
+                key=f"cr_to_today_{sel_preset}",
+                help="When saved, this preset will always use today's date as the To date.",
+            )
+            if date_to_is_today:
+                date_to = now.date()
+                st.date_input("To", value=date_to, disabled=True,
+                              key=f"cr_date_to_dis_{sel_preset}")
+            else:
+                date_to = st.date_input(
+                    "To", value=def_to, key=f"cr_date_to_{sel_preset}",
+                    min_value=datetime(2000, 1, 1).date(), max_value=now.date(),
+                )
 
     # ── Account filter ────────────────────────────────────────────────────────
     with st.expander("\U0001f3e6 Accounts", expanded=bool(loaded_cfg.get("account_ids"))):
@@ -263,13 +297,15 @@ def render_custom_reports():
             st.warning("Enter a preset name before saving.")
         else:
             cfg = {
-                "date_range_type": date_range_type,
-                "date_from":       str(date_from),
-                "date_to":         str(date_to),
-                "column_grouping": grouping,
-                "account_ids":     account_ids,
-                "category_ids":    category_ids,
-                "payee_names":     payee_names,
+                "date_range_type":    date_range_type,
+                "date_from":          str(date_from),
+                "date_to":            str(date_to),
+                "date_from_is_today": date_from_is_today,
+                "date_to_is_today":   date_to_is_today,
+                "column_grouping":    grouping,
+                "account_ids":        account_ids,
+                "category_ids":       category_ids,
+                "payee_names":        payee_names,
             }
             upsert_custom_report_preset(pname, cfg)
             get_custom_report_presets.clear()
@@ -541,11 +577,6 @@ def render_reports():
             key="inv_date"
         )
         st.session_state.inv_date_val = min_inv_date
-
-        if st.sidebar.button("🔄 Refresh Positions"):
-            get_hist_inv_positions_data.clear()
-            st.cache_data.clear()
-            st.rerun()
 
         df_raw = get_hist_inv_positions_data(min_inv_date)
 
@@ -2306,7 +2337,7 @@ def render_income_expense_reports():
         # Προεπιλεγμένοι τύποι (αυτοί που είχες στον κώδικα)
         default_inv = ['Brokerage', 'Other Investment', 'Margin']
 
-        col_a, col_b = st.columns(2)
+        col_a, col_b, col_c = st.columns(3)
 
         with col_a:      
             with st.expander("🏦 Cash Account Types", expanded=False):
@@ -2333,13 +2364,14 @@ def render_income_expense_reports():
                     key="ie_inv_account_types_filter"
                 )
 
+        with col_c:
         # Function για το reset
-        def reset_account_filters():
-            st.session_state["ie_cash_account_types_filter"] = default_cash
-            st.session_state["ie_inv_account_types_filter"] = default_inv
+            def reset_account_filters():
+                st.session_state["ie_cash_account_types_filter"] = default_cash
+                st.session_state["ie_inv_account_types_filter"] = default_inv
 
-        # Τοποθέτηση του κουμπιού (π.χ. δίπλα από τους επιλογείς)
-        st.button("🔄 Reset to Defaults", on_click=reset_account_filters)
+            # Τοποθέτηση του κουμπιού (π.χ. δίπλα από τους επιλογείς)
+            st.button("🔄 Reset to Defaults", on_click=reset_account_filters)
 
 
         # Έλεγχος αν κάποια λίστα είναι άδεια για να αποφύγεις σφάλματα στην SQL
@@ -2352,11 +2384,6 @@ def render_income_expense_reports():
             if df.empty:
                 st.warning("No transactions found for the selected period.")
                 return
-
-            if st.button("🔄 Refresh Data", key="refresh_ie_btn"):
-                get_income_expense_data.clear()
-                st.cache_data.clear()
-                st.rerun()
 
             # Handle datetime conversion safely
             try:
@@ -2392,7 +2419,7 @@ def render_income_expense_reports():
                 return
 
             # Display summary metrics
-            st.markdown("### 📈 Summary")
+            #st.markdown("### 📈 Summary")
             
             # total_bank_income = df[df['source_type'] == 'Bank'][df['categories_type'] == 'Income']['split_amount'].sum() if 'Bank' in df['source_type'].values and 'Income' in df['categories_type'].values else 0
             # Πιο σωστή και αποδοτική σύνταξη με χρήση του .loc
@@ -2572,8 +2599,9 @@ def render_income_expense_reports():
             
             # Tabs for different views
             if period_columns:
-                tab_chart, tab_table, tab_trend, tab_drilldown = st.tabs([
-                    "📊 Chart", "📋 Detailed Table", "📈 Trend Analysis", "🔍 Drill Down"
+                tab_chart, tab_table, tab_trend, tab_top_cats, tab_top_payees = st.tabs([
+                    "📊 Chart", "📋 Detailed Table", "📈 Trend Analysis",
+                    "🏷️ Top Categories", "👥 Top Payees",
                 ])
                 
                 with tab_chart:
@@ -2771,53 +2799,353 @@ def render_income_expense_reports():
                                 fig_line.update_layout(xaxis_tickangle=-45, hovermode='x unified', height=500)
                                 pf_plotly_chart(fig_line)
                 
-                with tab_drilldown:
-                    st.subheader("Detailed Transaction Drill Down")
-                    
+                # ── TOP CATEGORIES ─────────────────────────────────────────────
+                with tab_top_cats:
+                    st.subheader("🏷️ Top Categories")
+
+                    _tc_n = st.slider("Show Top N Categories", 5, 30, 15, key="ie_tc_n")
+
+                    # Build per-category summary from raw df
+                    cat_summary = (
+                        df.groupby(['category_full_path', 'categories_type'])
+                        .agg(total=('split_amount', 'sum'), count=('split_amount', 'count'))
+                        .reset_index()
+                    )
+                    cat_summary['abs_total'] = cat_summary['total'].abs()
+                    cat_summary['avg_per_tx'] = (cat_summary['total'] / cat_summary['count']).round(2)
+
+                    INCOME_TYPES = ['Income', 'Dividend', 'Interest']
+                    EXPENSE_TYPES = ['Expense', 'Tax']
+
+                    income_top = (
+                        cat_summary[cat_summary['categories_type'].isin(INCOME_TYPES)]
+                        .nlargest(_tc_n, 'abs_total')
+                        .sort_values('total', ascending=True)
+                    )
+                    expense_top = (
+                        cat_summary[cat_summary['categories_type'].isin(EXPENSE_TYPES)]
+                        .nlargest(_tc_n, 'abs_total')
+                        .sort_values('abs_total', ascending=True)
+                    )
+
+                    col_inc_c, col_exp_c = st.columns(2)
+
+                    with col_inc_c:
+                        st.markdown("#### 💚 Top Income Categories")
+                        if not income_top.empty:
+                            fig_tc_inc = go.Figure(go.Bar(
+                                x=income_top['total'],
+                                y=income_top['category_full_path'],
+                                orientation='h',
+                                marker_color='#27AE60',
+                                text=income_top['total'].apply(lambda v: f"€ {v:,.2f}"),
+                                textposition='auto',
+                                hovertemplate='%{y}<br>€ %{x:,.2f}<extra></extra>',
+                            ))
+                            fig_tc_inc.update_layout(
+                                height=max(300, len(income_top) * 32),
+                                margin=dict(l=0, r=20, t=0, b=0),
+                                xaxis_title='Amount (€)',
+                            )
+                            pf_plotly_chart(fig_tc_inc)
+                        else:
+                            st.info("No income categories found.")
+
+                    with col_exp_c:
+                        st.markdown("#### 🔴 Top Expense Categories")
+                        if not expense_top.empty:
+                            fig_tc_exp = go.Figure(go.Bar(
+                                x=expense_top['abs_total'],
+                                y=expense_top['category_full_path'],
+                                orientation='h',
+                                marker_color='#E74C3C',
+                                text=expense_top['total'].apply(lambda v: f"€ {v:,.2f}"),
+                                textposition='auto',
+                                hovertemplate='%{y}<br>€ %{x:,.2f}<extra></extra>',
+                            ))
+                            fig_tc_exp.update_layout(
+                                height=max(300, len(expense_top) * 32),
+                                margin=dict(l=0, r=20, t=0, b=0),
+                                xaxis_title='Amount (€)',
+                            )
+                            pf_plotly_chart(fig_tc_exp)
+                        else:
+                            st.info("No expense categories found.")
+
+                    st.divider()
+                    st.markdown("#### 📋 Category Detail")
+
+                    # Period breakdown table (reuse aggregated_df) enriched with tx count
+                    cat_counts = (
+                        df.groupby('category_full_path')['split_amount']
+                        .count()
+                        .reset_index()
+                        .rename(columns={'split_amount': 'tx_count'})
+                    )
+                    detail_cats = (
+                        aggregated_df
+                        .merge(cat_counts, on='category_full_path', how='left')
+                        .assign(abs_total=lambda d: d['Total'].abs())
+                        .sort_values('abs_total', ascending=False)
+                        .drop(columns=['abs_total'])
+                        .reset_index(drop=True)
+                    )
+                    fmt_cats = {col: "{:,.2f} €" for col in period_columns + ['Total']}
+                    st.dataframe(
+                        detail_cats.style.format(fmt_cats),
+                        width='stretch', hide_index=True,
+                        column_config={
+                            "category_full_path": st.column_config.TextColumn("Category", pinned=True),
+                            "categories_type":    "Type",
+                            "tx_count":           st.column_config.NumberColumn("# Txs", format="%d"),
+                            "Total":              st.column_config.NumberColumn("Total (€)", format="%,.2f"),
+                        },
+                    )
+                    copy_df_button(detail_cats, key="dl_rpt_ie_top_cats")
+
+                    st.divider()
+                    st.markdown("#### 🔍 Categories Drill Down")
+
                     all_cats = sorted(df['category_full_path'].unique())
                     selected_drill_cat = st.selectbox(
-                        "Select Category to Drill Down",
+                        "Select Category:",
                         ["All Categories"] + all_cats,
-                        key="ie_drill_category"
+                        key="ie_drill_category",
                     )
-                    
-                    if selected_drill_cat != "All Categories":
-                        drill_df = df[df['category_full_path'] == selected_drill_cat].copy()
-                    else:
-                        drill_df = df.copy()
-                    
+
+                    drill_df = (
+                        df[df['category_full_path'] == selected_drill_cat].copy()
+                        if selected_drill_cat != "All Categories"
+                        else df.copy()
+                    )
+
                     if not drill_df.empty:
-                    #    display_cols = ['date', 'description', 'payees_name', 'category_full_path', 'split_amount', 'accounts_name', 'source_type']
-                        # In the drill-down tab, add original currency column
-                        display_cols = ['date', 'description', 'payees_name', 'category_full_path', 
-                                        'split_amount', 'split_amount_original', 'original_currency', 
-                                        'accounts_name', 'source_type']
+                        if selected_drill_cat != "All Categories":
+                            d_total = drill_df['split_amount'].sum()
+                            d_count = len(drill_df)
+                            _dm1, _dm2 = st.columns(2)
+                            with _dm1:
+                                custom_metric("Total", f"€ {d_total:,.2f}", pnl_value=d_total)
+                            with _dm2:
+                                st.metric("Transactions", f"{d_count:,}")
+
+                        display_cols = [
+                            'date', 'description', 'payees_name', 'category_full_path',
+                            'split_amount', 'split_amount_original', 'original_currency',
+                            'accounts_name', 'source_type',
+                        ]
                         display_cols = [c for c in display_cols if c in drill_df.columns]
-                        
                         display_drill_df = drill_df[display_cols].sort_values('date', ascending=False).copy()
                         if 'date' in display_drill_df.columns:
                             display_drill_df['date'] = display_drill_df['date'].dt.strftime('%Y-%m-%d')
-                        
+
                         st.dataframe(
                             display_drill_df,
                             width='stretch',
                             hide_index=True,
                             column_config={
-                                'date': 'Date',
-                                'description': 'Description',
-                                'payees_name': 'Payee',
-                                'category_full_path': 'Category',
-                                'split_amount': st.column_config.NumberColumn('Amount', format="%.2f €"),
+                                'date':                  'Date',
+                                'description':           'Description',
+                                'payees_name':           'Payee',
+                                'category_full_path':    'Category',
+                                'split_amount':          st.column_config.NumberColumn('Amount (€)',       format="%.2f"),
                                 'split_amount_original': st.column_config.NumberColumn('Original Amount', format="%.2f"),
-                                'original_currency': 'Currency',
-                                'accounts_name': 'Account'
-                            }
+                                'original_currency':     'Currency',
+                                'accounts_name':         'Account',
+                                'source_type':           'Source',
+                            },
                         )
                         copy_df_button(display_drill_df, key="dl_rpt_ie_drilldown")
 
-                        if selected_drill_cat != "All Categories":
-                            total = drill_df['split_amount'].sum()
-                            st.info(f"**Total for {selected_drill_cat}:** € {total:,.2f}")
+                # ── TOP PAYEES ──────────────────────────────────────────────────
+                with tab_top_payees:
+                    st.subheader("👥 Top Payees")
+
+                    _tp_n = st.slider("Show Top N Payees", 5, 30, 15, key="ie_tp_n")
+
+                    df_with_payees = df[df['payees_name'].notna()].copy()
+
+                    if df_with_payees.empty:
+                        st.info("No payee data available for the selected period and filters.")
+                    else:
+                        payee_summary = (
+                            df_with_payees
+                            .groupby('payees_name')
+                            .agg(
+                                total=('split_amount', 'sum'),
+                                count=('split_amount', 'count'),
+                                top_category=(
+                                    'category_full_path',
+                                    lambda x: x.value_counts().index[0] if len(x) > 0 else '—'
+                                ),
+                            )
+                            .reset_index()
+                        )
+                        payee_summary['abs_total'] = payee_summary['total'].abs()
+                        payee_summary['avg_per_tx'] = (payee_summary['total'] / payee_summary['count']).round(2)
+
+                        income_payees = (
+                            payee_summary[payee_summary['total'] > 0]
+                            .nlargest(_tp_n, 'abs_total')
+                            .sort_values('total', ascending=True)
+                        )
+                        expense_payees = (
+                            payee_summary[payee_summary['total'] < 0]
+                            .nlargest(_tp_n, 'abs_total')
+                            .sort_values('abs_total', ascending=True)
+                        )
+
+                        col_inc_p, col_exp_p = st.columns(2)
+
+                        with col_inc_p:
+                            st.markdown("#### 💚 Top Income Payees")
+                            if not income_payees.empty:
+                                fig_tp_inc = go.Figure(go.Bar(
+                                    x=income_payees['total'],
+                                    y=income_payees['payees_name'],
+                                    orientation='h',
+                                    marker_color='#27AE60',
+                                    text=income_payees['total'].apply(lambda v: f"€ {v:,.2f}"),
+                                    textposition='auto',
+                                    hovertemplate='%{y}<br>€ %{x:,.2f}<extra></extra>',
+                                ))
+                                fig_tp_inc.update_layout(
+                                    height=max(300, len(income_payees) * 32),
+                                    margin=dict(l=0, r=20, t=0, b=0),
+                                    xaxis_title='Amount (€)',
+                                )
+                                pf_plotly_chart(fig_tp_inc)
+                            else:
+                                st.info("No income payees found.")
+
+                        with col_exp_p:
+                            st.markdown("#### 🔴 Top Expense Payees")
+                            if not expense_payees.empty:
+                                fig_tp_exp = go.Figure(go.Bar(
+                                    x=expense_payees['abs_total'],
+                                    y=expense_payees['payees_name'],
+                                    orientation='h',
+                                    marker_color='#E74C3C',
+                                    text=expense_payees['total'].apply(lambda v: f"€ {v:,.2f}"),
+                                    textposition='auto',
+                                    hovertemplate='%{y}<br>€ %{x:,.2f}<extra></extra>',
+                                ))
+                                fig_tp_exp.update_layout(
+                                    height=max(300, len(expense_payees) * 32),
+                                    margin=dict(l=0, r=20, t=0, b=0),
+                                    xaxis_title='Amount (€)',
+                                )
+                                pf_plotly_chart(fig_tp_exp)
+                            else:
+                                st.info("No expense payees found.")
+
+                        st.divider()
+                        st.markdown("#### 📋 Payee Summary")
+
+                        payee_detail = (
+                            payee_summary
+                            .sort_values('abs_total', ascending=False)
+                            .drop(columns=['abs_total'])
+                            .reset_index(drop=True)
+                        )
+                        st.dataframe(
+                            payee_detail.style.format({
+                                'total':      "{:,.2f} €",
+                                'avg_per_tx': "{:,.2f} €",
+                            }),
+                            width='stretch', hide_index=True,
+                            column_config={
+                                "payees_name":  st.column_config.TextColumn("Payee", pinned=True),
+                                "total":        st.column_config.NumberColumn("Total (€)",       format="%,.2f"),
+                                "count":        st.column_config.NumberColumn("# Txs",           format="%d"),
+                                "avg_per_tx":   st.column_config.NumberColumn("Avg / Tx (€)",    format="%,.2f"),
+                                "top_category": st.column_config.TextColumn("Top Category"),
+                            },
+                        )
+                        copy_df_button(payee_detail, key="dl_rpt_ie_top_payees")
+
+                        st.divider()
+                        st.markdown("#### 🔍 Payee Drill Down")
+
+                        all_payee_names = sorted(df_with_payees['payees_name'].unique())
+                        selected_payee = st.selectbox(
+                            "Select Payee:",
+                            ["All Payees"] + all_payee_names,
+                            key="ie_payee_drill",
+                        )
+
+                        payee_drill_df = (
+                            df_with_payees[df_with_payees['payees_name'] == selected_payee].copy()
+                            if selected_payee != "All Payees"
+                            else df_with_payees.copy()
+                        )
+
+                        if not payee_drill_df.empty:
+                            p_total = payee_drill_df['split_amount'].sum()
+                            p_count = len(payee_drill_df)
+                            _pm1, _pm2 = st.columns(2)
+                            with _pm1:
+                                custom_metric("Total", f"€ {p_total:,.2f}", pnl_value=p_total)
+                            with _pm2:
+                                st.metric("Transactions", f"{p_count:,}")
+
+                            # Category breakdown for the selected payee
+                            if selected_payee != "All Payees":
+                                cat_bk = (
+                                    payee_drill_df
+                                    .groupby('category_full_path')['split_amount']
+                                    .agg(['sum', 'count'])
+                                    .reset_index()
+                                    .rename(columns={'sum': 'total', 'count': 'cnt'})
+                                    .sort_values('total')
+                                )
+                                if not cat_bk.empty:
+                                    st.markdown("**Category Breakdown**")
+                                    fig_bk = go.Figure(go.Bar(
+                                        x=cat_bk['total'],
+                                        y=cat_bk['category_full_path'],
+                                        orientation='h',
+                                        marker_color=[
+                                            '#27AE60' if v >= 0 else '#E74C3C'
+                                            for v in cat_bk['total']
+                                        ],
+                                        text=cat_bk['total'].apply(lambda v: f"€ {v:,.2f}"),
+                                        textposition='auto',
+                                        hovertemplate='%{y}<br>€ %{x:,.2f}<extra></extra>',
+                                    ))
+                                    fig_bk.update_layout(
+                                        height=max(200, len(cat_bk) * 32),
+                                        margin=dict(l=0, r=20, t=0, b=0),
+                                        xaxis_title='Amount (€)',
+                                    )
+                                    pf_plotly_chart(fig_bk)
+
+                            # Transaction list
+                            drill_cols = [
+                                'date', 'description', 'payees_name', 'category_full_path',
+                                'split_amount', 'split_amount_original', 'original_currency',
+                                'accounts_name',
+                            ]
+                            drill_cols = [c for c in drill_cols if c in payee_drill_df.columns]
+                            drill_disp = payee_drill_df[drill_cols].sort_values('date', ascending=False).copy()
+                            if 'date' in drill_disp.columns:
+                                drill_disp['date'] = drill_disp['date'].dt.strftime('%Y-%m-%d')
+                            st.dataframe(
+                                drill_disp,
+                                width='stretch', hide_index=True,
+                                column_config={
+                                    'date':                   'Date',
+                                    'description':            'Description',
+                                    'payees_name':            'Payee',
+                                    'category_full_path':     'Category',
+                                    'split_amount':           st.column_config.NumberColumn('Amount (€)',        format="%.2f"),
+                                    'split_amount_original':  st.column_config.NumberColumn('Original Amount',  format="%.2f"),
+                                    'original_currency':      'Currency',
+                                    'accounts_name':          'Account',
+                                },
+                            )
+                            copy_df_button(drill_disp, key="dl_rpt_ie_payee_detail")
+
             else:
                 st.info("No period data available for the selected criteria.")
 
@@ -2833,7 +3161,7 @@ def render_dividend_tracker():
     import datetime as _dt
     today = pd.Timestamp.now().date()
 
-    ctrl_col1, ctrl_col2, ctrl_col3 = st.columns([2, 2, 1])
+    ctrl_col1, ctrl_col2 = st.columns([2, 2])
     with ctrl_col1:
         period_opt = st.radio(
             "Period:",
@@ -2866,12 +3194,6 @@ def render_dividend_tracker():
         "YTD": f"YTD {today.year}",
         "Previous Year": str(today.year - 1),
     }.get(period_opt, f"Last {period_opt}")
-
-    with ctrl_col3:
-        st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("🔄 Refresh", key="div_refresh"):
-            get_dividend_tracker_data.clear()
-            st.rerun()
 
     df = get_dividend_tracker_data(str(start_date), str(end_date))
 
@@ -3065,10 +3387,6 @@ def render_cash_flow_forecast():
         key="cf_months_back",
         help="A payee must appear in every one of these last complete calendar months to be flagged as recurring.",
     )
-
-    if st.sidebar.button("🔄 Refresh", key="cf_refresh"):
-        get_cash_flow_forecast.clear()
-        st.rerun()
 
     df_future, df_recurring = get_cash_flow_forecast(months_back=months_back)
 
@@ -3296,11 +3614,6 @@ def render_asset_allocation():
             st.success("Target allocations saved.")
             st.rerun()
 
-    # ── Refresh ───────────────────────────────────────────────────────────────
-    if st.button("🔄 Refresh", key="alloc_refresh"):
-        get_asset_allocation_data.clear()
-        st.rerun()
-
     df = get_asset_allocation_data()
 
     if df.empty:
@@ -3366,10 +3679,6 @@ def render_asset_allocation():
 # ======================================================
 
 def render_sector_allocation():
-    if st.button("🔄 Refresh", key="sector_alloc_refresh"):
-        get_sector_allocation_data.clear()
-        st.rerun()
-
     df = get_sector_allocation_data()
 
     if df.empty:
@@ -3483,10 +3792,6 @@ def render_sector_allocation():
 def render_fx_exposure():
     st.subheader("🌍 FX Exposure Report")
 
-    if st.button("🔄 Refresh", key="fx_exp_refresh"):
-        get_fx_exposure_data.clear()
-        st.rerun()
-
     df = get_fx_exposure_data()
 
     if df.empty:
@@ -3540,10 +3845,6 @@ def render_fx_exposure():
 
 def render_bond_schedule():
     st.subheader("📅 Bond Maturity & Coupon Schedule")
-
-    if st.button("🔄 Refresh", key="bond_refresh"):
-        get_bond_schedule_data.clear()
-        st.rerun()
 
     df = get_bond_schedule_data()
 
@@ -3625,12 +3926,6 @@ def render_net_worth_report():
     st.session_state.nwr_date_val = start_date
     interval  = st.sidebar.radio("Interval:", ["Year", "Quarter", "Month"], key="nwr_interval")
     show_zero = st.sidebar.checkbox("Show zero-balance accounts", value=False, key="nwr_show_zero")
-    if st.sidebar.button("🔄 Refresh", key="nwr_refresh"):
-        get_net_worth_report_data.clear()
-        get_nwr_security_detail.clear()
-        st.cache_data.clear()
-        st.rerun()
-
     # ── Account selection (main area, full-width) ─────────────────────────
     df_accounts = get_all_accounts_for_nwr()
     all_ids     = df_accounts['accounts_id'].tolist()

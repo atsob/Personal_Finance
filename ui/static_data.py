@@ -9,43 +9,103 @@ from ui.components import copy_df_button
 
 # render_settings() was removed — superseded by render_static_data() and render_market_data()
 
+# ── Cached reference-data loaders ─────────────────────────────────────────────
+# These are small, rarely-changing tables used for dropdowns and option lists.
+# Caching them avoids re-querying on every Streamlit rerun.
+
+@st.cache_data(ttl=600)
+def _sd_load_currencies():
+    with get_db() as conn:
+        return pd.read_sql("SELECT Currencies_Id, Currencies_ShortName FROM Currencies ORDER BY Currencies_ShortName ASC", conn)
+
+@st.cache_data(ttl=600)
+def _sd_load_institutions():
+    with get_db() as conn:
+        return pd.read_sql("SELECT Institutions_Id, Institutions_Name FROM Institutions ORDER BY Institutions_Name ASC", conn)
+
+@st.cache_data(ttl=600)
+def _sd_load_accounts_list():
+    with get_db() as conn:
+        return pd.read_sql("SELECT Accounts_Id, Accounts_Name FROM Accounts ORDER BY Accounts_Name ASC", conn)
+
+@st.cache_data(ttl=3600)
+def _sd_load_credit_ratings():
+    with get_db() as conn:
+        return pd.read_sql("SELECT Moodys, S_P, Fitch FROM Credit_Ratings_LT ORDER BY Credit_Ratings_LT_Id ASC", conn)
+
+@st.cache_data(ttl=120)
+def _sd_load_category_hierarchy():
+    """Full recursive category path list — used for dropdowns and the merge section."""
+    with get_db() as conn:
+        return pd.read_sql("""
+            WITH RECURSIVE CategoryHierarchy AS (
+                SELECT Categories_Id, Categories_Name::TEXT AS Full_Path
+                FROM   Categories
+                WHERE  Categories_Id_Parent IS NULL
+                UNION ALL
+                SELECT c.Categories_Id, ch.Full_Path || ' : ' || c.Categories_Name
+                FROM   Categories c
+                JOIN   CategoryHierarchy ch ON c.Categories_Id_Parent = ch.Categories_Id
+            )
+            SELECT Categories_Id, Full_Path FROM CategoryHierarchy ORDER BY Full_Path
+        """, conn)
+
+@st.cache_data(ttl=120)
+def _sd_load_cats_with_splits():
+    """Categories that have at least one split, with counts — for the merge section."""
+    with get_db() as conn:
+        return pd.read_sql("""
+            WITH RECURSIVE CategoryHierarchy AS (
+                SELECT Categories_Id, Categories_Name::TEXT AS Full_Path
+                FROM   Categories WHERE Categories_Id_Parent IS NULL
+                UNION ALL
+                SELECT c.Categories_Id, ch.Full_Path || ' : ' || c.Categories_Name
+                FROM   Categories c
+                JOIN   CategoryHierarchy ch ON c.Categories_Id_Parent = ch.Categories_Id
+            )
+            SELECT c.Categories_Id, c.Categories_Type,
+                   ch.Full_Path, COUNT(s.Splits_Id) AS splits_count
+            FROM   Categories c
+            JOIN   CategoryHierarchy ch ON ch.Categories_Id = c.Categories_Id
+            JOIN   Splits s ON s.Categories_Id = c.Categories_Id
+            GROUP  BY c.Categories_Id, c.Categories_Type, ch.Full_Path
+            ORDER  BY c.Categories_Type, ch.Full_Path
+        """, conn)
+
+@st.cache_data(ttl=120)
+def _sd_load_payees_for_merge():
+    """Payees with transaction counts (source) and all payees (target) for the merge section."""
+    with get_db() as conn:
+        df_with_tx = pd.read_sql("""
+            SELECT p.Payees_Id, p.Payees_Name, COUNT(t.Transactions_Id) AS transactions_count
+            FROM   Payees p
+            JOIN   Transactions t ON t.Payees_Id = p.Payees_Id
+            GROUP  BY p.Payees_Id, p.Payees_Name
+            ORDER  BY p.Payees_Name
+        """, conn)
+        df_all = pd.read_sql("SELECT Payees_Id, Payees_Name FROM Payees ORDER BY Payees_Name", conn)
+    return df_with_tx, df_all
+
 
 def render_static_data():
     """Render the Static Data page (Institutions, Categories, Payees, Accounts)."""
     st.title("Static Data")
     t1, t2, t3, t4 = st.tabs(["Institutions", "Categories", "Payees", "Accounts"])
 
-    with get_db() as conn:
-        df_curr_list = pd.read_sql("SELECT Currencies_Id, Currencies_ShortName FROM Currencies ORDER BY Currencies_ShortName ASC", conn)
-        df_inst_list = pd.read_sql("SELECT Institutions_Id, Institutions_Name FROM Institutions ORDER BY Institutions_Name ASC", conn)
-        df_acc_list  = pd.read_sql("SELECT Accounts_Id, Accounts_Name FROM Accounts ORDER BY Accounts_Name ASC", conn)
+    # ── Shared reference data (all cached) ──────────────────────────────────
+    df_curr_list = _sd_load_currencies()
+    df_inst_list = _sd_load_institutions()
+    df_acc_list  = _sd_load_accounts_list()
+    df_cat_list  = _sd_load_category_hierarchy()
+    df_ratings   = _sd_load_credit_ratings()
 
-        query_cat_hierarchy = """
-        WITH RECURSIVE CategoryHierarchy AS (
-            SELECT Categories_Id, Categories_Name::TEXT as Full_Path
-            FROM Categories
-            WHERE Categories_Id_Parent IS NULL
-            UNION ALL
-            SELECT c.Categories_Id, ch.Full_Path || ' : ' || c.Categories_Name
-            FROM Categories c
-            JOIN CategoryHierarchy ch ON c.Categories_Id_Parent = ch.Categories_Id
-        )
-        SELECT Categories_Id, Full_Path FROM CategoryHierarchy ORDER BY Full_Path;
-        """
-        df_cat_list = pd.read_sql(query_cat_hierarchy, conn)
-
-        df_moodys_list = pd.read_sql("SELECT Moodys FROM Credit_Ratings_LT ORDER BY Credit_Ratings_LT_Id ASC", conn)
-        df_s_p_list    = pd.read_sql("SELECT S_P FROM Credit_Ratings_LT ORDER BY Credit_Ratings_LT_Id ASC", conn)
-        df_fitch_list  = pd.read_sql("SELECT Fitch FROM Credit_Ratings_LT ORDER BY Credit_Ratings_LT_Id ASC", conn)
-
-    curr_options = df_curr_list.set_index('currencies_id')['currencies_shortname'].to_dict()
-    inst_options = df_inst_list.set_index('institutions_id')['institutions_name'].to_dict()
-    acc_options  = df_acc_list.set_index('accounts_id')['accounts_name'].to_dict()
-    cat_options  = df_cat_list.set_index('categories_id')['full_path'].to_dict()
-
-    moodys_options = dict(zip(df_moodys_list['moodys'], df_moodys_list['moodys']))
-    s_p_options    = dict(zip(df_s_p_list['s_p'],       df_s_p_list['s_p']))
-    fitch_options  = dict(zip(df_fitch_list['fitch'],   df_fitch_list['fitch']))
+    curr_options   = df_curr_list.set_index('currencies_id')['currencies_shortname'].to_dict()
+    inst_options   = df_inst_list.set_index('institutions_id')['institutions_name'].to_dict()
+    acc_options    = df_acc_list.set_index('accounts_id')['accounts_name'].to_dict()
+    cat_options    = df_cat_list.set_index('categories_id')['full_path'].to_dict()
+    moodys_options = dict(zip(df_ratings['moodys'], df_ratings['moodys']))
+    s_p_options    = dict(zip(df_ratings['s_p'],    df_ratings['s_p']))
+    fitch_options  = dict(zip(df_ratings['fitch'],  df_ratings['fitch']))
 
     # ── Institutions ──────────────────────────────────────────────────────────
     with t1:
@@ -63,7 +123,7 @@ def render_static_data():
             key="sd_inst",
             column_config={
                 "institutions_id":   None,
-                "institutions_name": st.column_config.TextColumn("Institution Name", width="medium"),
+                "institutions_name": st.column_config.TextColumn("Institution Name", width="medium", pinned=True),
                 "institutions_type": st.column_config.SelectboxColumn(
                     "Institution Type",
                     options=['Bank', 'Credit Union', 'Insurance', 'Pension Fund',
@@ -94,22 +154,7 @@ def render_static_data():
 
     # ── Categories ────────────────────────────────────────────────────────────
     with t2:
-        query_cat_hierarchy = """
-        WITH RECURSIVE CategoryHierarchy AS (
-            SELECT Categories_Id, Categories_Name::TEXT as Full_Path
-            FROM Categories
-            WHERE Categories_Id_Parent IS NULL
-            AND Categories_Name NOT IN (SELECT Accounts_Name FROM Accounts)
-            UNION ALL
-            SELECT c.Categories_Id, ch.Full_Path || ' : ' || c.Categories_Name
-            FROM Categories c
-            JOIN CategoryHierarchy ch ON c.Categories_Id_Parent = ch.Categories_Id
-        )
-        SELECT Categories_Id, Full_Path FROM CategoryHierarchy ORDER BY Full_Path;
-        """
         with get_db() as conn:
-            df_cat_list = pd.read_sql(query_cat_hierarchy, conn)
-            cat_options = df_cat_list.set_index('categories_id')['full_path'].to_dict()
             df = pd.read_sql("""
                 WITH RECURSIVE Descendants AS (
                     SELECT Categories_Id AS root_id, Categories_Id AS child_id
@@ -168,6 +213,8 @@ def render_static_data():
         edited_cat_save = edited_cat.drop(columns=[c for c in _cat_computed if c in edited_cat.columns])
         if not edited_cat_save.equals(df_cat_save):
             save_changes(df_cat_save, edited_cat_save, "Categories", "categories_id")
+            _sd_load_category_hierarchy.clear()
+            _sd_load_cats_with_splits.clear()
 
         st.divider()
         st.subheader("🔀 Merge Category Splits")
@@ -176,38 +223,19 @@ def render_static_data():
             "Only categories with the same type are shown as valid targets."
         )
 
+        df_cats_with_splits = _sd_load_cats_with_splits()
+        # Build df_all_cats from the cached hierarchy + a quick type lookup
         with get_db() as conn:
-            df_cats_with_splits = pd.read_sql("""
-                WITH RECURSIVE CategoryHierarchy AS (
-                    SELECT Categories_Id, Categories_Name::TEXT AS Full_Path
-                    FROM Categories WHERE Categories_Id_Parent IS NULL
-                    UNION ALL
-                    SELECT c.Categories_Id, ch.Full_Path || ' : ' || c.Categories_Name
-                    FROM Categories c
-                    JOIN CategoryHierarchy ch ON c.Categories_Id_Parent = ch.Categories_Id
-                )
-                SELECT c.Categories_Id, c.Categories_Type,
-                       ch.Full_Path, COUNT(s.Splits_Id) AS splits_count
-                FROM Categories c
-                JOIN CategoryHierarchy ch ON ch.Categories_Id = c.Categories_Id
-                JOIN Splits s ON s.Categories_Id = c.Categories_Id
-                GROUP BY c.Categories_Id, c.Categories_Type, ch.Full_Path
-                ORDER BY c.Categories_Type, ch.Full_Path
-            """, conn)
-            df_all_cats = pd.read_sql("""
-                WITH RECURSIVE CategoryHierarchy AS (
-                    SELECT Categories_Id, Categories_Name::TEXT AS Full_Path
-                    FROM Categories WHERE Categories_Id_Parent IS NULL
-                    UNION ALL
-                    SELECT c.Categories_Id, ch.Full_Path || ' : ' || c.Categories_Name
-                    FROM Categories c
-                    JOIN CategoryHierarchy ch ON c.Categories_Id_Parent = ch.Categories_Id
-                )
-                SELECT c.Categories_Id, c.Categories_Type, ch.Full_Path
-                FROM Categories c
-                JOIN CategoryHierarchy ch ON ch.Categories_Id = c.Categories_Id
-                ORDER BY c.Categories_Type, ch.Full_Path
-            """, conn)
+            df_cat_types = pd.read_sql(
+                "SELECT Categories_Id, Categories_Type FROM Categories", conn
+            )
+        df_all_cats = (
+            _sd_load_category_hierarchy()
+            .merge(df_cat_types, on="categories_id")
+            .rename(columns={"full_path": "full_path", "categories_type": "categories_type"})
+            [["categories_id", "categories_type", "full_path"]]
+            .sort_values(["categories_type", "full_path"])
+        )
 
         if df_cats_with_splits.empty:
             st.info("No categories with splits found.")
@@ -317,6 +345,7 @@ def render_static_data():
                                         )
 
                                     st.session_state['sd_merge_cat_confirm'] = False
+                                    _sd_load_cats_with_splits.clear()
                                     st.toast(
                                         f"✅ {_splits_count} split(s) moved from "
                                         f"**{_from_cat_name}** to **{_to_cat_name}**.",
@@ -384,7 +413,17 @@ def render_static_data():
     # ── Payees ────────────────────────────────────────────────────────────────
     with t3:
         with get_db() as conn:
-            df = pd.read_sql("SELECT p.*, COALESCE((SELECT COUNT(*) FROM Transactions WHERE Transactions.Payees_Id = p.Payees_Id), 0) as transactions_count FROM Payees p ORDER BY p.Payees_Name ASC", conn)
+            df = pd.read_sql("""
+                SELECT p.*,
+                       COALESCE(t.cnt, 0) AS transactions_count
+                FROM   Payees p
+                LEFT JOIN (
+                    SELECT Payees_Id, COUNT(*) AS cnt
+                    FROM   Transactions
+                    GROUP  BY Payees_Id
+                ) t ON t.Payees_Id = p.Payees_Id
+                ORDER  BY p.Payees_Name ASC
+            """, conn)
 
         _payee_sort_labels = {
             "payees_name":            "Payee Name",
@@ -420,6 +459,7 @@ def render_static_data():
         edited_payee_save = edited_payee.drop(columns=[c for c in _payee_computed if c in edited_payee.columns])
         if not edited_payee_save.equals(df_payee_save):
             save_changes(df_payee_save, edited_payee_save, "Payees", "payees_id")
+            _sd_load_payees_for_merge.clear()
 
         if st.button("🔄 Update Default Category based on usage, in case not defined", key="sd_payee_update_default"):
             with st.spinner("Processing..."):
@@ -435,13 +475,7 @@ def render_static_data():
             "This is useful for merging duplicates or correcting misspellings."
         )
 
-        with get_db() as conn:
-            df_payees_with_transactions = pd.read_sql("""
-                SELECT p.Payees_Id, p.Payees_Name, COUNT(t.Transactions_Id) AS transactions_count
-                FROM Payees p JOIN Transactions t ON t.Payees_Id = p.Payees_Id
-                GROUP BY p.Payees_Id, p.Payees_Name ORDER BY p.Payees_Name
-            """, conn)
-            df_all_payees = pd.read_sql("SELECT Payees_Id, Payees_Name FROM Payees ORDER BY Payees_Name", conn)
+        df_payees_with_transactions, df_all_payees = _sd_load_payees_for_merge()
 
         if df_payees_with_transactions.empty:
             st.info("No payees with transactions found.")
@@ -537,6 +571,7 @@ def render_static_data():
                                         cur.execute("ALTER TABLE Transactions ENABLE TRIGGER trg_update_balance;")
                                         conn.commit()
                                     st.session_state['sd_merge_payee_confirm'] = False
+                                    _sd_load_payees_for_merge.clear()
                                     st.toast(
                                         f"✅ {_transactions_count} transaction(s) moved from "
                                         f"**{_from_payee_name}** to **{_to_payee_name}**.",
@@ -584,9 +619,9 @@ def render_static_data():
         edited_acc = st.data_editor(
             df, num_rows="dynamic", key="sd_acc", width="content",
             column_config={
-                "Balance":           st.column_config.TextColumn("Status", width="auto", disabled=True),
+                "Balance":           st.column_config.TextColumn("Status", width="auto", disabled=True, pinned=True),
                 "accounts_id":       None,
-                "accounts_name":     st.column_config.TextColumn("Account Name", width="auto"),
+                "accounts_name":     st.column_config.TextColumn("Account Name", width="auto", pinned=True),
                 "accounts_type":     st.column_config.SelectboxColumn("Type",
                     options=['Cash','Checking','Savings','Credit Card','Brokerage','Pension','Other Investment','Margin','Loan','Real Estate','Vehicle','Asset','Liability','Other'], width="auto"),
                 "currencies_id":     st.column_config.SelectboxColumn("Currency", options=list(curr_options.keys()),
@@ -606,3 +641,4 @@ def render_static_data():
         if not edited_acc.equals(df):
             save_df = edited_acc.drop(columns=["Balance"])
             save_changes(df.drop(columns=["Balance"]), save_df, "Accounts", "accounts_id")
+            _sd_load_accounts_list.clear()

@@ -429,20 +429,13 @@ def _render_price_quality():
         "trading day for the same security. The nearest buy/sell transaction is shown for context."
     )
 
-    # ── Threshold + Refresh ───────────────────────────────────────────────
-    col_thresh, col_btn = st.columns([5, 1])
-    with col_thresh:
-        threshold = st.slider(
-            "Flag when move exceeds (%):",
-            min_value=10, max_value=1000, value=100, step=10,
-            help="100 % = flag any price that is more than 2× or less than ½ of its neighbour, "
-                 "or that deviates from the nearest transaction by the same factor",
-        )
-    with col_btn:
-        st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("🔄 Refresh", key="pq_refresh", width="stretch"):
-            get_price_anomalies.clear()
-            st.rerun()
+    # ── Threshold ─────────────────────────────────────────────────────────
+    threshold = st.slider(
+        "Flag when move exceeds (%):",
+        min_value=10, max_value=1000, value=100, step=10,
+        help="100 % = flag any price that is more than 2× or less than ½ of its neighbour, "
+             "or that deviates from the nearest transaction by the same factor",
+    )
 
     # ── Fetch all anomalies at this threshold ─────────────────────────────
     with st.spinner("Scanning price history…"):
@@ -570,12 +563,6 @@ def _render_fill_missing_prices():
         "to fill the gap."
     )
 
-    col_refresh, col_spacer = st.columns([1, 5])
-    with col_refresh:
-        if st.button("🔄 Refresh", key="fmp_refresh", width="stretch"):
-            get_missing_tx_prices.clear()
-            st.rerun()
-
     with st.spinner("Scanning for gaps…"):
         df = get_missing_tx_prices()
 
@@ -687,12 +674,6 @@ def _render_normalize_investments():
         "Updates Price Per Share → actual close price and recalculates Quantity = "
         "Total Amount ÷ Price, leaving Total Amount unchanged so P&L is preserved."
     )
-
-    col_refresh, _ = st.columns([1, 5])
-    with col_refresh:
-        if st.button("🔄 Refresh", key="ni_refresh", width="stretch"):
-            get_investments_with_dummy_prices.clear()
-            st.rerun()
 
     with st.spinner("Scanning investments…"):
         df = get_investments_with_dummy_prices()

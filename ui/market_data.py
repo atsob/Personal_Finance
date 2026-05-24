@@ -18,6 +18,47 @@ from data.downloaders import (
 )
 
 
+# ── Cached reference-data loaders ─────────────────────────────────────────────
+
+@st.cache_data(ttl=600)
+def _md_load_currencies():
+    with get_db() as conn:
+        return pd.read_sql(
+            "SELECT Currencies_Id, Currencies_ShortName FROM Currencies ORDER BY Currencies_ShortName ASC", conn)
+
+@st.cache_data(ttl=600)
+def _md_load_securities_list():
+    with get_db() as conn:
+        return pd.read_sql(
+            "SELECT Securities_Id, Securities_Name FROM Securities ORDER BY Securities_Name ASC", conn)
+
+@st.cache_data(ttl=3600)
+def _md_load_credit_ratings():
+    with get_db() as conn:
+        return pd.read_sql(
+            "SELECT Moodys, S_P, Fitch FROM Credit_Ratings_LT ORDER BY Credit_Ratings_LT_Id ASC", conn)
+
+@st.cache_data(ttl=120)
+def _md_load_securities_with_price_stats():
+    """Securities with price count and latest price date — for the security selector dropdown."""
+    with get_db() as conn:
+        return pd.read_sql("""
+            SELECT s.Securities_Id, s.Securities_Name,
+                   s.Yahoo_Ticker, s.TV_Symbol,
+                   COALESCE(hp.NoOfRecords, 0)          AS NoOfRecords,
+                   COALESCE(hp.MaxDate, '1900-01-01')   AS MaxDate
+            FROM Securities s
+            LEFT JOIN (
+                SELECT Securities_Id,
+                       COUNT(*)   AS NoOfRecords,
+                       MAX(Date)  AS MaxDate
+                FROM   Historical_Prices
+                GROUP  BY Securities_Id
+            ) hp ON hp.Securities_Id = s.Securities_Id
+            ORDER BY s.Securities_Name ASC
+        """, conn)
+
+
 def render_market_data():
     """Render the Market Data page.
 
@@ -28,18 +69,16 @@ def render_market_data():
     st.title("Market Data")
     t_curr, t_sec = st.tabs(["💱 Currencies", "📈 Securities"])
 
-    # ── Shared lookups ────────────────────────────────────────────────────────
-    with get_db() as conn:
-        df_curr_list = pd.read_sql(
-            "SELECT Currencies_Id, Currencies_ShortName FROM Currencies ORDER BY Currencies_ShortName ASC", conn)
-        df_sec_list  = pd.read_sql(
-            "SELECT Securities_Id, Securities_Name FROM Securities ORDER BY Securities_Name ASC", conn)
-        df_moodys_list = pd.read_sql("SELECT Moodys FROM Credit_Ratings_LT ORDER BY Credit_Ratings_LT_Id ASC", conn)
-        df_s_p_list    = pd.read_sql("SELECT S_P    FROM Credit_Ratings_LT ORDER BY Credit_Ratings_LT_Id ASC", conn)
-        df_fitch_list  = pd.read_sql("SELECT Fitch  FROM Credit_Ratings_LT ORDER BY Credit_Ratings_LT_Id ASC", conn)
+    # ── Shared lookups (all cached) ───────────────────────────────────────────
+    df_curr_list = _md_load_currencies()
+    df_sec_list  = _md_load_securities_list()
+    df_ratings   = _md_load_credit_ratings()
 
-    curr_options = df_curr_list.set_index('currencies_id')['currencies_shortname'].to_dict()
-    sec_options  = df_sec_list.set_index('securities_id')['securities_name'].to_dict()
+    curr_options   = df_curr_list.set_index('currencies_id')['currencies_shortname'].to_dict()
+    sec_options    = df_sec_list.set_index('securities_id')['securities_name'].to_dict()
+    moodys_options = dict(zip(df_ratings['moodys'], df_ratings['moodys']))
+    s_p_options    = dict(zip(df_ratings['s_p'],    df_ratings['s_p']))
+    fitch_options  = dict(zip(df_ratings['fitch'],  df_ratings['fitch']))
 
     period_options = {
         "1 Day": "1d", "5 Days": "5d", "1 Month": "1mo", "3 Months": "3mo",
@@ -70,6 +109,7 @@ def render_market_data():
         )
         if not edited_curr.equals(df_curr):
             save_changes(df_curr, edited_curr, "Currencies", "currencies_id")
+            _md_load_currencies.clear()
 
         st.divider()
 
@@ -158,16 +198,21 @@ def render_market_data():
         st.subheader("📋 Securities Master Data")
         with get_db() as conn:
             df_sec = pd.read_sql("""
-                SELECT Securities_Id, Ticker, Securities_Name, Securities_Type, Currencies_Id,
-                       Sector, Industry, Analyst_Rating, Analyst_Target_Price, Is_Active,
-                       COALESCE(Is_Tax_Exempt, FALSE) AS Is_Tax_Exempt,
-                       Yahoo_Ticker, TV_Symbol, TV_Exchange, ISIN, Maturity_Date, Coupon_Rate,
-                       Face_Value, Coupon_Frequency, embedding,
-                       COALESCE(
-                           (SELECT COUNT(*) FROM Investments
-                            WHERE Investments.Securities_Id = Securities.Securities_Id), 0
-                       ) AS investment_count
-                FROM Securities ORDER BY Securities_Name
+                SELECT s.Securities_Id, s.Ticker, s.Securities_Name, s.Securities_Type,
+                       s.Currencies_Id, s.Sector, s.Industry, s.Analyst_Rating,
+                       s.Analyst_Target_Price, s.Is_Active,
+                       COALESCE(s.Is_Tax_Exempt, FALSE) AS Is_Tax_Exempt,
+                       s.Yahoo_Ticker, s.TV_Symbol, s.TV_Exchange, s.ISIN,
+                       s.Maturity_Date, s.Coupon_Rate, s.Face_Value, s.Coupon_Frequency,
+                       s.embedding,
+                       COALESCE(ic.cnt, 0) AS investment_count
+                FROM Securities s
+                LEFT JOIN (
+                    SELECT Securities_Id, COUNT(*) AS cnt
+                    FROM   Investments
+                    GROUP  BY Securities_Id
+                ) ic ON ic.Securities_Id = s.Securities_Id
+                ORDER BY s.Securities_Name
             """, conn)
 
         _sec_sort_labels = {
@@ -230,31 +275,26 @@ def render_market_data():
         edited_sec_save = edited_sec.drop(columns=[c for c in _sec_computed if c in edited_sec.columns])
         if not edited_sec_save.equals(df_sec_save):
             save_changes(df_sec_save, edited_sec_save, "Securities", "securities_id")
+            _md_load_securities_list.clear()
+            _md_load_securities_with_price_stats.clear()
 
         if st.button("🚀 Update Securities Information from Yahoo", key="mkt_download_sec_info", width="stretch"):
             with st.spinner("Fetching sector, industry, rating & target price from Yahoo…"):
                 download_securities_info_from_yahoo()
+            _md_load_securities_list.clear()
             st.rerun()
 
         if st.button("🚀 Update Securities Information from TradingView", key="mkt_download_tv_info", width="stretch"):
             with st.spinner("Fetching sector, industry, rating & target price from TradingView…"):
                 download_securities_info_from_tradingview(target_sec_id=None, overwrite=False)
+            _md_load_securities_list.clear()
             st.rerun()
 
         st.divider()
 
         # ── Per-security selector ─────────────────────────────────────────────
         st.subheader("📊 Security Details")
-        with get_db() as conn:
-            df_inv_secs = pd.read_sql("""
-                SELECT S.Securities_Id, S.Securities_Name,
-                    S.Yahoo_Ticker, S.TV_Symbol,
-                    (SELECT COUNT(HP.*) FROM Historical_Prices HP
-                     WHERE HP.Securities_Id = S.Securities_Id)                         AS NoOfRecords,
-                    (SELECT COALESCE(MAX(HP.Date), '1900-01-01') FROM Historical_Prices HP
-                     WHERE HP.Securities_Id = S.Securities_Id)                         AS MaxDate
-                FROM Securities S ORDER BY S.Securities_Name ASC
-            """, conn)
+        df_inv_secs = _md_load_securities_with_price_stats()
 
         if df_inv_secs.empty:
             st.warning("⚠️ No Securities found. Add one in the master data editor above.")
@@ -421,30 +461,35 @@ def render_market_data():
 
                     if st.button("🚀 Download All from Yahoo", key="mkt_dl_all_yahoo", width="stretch"):
                         download_historical_prices_from_yahoo(ts_period_price)
+                        _md_load_securities_with_price_stats.clear()
                         st.rerun()
                     if _has_yahoo:
                         if st.button(
                                 f"🚀 Update {selected_inv_sec['securities_name']} from Yahoo",
                                 key="mkt_dl_one_yahoo", width="stretch"):
                             download_historical_prices_from_yahoo(ts_period_price, inv_sec_id)
+                            _md_load_securities_with_price_stats.clear()
                             st.rerun()
                     else:
                         st.caption(f"ℹ️ No Yahoo ticker defined for {selected_inv_sec['securities_name']}")
 
                     if st.button("🚀 Download All from TradingView", key="mkt_dl_all_tv", width="stretch"):
                         download_historical_prices_from_tradingview(ts_period_price)
+                        _md_load_securities_with_price_stats.clear()
                         st.rerun()
                     if _has_tv:
                         if st.button(
                                 f"🚀 Update {selected_inv_sec['securities_name']} from TradingView",
                                 key="mkt_dl_one_tv", width="stretch"):
                             download_historical_prices_from_tradingview(ts_period_price, inv_sec_id)
+                            _md_load_securities_with_price_stats.clear()
                             st.rerun()
                     else:
                         st.caption(f"ℹ️ No TradingView symbol defined for {selected_inv_sec['securities_name']}")
 
                     if st.button("🚀 Download Greek Bond Prices from Solidus", key="mkt_dl_solidus", width="stretch"):
                         download_bond_prices_from_solidus()
+                        _md_load_securities_with_price_stats.clear()
                         st.rerun()
 
                 # ── Import from file ──────────────────────────────────────────
@@ -568,6 +613,7 @@ def render_market_data():
                                         _parts.append(
                                             f"{_overwritten:,} rows written (inserted or overwritten)")
                                     st.success(f"✅ Import complete — {', '.join(_parts)}.")
+                                    _md_load_securities_with_price_stats.clear()
                                     st.rerun()
                         except Exception as _exc:
                             st.error(f"❌ Error parsing file: {_exc}")
@@ -679,19 +725,12 @@ def render_market_data():
                     "or next trading day for **this security**. "
                     "The nearest buy/sell transaction is shown for context."
                 )
-                col_thresh, col_btn = st.columns([5, 1])
-                with col_thresh:
-                    threshold = st.slider(
-                        "Flag when move exceeds (%):",
-                        min_value=10, max_value=1000, value=100, step=10,
-                        key=f"mkt_pq_threshold_{inv_sec_id}",
-                        help="100% = flag any price that is more than 2× or less than ½ of its neighbour",
-                    )
-                with col_btn:
-                    st.markdown("<br>", unsafe_allow_html=True)
-                    if st.button("🔄 Refresh", key=f"mkt_pq_refresh_{inv_sec_id}", width="stretch"):
-                        get_price_anomalies.clear()
-                        st.rerun()
+                threshold = st.slider(
+                    "Flag when move exceeds (%):",
+                    min_value=10, max_value=1000, value=100, step=10,
+                    key=f"mkt_pq_threshold_{inv_sec_id}",
+                    help="100% = flag any price that is more than 2× or less than ½ of its neighbour",
+                )
 
                 with st.spinner("Scanning price history…"):
                     df_anomalies = get_price_anomalies(float(threshold), securities_ids=(inv_sec_id,))
@@ -800,12 +839,6 @@ def render_market_data():
                     "Updates Price → actual close price and recalculates Quantity = Total ÷ Price, "
                     "leaving Total Amount unchanged so P&L is preserved."
                 )
-                col_refresh, _ = st.columns([1, 5])
-                with col_refresh:
-                    if st.button("🔄 Refresh", key=f"mkt_ni_refresh_{inv_sec_id}", width="stretch"):
-                        get_investments_with_dummy_prices.clear()
-                        st.rerun()
-
                 with st.spinner("Scanning investments…"):
                     df_dummy_all = get_investments_with_dummy_prices()
 
