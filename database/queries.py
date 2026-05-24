@@ -2391,7 +2391,18 @@ def get_transaction_anomalies(z_threshold: float = 2.5, lookback_days: int = 365
     conn = get_connection()
 
     df = pd.read_sql("""
-        WITH fx AS (
+        WITH RECURSIVE cat_path AS (
+            SELECT Categories_Id,
+                   Categories_Name::TEXT AS Full_Path
+            FROM   Categories
+            WHERE  Categories_Id_Parent IS NULL
+            UNION ALL
+            SELECT c.Categories_Id,
+                   cp.Full_Path || ' : ' || c.Categories_Name
+            FROM   Categories c
+            JOIN   cat_path cp ON c.Categories_Id_Parent = cp.Categories_Id
+        ),
+        fx AS (
             SELECT DISTINCT ON (Currencies_Id_1) Currencies_Id_1, FX_Rate
             FROM Historical_FX ORDER BY Currencies_Id_1, Date DESC
         ),
@@ -2400,16 +2411,17 @@ def get_transaction_anomalies(z_threshold: float = 2.5, lookback_days: int = 365
                 t.Transactions_Id,
                 t.Date,
                 p.Payees_Name,
-                cat.Categories_Name AS category,
+                COALESCE(cp.Full_Path, cat.Categories_Name) AS category,
                 a.Accounts_Name,
                 s.Amount,
                 ROUND((s.Amount * COALESCE(fx.FX_Rate, 1))::numeric, 2) AS amount_eur
             FROM Transactions t
             JOIN Accounts a  ON t.Accounts_Id = a.Accounts_Id
             JOIN Currencies c ON a.Currencies_Id = c.Currencies_Id
-            LEFT JOIN Payees p   ON t.Payees_Id = p.Payees_Id
-            LEFT JOIN Splits s   ON s.Transactions_Id = t.Transactions_Id
-            LEFT JOIN Categories cat ON s.Categories_Id = cat.Categories_Id
+            LEFT JOIN Payees p        ON t.Payees_Id = p.Payees_Id
+            LEFT JOIN Splits s        ON s.Transactions_Id = t.Transactions_Id
+            LEFT JOIN Categories cat  ON s.Categories_Id = cat.Categories_Id
+            LEFT JOIN cat_path cp     ON s.Categories_Id = cp.Categories_Id
             LEFT JOIN fx ON fx.Currencies_Id_1 = a.Currencies_Id
             WHERE t.Date >= CURRENT_DATE - %(lookback)s * INTERVAL '1 day'
               AND p.Payees_Name IS NOT NULL

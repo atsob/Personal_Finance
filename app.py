@@ -184,7 +184,12 @@ def main():
             "🧠 AI Assistant",
         ]
     )
-    
+
+    st.sidebar.divider()
+    if st.sidebar.button("Clear Cache", use_container_width=True):
+        st.cache_data.clear()
+        st.sidebar.success("Cache cleared.")
+
     # Database connection for page rendering
     conn = get_connection()
     

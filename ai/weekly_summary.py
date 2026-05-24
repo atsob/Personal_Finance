@@ -6,7 +6,8 @@ It queries key financial metrics, asks the LLM to produce a plain-English
 summary, and saves the result to the database table `AI_Weekly_Summaries`.
 
 Usage:
-    python -m ai.weekly_summary
+    python -m ai.weekly_summary                      # summarise the just-finished week
+    python -m ai.weekly_summary --week 2026-05-11    # regenerate for the week starting May 11
 
 Schedule (Linux cron — every Monday at 07:00):
     0 7 * * 1 cd /path/to/app && python -m ai.weekly_summary >> logs/weekly_summary.log 2>&1
@@ -17,6 +18,7 @@ Schedule (Windows Task Scheduler):
     Start in : C:\\path\\to\\app
 """
 
+import argparse
 import logging
 import textwrap
 import warnings
@@ -70,14 +72,12 @@ def ensure_summary_table(conn):
 # DATA GATHERING
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _gather_context(conn, period_end: str) -> str:
+def _gather_context(conn, week_start: str, period_end: str) -> str:
     """Pull key metrics from the DB and format them as a compact text block.
 
-    period_end: ISO date string (YYYY-MM-DD) — net worth is reconstructed as of
-    this date rather than using today's live balances / holdings.
+    week_start: ISO date string (YYYY-MM-DD) — Monday of the week being summarised.
+    period_end: ISO date string (YYYY-MM-DD) — Sunday of that week (inclusive upper bound).
     """
-    week_ago = (date.today() - timedelta(days=7)).isoformat()
-
     blocks = []
 
     # 1. Net worth snapshot — reconstructed as of period_end
@@ -197,12 +197,12 @@ def _gather_context(conn, period_end: str) -> str:
             JOIN Categories c ON c.Categories_Id = s.Categories_Id
 			JOIN Transactions t ON t.Transactions_Id = s.Transactions_Id
             WHERE t.Date >= %s
-            AND t.Date <= CURRENT_DATE	
-        """, (week_ago,))
+            AND t.Date <= %s
+        """, (week_start, period_end))
         if not df.empty:
             r = df.iloc[0]
             blocks.append(
-                f"WEEKLY CASH FLOWS (last 7 days):\n"
+                f"WEEKLY CASH FLOWS ({week_start} to {period_end}):\n"
                 f"  Income: €{float(r.income or 0):,.2f}  "
                 f"Expenses: €{float(r.expense or 0):,.2f}  "
                 f"Tax: €{float(r.tax or 0):,.2f}  "
@@ -218,9 +218,9 @@ def _gather_context(conn, period_end: str) -> str:
         df = _query(conn, """
             WITH RECURSIVE 
                 periods AS (
-                    SELECT 
+                    SELECT
                         %s::date as wtd_start,
-                        CURRENT_DATE::date as today
+                        %s::date as today
                 ),
                 -- Βρίσκουμε κάθε συνδυασμό Λογαριασμού/Τίτλου που υπήρξε ποτέ
                 historical_entities AS (
@@ -315,7 +315,7 @@ def _gather_context(conn, period_end: str) -> str:
                 LEFT JOIN Holdings h
                     ON h.Accounts_Id = pf.Accounts_Id AND h.Securities_Id = pf.Securities_Id
                 WHERE (pf.qty_today != 0 OR cf.cf_all_time IS NOT NULL)
-        """, (week_ago,))        
+        """, (week_start, period_end))
         if not df.empty:
         #    pnl = float(df.iloc[0]['weekly_pnl_eur'] or 0)
             pnl = float(df.iloc[0]['pnl_wtd_eur'] or 0)
@@ -329,11 +329,11 @@ def _gather_context(conn, period_end: str) -> str:
             SELECT t.Date, p.Payees_Name, ABS(t.Total_Amount) AS abs_amount, t.Total_Amount
             FROM Transactions t
             LEFT JOIN Payees p ON t.Payees_Id = p.Payees_Id
-            WHERE t.Date >= %s
-            AND	t.Transfers_Id IS NULL  -- Exclude internal transfers to avoid cluttering the list with large but non-impactful movements
+            WHERE t.Date BETWEEN %s AND %s
+            AND t.Transfers_Id IS NULL
             ORDER BY ABS(t.Total_Amount) DESC
             LIMIT 5
-        """, (week_ago,))
+        """, (week_start, period_end))
         if not df.empty:
             rows = "\n".join(
                 f"  {r.date}  {r.payees_name or 'N/A':30s}  €{float(r.total_amount):+,.2f}"
@@ -390,18 +390,23 @@ def save_summary(conn, week_start: date, summary_text: str):
 # ENTRY POINT
 # ──────────────────────────────────────────────────────────────────────────────
 
-def run():
+def run(week_start: date | None = None):
     logging.info("Starting weekly AI financial summary generation...")
 
     conn = get_connection()
     try:
         ensure_summary_table(conn)
 
-        week_start = date.today() - timedelta(days=date.today().weekday())  # this Monday
-        period_end = (week_start - timedelta(days=1)).isoformat()          # last Sunday
+        if week_start is None:
+            today      = date.today()
+            week_start = today - timedelta(days=today.weekday() + 7)  # Monday of the just-finished week
+            period_end = (today - timedelta(days=1)).isoformat()      # last Sunday
+        else:
+            period_end = (week_start + timedelta(days=6)).isoformat() # Sunday of the given week
+
         logging.info(f"Week start: {week_start}  Period end: {period_end}")
 
-        context = _gather_context(conn, period_end)
+        context = _gather_context(conn, week_start.isoformat(), period_end)
         logging.info("Context gathered.")
 
         llm = init_llm()
@@ -422,4 +427,17 @@ def run():
 
 
 if __name__ == "__main__":
-    run()
+    parser = argparse.ArgumentParser(description="Generate AI weekly financial summary.")
+    parser.add_argument(
+        "--week", metavar="YYYY-MM-DD",
+        help="Monday of the week to (re)generate. Defaults to the just-finished week.",
+    )
+    args = parser.parse_args()
+
+    override = None
+    if args.week:
+        override = date.fromisoformat(args.week)
+        if override.weekday() != 0:
+            parser.error(f"{args.week} is not a Monday.")
+
+    run(week_start=override)

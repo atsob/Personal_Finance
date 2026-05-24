@@ -495,11 +495,30 @@ def render_static_data():
                 _to_payee_name   = _to_payee_options.get(_payee_to_id, "")
                 _transactions_count = int(df_payees_with_transactions.loc[
                     df_payees_with_transactions["payees_id"] == _payee_from_id, "transactions_count"].iloc[0])
+
+                _also_delete_payee = st.checkbox(
+                    "Also delete source payee after merge",
+                    key="sd_merge_payee_also_delete",
+                    help="After all transactions are moved, permanently delete the source payee.",
+                )
+
+                if st.session_state.get('sd_merge_payee_post_msg'):
+                    _pm_level, _pm_text = st.session_state.pop('sd_merge_payee_post_msg')
+                    if _pm_level == 'warning':
+                        st.warning(_pm_text)
+                    else:
+                        st.success(_pm_text)
+
                 if st.button("▶️ Merge Payee Transactions", type="primary", key="sd_merge_payee_btn"):
                     st.session_state['sd_merge_payee_confirm'] = True
 
                 if st.session_state.get('sd_merge_payee_confirm'):
-                    st.warning(f"⚠️ This will move **{_transactions_count} transaction(s)** from **{_from_payee_name}** → **{_to_payee_name}**. This cannot be undone.")
+                    _delete_note = " and permanently **delete** the source payee" if _also_delete_payee else ""
+                    st.warning(
+                        f"⚠️ This will move **{_transactions_count} transaction(s)** from "
+                        f"**{_from_payee_name}** → **{_to_payee_name}**{_delete_note}. "
+                        f"This cannot be undone."
+                    )
                     _cn, _cy, _ = st.columns([1, 1, 3])
                     with _cn:
                         if st.button("✖ Cancel", key="sd_merge_payee_cancel", width="stretch"):
@@ -518,7 +537,27 @@ def render_static_data():
                                         cur.execute("ALTER TABLE Transactions ENABLE TRIGGER trg_update_balance;")
                                         conn.commit()
                                     st.session_state['sd_merge_payee_confirm'] = False
-                                    st.success(f"✅ {_transactions_count} transaction(s) moved from **{_from_payee_name}** to **{_to_payee_name}** successfully.")
+                                    st.toast(
+                                        f"✅ {_transactions_count} transaction(s) moved from "
+                                        f"**{_from_payee_name}** to **{_to_payee_name}**.",
+                                        icon="✅",
+                                    )
+                                    if _also_delete_payee:
+                                        try:
+                                            with get_db() as conn:
+                                                cur = conn.cursor()
+                                                cur.execute("DELETE FROM Payees WHERE Payees_Id = %s", (_payee_from_id,))
+                                                conn.commit()
+                                            st.session_state['sd_merge_payee_post_msg'] = (
+                                                'success',
+                                                f"🗑️ **{_from_payee_name}** has been deleted.",
+                                            )
+                                        except Exception as _del_err:
+                                            st.session_state['sd_merge_payee_post_msg'] = (
+                                                'warning',
+                                                f"⚠️ Transactions merged but could not delete "
+                                                f"**{_from_payee_name}**: {_del_err}",
+                                            )
                                     st.rerun()
                                 except Exception as e:
                                     st.error(f"❌ Error during merge: {e}")
