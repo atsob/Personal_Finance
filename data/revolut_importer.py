@@ -127,6 +127,16 @@ def parse_revolut_csv(file_bytes: bytes) -> pd.DataFrame:
     required = {"type", "started_date", "description", "amount", "currency", "state"}
     missing  = required - set(df.columns)
     if missing:
+        # Detect a Revolut Savings CSV by its unique column names (checked on the
+        # raw/un-renamed column set, since this parser won't have renamed them).
+        _raw_lower = {c.strip().lower() for c in df.columns}
+        if any("price per share" in c for c in _raw_lower) or \
+                any("quantity" in c for c in _raw_lower):
+            raise ValueError(
+                "This looks like a Revolut Savings (Flexible Cash Funds) statement, "
+                "not a Revolut Personal account statement. "
+                "Please switch to the '🐣 Revolut Savings' tab to import it."
+            )
         raise ValueError(
             f"Revolut CSV is missing columns: {', '.join(sorted(missing))}. "
             "Please export a fresh statement from the Revolut app."
@@ -624,23 +634,35 @@ _ASSET_TO_SECTYPE: dict[str, str] = {
 
 def _get_or_create_security(cur, symbol: str, name: str,
                              currency: str, asset_category: str,
-                             source: str = "") -> int:
+                             source: str = "", isin: str = "") -> int:
     """Resolve or create a Security record.
 
-    Match priority (when *source* is provided):
+    Match priority:
       0. Saved mapping in import_security_mappings (user-defined override)
-      1. Ticker match in Securities
-      2. Name match in Securities
-      3. Create new security
+      1. ISIN match in Securities (when isin is provided)
+      2. Ticker match in Securities
+      3. Name match in Securities
+      4. Create new security
     """
-    # 0. Check saved mapping (user-defined override)
-    if source and symbol:
+    # 0. Check saved mapping (user-defined override) — keyed by ISIN then symbol
+    if source:
         from database.queries import get_security_mappings as _get_map
         _mappings = _get_map(source)
-        if symbol in _mappings:
-            return _mappings[symbol]
+        for _key in (isin, symbol):
+            if _key and _key in _mappings:
+                return _mappings[_key]
 
-    # 1. Match by Ticker
+    # 1. Match by ISIN
+    if isin:
+        cur.execute(
+            "SELECT Securities_Id FROM Securities WHERE ISIN = %s LIMIT 1",
+            (isin,),
+        )
+        row = cur.fetchone()
+        if row:
+            return row[0]
+
+    # 2. Match by Ticker
     if symbol:
         cur.execute(
             "SELECT Securities_Id FROM Securities WHERE Ticker = %s LIMIT 1",
@@ -650,7 +672,7 @@ def _get_or_create_security(cur, symbol: str, name: str,
         if row:
             return row[0]
 
-    # 2. Match by name
+    # 3. Match by name
     if name:
         cur.execute(
             "SELECT Securities_Id FROM Securities WHERE Securities_Name = %s LIMIT 1",
@@ -660,16 +682,16 @@ def _get_or_create_security(cur, symbol: str, name: str,
         if row:
             return row[0]
 
-    # 3. Create new
+    # 4. Create new
     sec_type = _ASSET_TO_SECTYPE.get(asset_category.upper(), "Stock")
     cur.execute(
         """INSERT INTO Securities
-               (Ticker, Securities_Name, Securities_Type, Currencies_Id)
-           VALUES (%s, %s, %s,
+               (Ticker, Securities_Name, ISIN, Securities_Type, Currencies_Id)
+           VALUES (%s, %s, %s, %s,
                   (SELECT Currencies_Id FROM Currencies
                    WHERE Currencies_ShortName = %s LIMIT 1))
            RETURNING Securities_Id""",
-        (symbol or name[:30], name, sec_type, currency or "EUR"),
+        (symbol or name[:30], name, isin or None, sec_type, currency or "EUR"),
     )
     return cur.fetchone()[0]
 
@@ -908,6 +930,429 @@ def run_import(
                            (Accounts_Id, Date, Total_Amount, Description, Cleared)
                        VALUES (%s, %s, %s, %s, TRUE)""",
                     (account_id, rec["date"], rec["amount"], rec["desc"]),
+                )
+                counts["transactions"] += 1
+            done += 1
+            if progress_cb and done % 25 == 0:
+                progress_cb(done / total)
+
+        conn.commit()
+        update_holdings()
+        update_accounts_balances()
+
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+
+    return counts
+
+
+# ===========================================================================
+# Revolut Savings CSV importer
+# ===========================================================================
+#
+# CSV columns (Revolut Savings, current format):
+#   Date, Description, "Value, EUR", Price per share, Quantity of shares
+#
+# Date format example: "May 25, 2026, 4:29:55 AM"
+#
+# Transaction types (from Description field):
+#   BUY EUR Class R <ISIN>              → Investment (Buy)
+#   Interest PAID EUR Class R <ISIN>   → Investment (Dividend)
+#   Service Fee Charged EUR Class <ISIN> → Investment (MiscExp)
+#   Interest Reinvested Class R EUR <ISIN> → skipped (paired BUY covers it)
+# ===========================================================================
+
+_REV_SAVINGS_PREFIX = "REVS|"
+_SAVINGS_ISIN       = "IE000AZVL3K0"   # Revolut EUR money market fund default
+
+
+def _parse_savings_date(val) -> "Optional[date]":
+    """Parse Revolut Savings date: 'May 25, 2026, 4:29:55 AM'."""
+    raw = str(val).strip()
+    for fmt in (
+        "%b %d, %Y, %I:%M:%S %p",   # "May 25, 2026, 4:29:55 AM"
+        "%B %d, %Y, %I:%M:%S %p",   # full month name fallback
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d",
+    ):
+        try:
+            return datetime.strptime(raw, fmt).date()
+        except ValueError:
+            pass
+    return None
+
+
+def parse_revolut_savings_csv(file_bytes: bytes) -> "pd.DataFrame":
+    """Parse a Revolut Savings statement CSV export into a normalised DataFrame.
+
+    Returns columns:
+        date, raw_date_str, description, value_eur, price_per_share, quantity
+    """
+    text = None
+    for enc in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            text = file_bytes.decode(enc)
+            break
+        except (UnicodeDecodeError, LookupError):
+            pass
+    if text is None:
+        raise ValueError("Could not decode the Revolut Savings CSV file.")
+
+    df = pd.read_csv(io.StringIO(text), dtype=str)
+    df.columns = [c.strip() for c in df.columns]
+
+    # Normalise column names
+    rename: dict[str, str] = {}
+    for col in df.columns:
+        cl = col.lower().replace(" ", "_")
+        if cl in ("date", "datetime"):  rename[col] = "date"
+        elif cl == "description":       rename[col] = "description"
+        elif "value" in cl:             rename[col] = "value_eur"
+        elif "price" in cl:             rename[col] = "price_per_share"
+        elif "quantity" in cl:          rename[col] = "quantity"
+    df = df.rename(columns=rename)
+
+    required = {"date", "description", "value_eur"}
+    missing  = required - set(df.columns)
+    if missing:
+        # Detect a Revolut Personal CSV by its distinctive column names.
+        _raw_lower = {c.strip().lower() for c in df.columns}
+        if "started date" in _raw_lower or "started_date" in _raw_lower or \
+                "state" in _raw_lower:
+            raise ValueError(
+                "This looks like a Revolut Personal (current account) statement, "
+                "not a Revolut Savings statement. "
+                "Please switch to the '💚 Revolut Personal' tab to import it."
+            )
+        raise ValueError(
+            f"Revolut Savings CSV is missing columns: {', '.join(sorted(missing))}. "
+            "Please export a savings statement: Revolut app → Savings → ⋮ → Statement."
+        )
+
+    # Preserve raw date string for dedup keys (keeps same-day records distinct)
+    df["raw_date_str"]    = df["date"].str.strip()
+    df["value_eur"]       = df["value_eur"].apply(_clean_amount)
+    df["price_per_share"] = df.get("price_per_share",
+                                   pd.Series(dtype=str)).apply(_clean_amount)
+    df["quantity"]        = df.get("quantity",
+                                   pd.Series(dtype=str)).apply(_clean_amount)
+    df["date"]            = df["raw_date_str"].apply(_parse_savings_date)
+    df = df.dropna(subset=["date", "value_eur"]).copy()
+
+    return df[["date", "raw_date_str", "description",
+               "value_eur", "price_per_share", "quantity"]].reset_index(drop=True)
+
+
+def build_savings_records(df: "pd.DataFrame") -> "tuple[list, list]":
+    """Convert a parsed Revolut Savings DataFrame into (inv_records, tx_records).
+
+    Mapping:
+      BUY ...              → Investment (Buy)
+    #  Interest PAID ...    → Investment (Dividend)
+      Interest PAID ...    → Investment (Reinvest with Quantity = Value)
+    #  Service Fee ...      → Investment (MiscExp)
+      Service Fee ...      → Investment (Reinvest with Quantity = Value)
+    #  Interest Reinvested  → skipped (the paired BUY the next day records it)
+      Interest Reinvested  → Investment (Sell with Price = 1 and Quantuity = Value, i.e. a reinvestment record that doesn't affect holdings or cash)
+      anything else        → plain cash Transaction
+    """
+    inv_records: list[dict] = []
+    tx_records:  list[dict] = []
+
+    for _, row in df.iterrows():
+        desc   = str(row["description"]).strip()
+        value  = float(row["value_eur"])
+        dt     = row["date"]
+        raw_ts = str(row.get("raw_date_str", dt))
+
+        _pps  = row.get("price_per_share")
+        price = float(_pps) if (_pps is not None and not pd.isna(_pps)) else 1.0
+
+        _qty = row.get("quantity")
+        qty  = float(_qty)  if (_qty  is not None and not pd.isna(_qty))  else 0.0
+
+        # Extract ISIN from description (e.g. "IE000AZVL3K0")
+        isin_m = re.search(r'\b([A-Z]{2}[A-Z0-9]{10})\b', desc)
+        isin   = isin_m.group(1) if isin_m else _SAVINGS_ISIN
+
+        # Stable dedup key — raw timestamp keeps same-day events distinct
+        key = f"{_REV_SAVINGS_PREFIX}{raw_ts}|{desc[:50]}|{round(value, 4)}"
+
+        # Common investment-record base
+        base = {
+            "record_type":    "investment",
+            "source":         "Revolut Savings",
+            "desc":           key,
+            "symbol":         isin,
+            "name":           "Revolut EUR Money Market Fund",
+            "isin":           isin,
+            "currency":       "EUR",
+            "asset_category": "BOND",
+            "date":           dt,
+            "commission":     0.0,
+        }
+
+        desc_upper = desc.upper()
+
+        if desc_upper.startswith("BUY"):
+            qty_used = abs(qty) if qty else (abs(value) / max(price, 0.0001))
+            inv_records.append({**base,
+                "action":    "Buy",
+                "quantity":  round(qty_used, 6),
+                "price":     round(price if price else 1.0, 6),
+                "total_eur": round(abs(value), 2),
+            })
+
+        elif desc_upper.startswith("INTEREST PAID"):
+            inv_records.append({**base,
+            #    "action":    "Dividend",
+                "action":    "Reinvest",
+            #    "quantity":  1.0,
+                "quantity":  round(abs(value), 6),  # reinvestment record with Quantity = interest amount
+            #    "price":     round(abs(value), 6),
+                "price":     round(price if price else 1.0, 6),
+                "total_eur": round(abs(value), 2),
+            })
+
+        elif desc_upper.startswith("SERVICE FEE"):
+            inv_records.append({**base,
+            #    "action":    "MiscExp",
+                "action":    "Reinvest",
+            #    "quantity":  1.0, 
+                "quantity":  round(value, 6),
+            #    "price":     round(abs(value), 6),
+                "price":     round(price if price else 1.0, 6),
+                "total_eur": round(value, 2),
+            })
+
+        elif desc_upper.startswith("INTEREST REINVESTED"):
+            # Skip — the paired BUY on the following day records the reinvestment
+        #    pass
+            inv_records.append({**base,
+            #    "action":    "MiscExp",
+                "action":    "Sell",
+            #    "quantity":  1.0, 
+                "quantity":  round(abs(value), 6),
+            #    "price":     round(abs(value), 6),
+                "price":     round(price if price else 1.0, 6),
+                "total_eur": round(abs(value), 2),
+            })
+
+        else:
+            # Catch-all: emit as a plain cash transaction
+            tx_records.append({
+                "record_type": "transaction",
+                "source":      "Revolut Savings",
+                "desc":        key,
+                "date":        dt,
+                "amount":      round(value, 2),
+                "description": f"Revolut Savings: {desc}",
+                "currency":    "EUR",
+            })
+
+    return inv_records, tx_records
+
+
+def build_savings_records_as_tx(df: "pd.DataFrame") -> "tuple[list, list]":
+    """Transaction-mode alternative to build_savings_records.
+
+    Maps all Revolut Savings events to plain cash Transactions so they are
+    visible in a standard Savings / Checking account register — no Investments
+    table records are created.
+
+    Mapping:
+      BUY ...              → Transaction (+ amount, "Revolut Savings: Fund Purchase")
+      Interest PAID ...    → Transaction (+ amount, "Revolut Savings: Interest Earned")
+      Service Fee ...      → Transaction (- amount, "Revolut Savings: Service Fee")
+      Interest Reinvested  → skipped (covered by the paired BUY)
+      anything else        → Transaction (raw description)
+    """
+    tx_records: list[dict] = []
+
+    for _, row in df.iterrows():
+        desc   = str(row["description"]).strip()
+        value  = float(row["value_eur"])
+        dt     = row["date"]
+        raw_ts = str(row.get("raw_date_str", dt))
+
+        # Stable dedup key (same prefix so replace-mode DELETE still catches them)
+        key = f"{_REV_SAVINGS_PREFIX}{raw_ts}|{desc[:50]}|{round(value, 4)}"
+
+        desc_upper = desc.upper()
+
+        if desc_upper.startswith("INTEREST REINVESTED"):
+            # Skip — the paired BUY the next day records the actual fund purchase
+            continue
+
+        if desc_upper.startswith("BUY"):
+            label = "Revolut Savings: Fund Purchase"
+        elif desc_upper.startswith("INTEREST PAID"):
+            label = "Revolut Savings: Interest Earned"
+        elif desc_upper.startswith("SERVICE FEE"):
+            label = "Revolut Savings: Service Fee"
+        else:
+            label = f"Revolut Savings: {desc}"
+
+        tx_records.append({
+            "record_type": "transaction",
+            "source":      "Revolut Savings",
+            "desc":        key,
+            "date":        dt,
+            "amount":      value,          # keep full precision (e.g. 0.0696 interest)
+            "description": label,
+            "currency":    "EUR",
+        })
+
+    return [], tx_records
+
+
+def preview_savings_security(isin: str = _SAVINGS_ISIN) -> "dict | None":
+    """Return DB security info that will be used for the Revolut Savings import.
+
+    Resolution order mirrors _get_or_create_security:
+      0. Saved mapping  (import_security_mappings for source='Revolut Savings')
+      1. ISIN match     (Securities.ISIN = isin)
+      2. Ticker match   (Securities.Ticker = isin)
+      3. None           (will create a new security on import)
+
+    Returns a dict with keys: sec_id, ticker, name, match_type
+    or None if no existing security matches.
+    """
+    from database.connection import get_connection as _get_conn
+    from database.queries import get_security_mappings as _get_map
+
+    mappings = _get_map("Revolut Savings")   # {key → sec_id}
+
+    conn = _get_conn()
+    cur  = conn.cursor()
+    try:
+        # 0. Saved mapping (keyed by ISIN)
+        if isin and isin in mappings:
+            sec_id = mappings[isin]
+            cur.execute(
+                "SELECT Ticker, Securities_Name FROM Securities WHERE Securities_Id = %s",
+                (sec_id,),
+            )
+            row = cur.fetchone()
+            if row:
+                return {"sec_id": sec_id, "ticker": row[0],
+                        "name": row[1], "match_type": "mapped"}
+
+        # 1. ISIN match
+        if isin:
+            cur.execute(
+                "SELECT Securities_Id, Ticker, Securities_Name "
+                "FROM Securities WHERE ISIN = %s LIMIT 1",
+                (isin,),
+            )
+            row = cur.fetchone()
+            if row:
+                return {"sec_id": row[0], "ticker": row[1],
+                        "name": row[2], "match_type": "isin"}
+
+        # 2. Ticker match (ISIN used as ticker fallback)
+        if isin:
+            cur.execute(
+                "SELECT Securities_Id, Ticker, Securities_Name "
+                "FROM Securities WHERE Ticker = %s LIMIT 1",
+                (isin,),
+            )
+            row = cur.fetchone()
+            if row:
+                return {"sec_id": row[0], "ticker": row[1],
+                        "name": row[2], "match_type": "ticker"}
+
+        return None   # will create on import
+    finally:
+        cur.close()
+        conn.close()
+
+
+def savings_investments_preview_df(records: list) -> "pd.DataFrame":
+    if not records:
+        return pd.DataFrame()
+    df = pd.DataFrame(records)
+    cols = ["date", "action", "symbol", "name", "quantity",
+            "price", "total_eur", "currency", "asset_category", "desc"]
+    return df[[c for c in cols if c in df.columns]].copy()
+
+
+def savings_transactions_preview_df(records: list) -> "pd.DataFrame":
+    if not records:
+        return pd.DataFrame()
+    df = pd.DataFrame(records)
+    return df[["date", "description", "amount", "currency"]].copy()
+
+
+def run_savings_import(
+    inv_records:  list,
+    tx_records:   list,
+    account_id:   int,
+    replace_mode: bool = False,
+    progress_cb=None,
+) -> dict:
+    """Insert parsed Revolut Savings records into the database."""
+    from database.connection import get_connection as _get_conn
+    from database.crud import update_holdings, update_accounts_balances
+
+    conn = _get_conn()
+    cur  = conn.cursor()
+    counts = {
+        "investments": 0, "investments_skip": 0,
+        "transactions": 0, "transactions_skip": 0,
+    }
+
+    try:
+        if replace_mode:
+            cur.execute(
+                "DELETE FROM Investments  WHERE Accounts_Id = %s AND Description LIKE %s",
+                (account_id, f"{_REV_SAVINGS_PREFIX}%"),
+            )
+            cur.execute(
+                "DELETE FROM Transactions WHERE Accounts_Id = %s AND Description LIKE %s",
+                (account_id, f"{_REV_SAVINGS_PREFIX}%"),
+            )
+
+        total = len(inv_records) + len(tx_records)
+        done  = 0
+
+        for rec in inv_records:
+            sec_id = _get_or_create_security(
+                cur,
+                rec["symbol"], rec["name"],
+                rec.get("currency", "EUR"), rec.get("asset_category", "BOND"),
+                source="Revolut Savings", isin=rec.get("isin", ""),
+            )
+            desc = rec["desc"]
+            if not replace_mode and _inv_exists(cur, account_id, desc):
+                counts["investments_skip"] += 1
+            else:
+                cur.execute(
+                    """INSERT INTO Investments
+                           (Accounts_Id, Securities_Id, Date, Action, Quantity,
+                            Price_Per_Share, Total_Amount, Description)
+                       VALUES (%s, %s, %s, %s::investments_action, %s, %s, %s, %s)""",
+                    (account_id, sec_id, rec["date"], rec["action"],
+                     rec["quantity"], rec["price"], rec["total_eur"], desc),
+                )
+                counts["investments"] += 1
+            done += 1
+            if progress_cb and done % 25 == 0:
+                progress_cb(done / total)
+
+        for rec in tx_records:
+            desc = rec["desc"]
+            if not replace_mode and _tx_exists(cur, account_id, desc):
+                counts["transactions_skip"] += 1
+            else:
+                cur.execute(
+                    """INSERT INTO Transactions
+                           (Accounts_Id, Date, Total_Amount, Description, Cleared)
+                       VALUES (%s, %s, %s, %s, TRUE)""",
+                    (account_id, rec["date"], rec["amount"], desc),
                 )
                 counts["transactions"] += 1
             done += 1

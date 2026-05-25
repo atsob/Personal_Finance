@@ -507,9 +507,10 @@ def render_bank_section() -> None:
     conn.close()
     _seed_default_profiles()
 
-    tab_import, tab_revolut, tab_profiles, tab_rules, tab_history = st.tabs([
+    tab_import, tab_revolut, tab_revs, tab_profiles, tab_rules, tab_history = st.tabs([
         "📥 Import & Reconcile",
         "💚 Revolut Personal",
+        "🐣 Revolut Savings",
         "⚙️ Import Profiles",
         "🏷️ Payee Rules",
         "📋 Reconciliation History",
@@ -529,19 +530,26 @@ def render_bank_section() -> None:
         render_revolut_import()
 
     # =========================================================
-    # TAB 3 — Import Profiles
+    # TAB 3 — Revolut Savings (money-market fund CSV)
+    # =========================================================
+    with tab_revs:
+        from ui.broker_import import render_revolut_savings_import
+        render_revolut_savings_import()
+
+    # =========================================================
+    # TAB 4 — Import Profiles
     # =========================================================
     with tab_profiles:
         _render_profiles_tab()
 
     # =========================================================
-    # TAB 4 — Payee Rules
+    # TAB 5 — Payee Rules
     # =========================================================
     with tab_rules:
         _render_rules_tab()
 
     # =========================================================
-    # TAB 5 — Reconciliation History
+    # TAB 6 — Reconciliation History
     # =========================================================
     with tab_history:
         _render_history_tab()

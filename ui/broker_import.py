@@ -1357,6 +1357,532 @@ def render_revolut_brokerage_import() -> None:
 
 
 # ===========================================================================
+# Revolut Savings — preview helper with reconciliation status
+# ===========================================================================
+
+def _revs_preview_with_status(
+    inv_records: list,
+    tx_records: list,
+    existing_inv: set,
+    existing_tx: set,
+    fuzzy_inv: set,
+    fuzzy_tx: set,
+    ignored_descs: set | None = None,
+) -> None:
+    """Preview table for Revolut Savings records with 4-state status.
+
+    Simpler than Trading/IB preview — the security is always the same
+    money-market fund (ISIN IE000AZVL3K0), so no per-record mapping column.
+    """
+    ignored_descs = ignored_descs or set()
+    tab_inv, tab_tx = st.tabs([
+        f"📈 Investments ({len(inv_records)})",
+        f"💳 Cash Transactions ({len(tx_records)})",
+    ])
+
+    with tab_inv:
+        if inv_records:
+            rows = []
+            for r in inv_records:
+                if r["desc"] in existing_inv:
+                    status = "✅ Exists"
+                elif r["desc"] in fuzzy_inv:
+                    status = "⚠️ Likely duplicate"
+                elif r["desc"] in ignored_descs:
+                    status = "⏭️ Ignored"
+                else:
+                    status = "🆕 New"
+                rows.append({**r, "status": status})
+            df_inv = pd.DataFrame(rows)
+            cols = ["status", "date", "action", "symbol", "name",
+                    "quantity", "price", "total_eur", "currency",
+                    "asset_category", "desc"]
+            df_inv = df_inv[[c for c in cols if c in df_inv.columns]]
+            st.dataframe(
+                df_inv, hide_index=True, use_container_width=True,
+                column_config={
+                    "status":         "Status",
+                    "date":           "Date",
+                    "action":         "Action",
+                    "symbol":         "Symbol / ISIN",
+                    "name":           "Name",
+                    "quantity":       st.column_config.NumberColumn("Qty",       format="%.4f"),
+                    "price":          st.column_config.NumberColumn("Price",     format="%.6f"),
+                    "total_eur":      st.column_config.NumberColumn("Total (€)", format="%.4f"),
+                    "currency":       "Ccy",
+                    "asset_category": "Asset",
+                    "desc":           "Dedup Key",
+                },
+            )
+        else:
+            st.info("No investment records in this file.")
+
+    with tab_tx:
+        if tx_records:
+            rows = []
+            for r in tx_records:
+                if r["desc"] in existing_tx:
+                    status = "✅ Exists"
+                elif r["desc"] in fuzzy_tx:
+                    status = "⚠️ Likely duplicate"
+                elif r["desc"] in ignored_descs:
+                    status = "⏭️ Ignored"
+                else:
+                    status = "🆕 New"
+                rows.append({**r, "status": status})
+            df_tx = pd.DataFrame(rows)
+            cols = ["status", "date", "description", "amount", "currency"]
+            df_tx = df_tx[[c for c in cols if c in df_tx.columns]]
+            st.dataframe(
+                df_tx, hide_index=True, use_container_width=True,
+                column_config={
+                    "status":      "Status",
+                    "date":        "Date",
+                    "description": "Description",
+                    "amount":      st.column_config.NumberColumn("Amount", format="%.2f"),
+                    "currency":    "Ccy",
+                },
+            )
+        else:
+            st.info("No cash transaction records in this file.")
+
+
+# ===========================================================================
+# Security Mapping UI  (Revolut Savings)
+# ===========================================================================
+
+def _revs_security_mapping_ui() -> None:
+    """Single-security mapping UI for Revolut Savings (Investment mode only).
+
+    Called only when preview_savings_security() returns None — i.e. the fund
+    ISIN IE000AZVL3K0 is not yet in the database.  Shows one selectbox to pin
+    the ISIN to an existing DB security and a save button that persists the
+    mapping via import_security_mappings so future imports resolve it instantly.
+    """
+    _SAVINGS_ISIN = "IE000AZVL3K0"
+
+    with st.expander(
+        "🗺️ Security Mapping — ISIN IE000AZVL3K0 not matched — click to configure",
+        expanded=True,
+    ):
+        st.caption(
+            "The Revolut EUR Money Market Fund (ISIN **IE000AZVL3K0**) was not found "
+            "in your Securities database.  Select the matching security below to create "
+            "a permanent mapping, or leave as *(create new)* to have it added automatically "
+            "on import."
+        )
+
+        all_secs = _load_all_securities()
+        if all_secs.empty:
+            st.warning("No securities found in the database. Create one in Static Data first.")
+            return
+
+        sec_options = ["(create new — will be added on import)"] + all_secs["name"].tolist()
+        chosen = st.selectbox(
+            "Map IE000AZVL3K0 (Revolut EUR Money Market Fund) to:",
+            sec_options,
+            key="revs_map_security",
+        )
+
+        if not chosen.startswith("(create new"):
+            sec_row = all_secs[all_secs["name"] == chosen]
+            if not sec_row.empty:
+                sec_id = int(sec_row.iloc[0]["securities_id"])
+                if st.button("💾 Save Mapping", key="revs_save_mapping", type="primary"):
+                    from database.queries import save_security_mappings as _save_map
+                    try:
+                        _save_map("Revolut Savings", {_SAVINGS_ISIN: sec_id})
+                        _load_all_securities.clear()
+                        st.success(
+                            f"✅ Mapping saved: `{_SAVINGS_ISIN}` → **{chosen}**. "
+                            "Re-parse to see the updated security confirmation above."
+                        )
+                        st.rerun()
+                    except Exception as _exc:
+                        st.error(f"Failed to save mapping: {_exc}")
+        else:
+            st.info(
+                "A new security will be created automatically during import. "
+                "Select an existing one above if you prefer to link to a security "
+                "already in your database (e.g. the Fidelity fund you may have added "
+                "under a different ticker)."
+            )
+
+
+# ===========================================================================
+# Revolut Savings — main render function  (called from ui/bank_import.py)
+# ===========================================================================
+
+def render_revolut_savings_import() -> None:
+    _brand_header("https://logo.clearbit.com/revolut.com", "Revolut Savings")
+    st.markdown(
+        "Import buys, daily interest and service fees from a **Revolut Savings** "
+        "(Flexible Cash Funds / money-market) account using the savings statement CSV."
+    )
+
+    with st.expander("ℹ️ How to export from Revolut Savings (click to expand)", expanded=False):
+        st.markdown("""
+1. Open the **Revolut app** → tap **Savings** (or **Flexible account**).
+2. Tap the **⋮** (three-dot) menu → **Statement**.
+3. Choose a date range → tap **Download CSV**.
+4. Upload the downloaded `.csv` file below.
+
+> **CSV columns:** Date · Description · Value, EUR · Price per share · Quantity of shares
+>
+> **Supported types:** BUY · Interest PAID · Service Fee Charged
+>
+> **Note:** *Interest Reinvested* rows are skipped — the paired BUY on the
+> following day already records the reinvestment as a fund purchase.
+""")
+
+    st.divider()
+
+    # ── Import mode ──────────────────────────────────────────────────────────
+    st.markdown("### 🔀 Import Mode")
+    _MODE_TX  = "💳 Transaction mode — cash in/out (for Savings / Checking accounts)"
+    _MODE_INV = "📈 Investment mode  — fund units  (for Brokerage / Investment accounts)"
+    import_mode = st.radio(
+        "How should Revolut Savings records be stored?",
+        [_MODE_TX, _MODE_INV],
+        key="revs_mode",
+        help=(
+            "**Transaction mode** — maps all events to plain cash transactions visible "
+            "in the standard account register. Best if you already have this account "
+            "defined as *Savings* and treat it as a cash savings pot.\n\n"
+            "**Investment mode** — creates Investment records (Buy / Dividend / MiscExp) "
+            "tracking fund units at NAV ≈ €1.00. Requires a *Brokerage* or *Other Investment* "
+            "account type so the investment register shows the records."
+        ),
+    )
+    _tx_mode = import_mode == _MODE_TX
+
+    if _tx_mode:
+        st.info(
+            "💳 **Transaction mode:** BUY → deposit, Interest PAID → income, "
+            "Service Fee → expense. All visible in the standard Transactions register."
+        )
+    else:
+        st.info(
+            "📈 **Investment mode:** records fund units (ISIN IE000AZVL3K0) as "
+            "Buy / Reinvest / Sell in the Investments table. "
+            "Make sure to select a *Brokerage* or *Other Investment* account below."
+        )
+
+    st.divider()
+
+    # ── File upload ──────────────────────────────────────────────────────────
+    st.markdown("### 📂 Statement File")
+    uploaded = st.file_uploader(
+        "Upload Revolut Savings CSV statement",
+        type=["csv"],
+        key="revs_csv_upload",
+        help="Export from Revolut app → Savings → ⋮ → Statement → CSV",
+    )
+
+    st.divider()
+
+    # ── Account mapping (filter by mode) ────────────────────────────────────
+    st.markdown("### 🏦 Account Mapping")
+    if _tx_mode:
+        _acc_types = ["Checking", "Savings", "Cash", "Other"]
+        _acc_hint  = "Select the Savings / Checking account this fund is linked to."
+    else:
+        _acc_types = ["Brokerage", "Other Investment", "Pension", "Savings"]
+        _acc_hint  = "Select a Brokerage or Investment account. Investment records will not appear in Savings account registers."
+    acc_id, acc_name = _account_selectbox(
+        "Import into account",
+        key="revs_account",
+        type_filter=_acc_types,
+    )
+    if _acc_hint:
+        st.caption(_acc_hint)
+
+    st.divider()
+
+    # ── Options ──────────────────────────────────────────────────────────────
+    st.markdown("### ⚙️ Options")
+    replace_mode = st.checkbox(
+        "Replace mode — delete all existing Revolut Savings records for this account before importing",
+        value=False, key="revs_replace",
+        help="All Investment and Transaction rows whose Description starts with "
+             "'REVS|' will be deleted first.",
+    )
+
+    st.divider()
+
+    if uploaded is None:
+        st.info("Upload a Revolut Savings CSV file above to continue.")
+        return
+
+    # ── Parse ────────────────────────────────────────────────────────────────
+    parse_btn = st.button("🔍 Parse & Preview", key="revs_parse", type="primary",
+                          disabled=acc_id is None)
+
+    # Clear stale parsed state when mode changes so re-parse is always fresh
+    _cached_mode = st.session_state.get("revs_parsed_mode")
+    if _cached_mode is not None and _cached_mode != import_mode:
+        for _k in ("revs_parsed", "revs_inv_records", "revs_tx_records", "revs_df_raw",
+                   "revs_existing_inv", "revs_existing_tx",
+                   "revs_fuzzy_inv", "revs_fuzzy_tx", "revs_ignored"):
+            st.session_state.pop(_k, None)
+
+    if parse_btn or st.session_state.get("revs_parsed"):
+        from data.revolut_importer import (
+            parse_revolut_savings_csv,
+            build_savings_records, build_savings_records_as_tx,
+            check_existing_records as _revs_check,
+            check_fuzzy_duplicates  as _revs_fuzzy,
+        )
+
+        if parse_btn:
+            try:
+                df_raw = parse_revolut_savings_csv(uploaded.read())
+            except Exception as exc:
+                st.error(f"Failed to parse CSV: {exc}")
+                return
+
+            try:
+                _builder = build_savings_records_as_tx if _tx_mode else build_savings_records
+                inv_records, tx_records = _builder(df_raw)
+            except Exception as exc:
+                st.error(f"Failed to build records: {exc}")
+                st.code(traceback.format_exc())
+                return
+
+            existing_inv, existing_tx = _revs_check(inv_records, tx_records, acc_id)
+            fuzzy_inv, fuzzy_tx       = _revs_fuzzy(inv_records, tx_records, acc_id)
+            fuzzy_inv -= existing_inv
+            fuzzy_tx  -= existing_tx
+
+            from database.queries import get_ignored_records as _get_ign_revs
+            ignored_descs = _get_ign_revs("Revolut Savings")
+
+            st.session_state["revs_inv_records"]  = inv_records
+            st.session_state["revs_tx_records"]   = tx_records
+            st.session_state["revs_df_raw"]       = df_raw
+            st.session_state["revs_existing_inv"] = existing_inv
+            st.session_state["revs_existing_tx"]  = existing_tx
+            st.session_state["revs_fuzzy_inv"]    = fuzzy_inv
+            st.session_state["revs_fuzzy_tx"]     = fuzzy_tx
+            st.session_state["revs_ignored"]      = ignored_descs
+            st.session_state["revs_parsed"]       = True
+            st.session_state["revs_parsed_mode"]  = import_mode
+
+        inv_records   = st.session_state.get("revs_inv_records",  [])
+        tx_records    = st.session_state.get("revs_tx_records",   [])
+        df_raw        = st.session_state.get("revs_df_raw",       pd.DataFrame())
+        existing_inv  = st.session_state.get("revs_existing_inv", set())
+        existing_tx   = st.session_state.get("revs_existing_tx",  set())
+        fuzzy_inv     = st.session_state.get("revs_fuzzy_inv",    set())
+        fuzzy_tx      = st.session_state.get("revs_fuzzy_tx",     set())
+        ignored_descs = st.session_state.get("revs_ignored",      set())
+
+        # ── File summary ──────────────────────────────────────────────────
+        if not df_raw.empty:
+            s1, s2, s3 = st.columns(3)
+            s1.metric("Rows in file",    len(df_raw))
+            s2.metric("Date range from", str(df_raw["date"].min()))
+            s3.metric("Date range to",   str(df_raw["date"].max()))
+
+        if not inv_records and not tx_records:
+            st.warning("No importable records found in this file.")
+            return
+
+        # ── Security preview (Investment mode only) ────────────────────────
+        if not _tx_mode:
+            from data.revolut_importer import preview_savings_security as _prev_sec
+            _sec_info = _prev_sec()
+            if _sec_info:
+                _match_icon  = {"mapped": "🗺️", "isin": "🔗", "ticker": "🔗"}.get(
+                    _sec_info["match_type"], "🔗"
+                )
+                _match_label = {
+                    "mapped": "saved mapping",
+                    "isin":   "ISIN IE000AZVL3K0",
+                    "ticker": "ticker match",
+                }.get(_sec_info["match_type"], "ISIN match")
+                st.success(
+                    f"{_match_icon} **Security resolved:** **{_sec_info['name']}** "
+                    f"(`{_sec_info['ticker']}`) — matched by {_match_label}. "
+                    "All investment records will be linked to this security."
+                )
+            else:
+                st.warning(
+                    "⚠️ **Security not found:** ISIN `IE000AZVL3K0` "
+                    "(Revolut EUR Money Market Fund) was not matched in your Securities "
+                    "database. A new security will be created on import, or use the "
+                    "mapping tool below to link it to an existing entry."
+                )
+                _revs_security_mapping_ui()
+
+        # ── Transaction type breakdown ─────────────────────────────────────
+        if not df_raw.empty:
+            with st.expander("📊 Transaction type breakdown"):
+                def _cls(desc: str) -> str:
+                    d = str(desc).upper()
+                    if d.startswith("BUY"):               return "BUY"
+                    if d.startswith("INTEREST PAID"):     return "INTEREST PAID"
+                    if d.startswith("SERVICE FEE"):       return "SERVICE FEE CHARGED"
+                    if d.startswith("INTEREST REINVEST"): return "INTEREST REINVESTED (SELL)"
+                    return "OTHER"
+                df_tc = df_raw.copy()
+                df_tc["type"] = df_tc["description"].apply(_cls)
+                type_counts = (
+                    df_tc.groupby("type")["value_eur"]
+                    .agg(count="count", total="sum")
+                    .reset_index()
+                    .sort_values("count", ascending=False)
+                )
+                st.dataframe(
+                    type_counts, hide_index=True, use_container_width=True,
+                    column_config={
+                        "type":  "Type",
+                        "count": st.column_config.NumberColumn("# Rows",     format="%d"),
+                        "total": st.column_config.NumberColumn("Net (€)",    format="%.4f"),
+                    },
+                )
+
+        # ── Reconciliation summary ─────────────────────────────────────────
+        truly_new_inv = [r for r in inv_records
+                         if r["desc"] not in existing_inv
+                         and r["desc"] not in fuzzy_inv
+                         and r["desc"] not in ignored_descs]
+        truly_new_tx  = [r for r in tx_records
+                         if r["desc"] not in existing_tx
+                         and r["desc"] not in fuzzy_tx
+                         and r["desc"] not in ignored_descs]
+        fuzzy_only_inv  = [r for r in inv_records if r["desc"] in fuzzy_inv]
+        fuzzy_only_tx   = [r for r in tx_records  if r["desc"] in fuzzy_tx]
+        exist_inv_count = sum(1 for r in inv_records if r["desc"] in existing_inv)
+        exist_tx_count  = sum(1 for r in tx_records  if r["desc"] in existing_tx)
+        ign_inv_count   = sum(1 for r in inv_records if r["desc"] in ignored_descs)
+        ign_tx_count    = sum(1 for r in tx_records  if r["desc"] in ignored_descs)
+
+        _skip_inv = exist_inv_count + len(fuzzy_only_inv)
+        _skip_tx  = exist_tx_count  + len(fuzzy_only_tx)
+
+        if not truly_new_inv and not truly_new_tx and not replace_mode:
+            st.info(
+                f"✅ Nothing genuinely new — "
+                + (f"**{exist_inv_count}** inv exact + **{len(fuzzy_only_inv)}** likely-dup, "
+                   if not _tx_mode else "")
+                + f"**{exist_tx_count}** tx exact + **{len(fuzzy_only_tx)}** likely-dup."
+            )
+        else:
+            _new_label = (
+                f"**{len(truly_new_tx)}** new transaction(s)"
+                if _tx_mode else
+                f"**{len(truly_new_inv)}** new investment record(s) and "
+                f"**{len(truly_new_tx)}** new transaction(s)"
+            )
+            st.success(f"Found {_new_label} to import.")
+
+        if fuzzy_only_inv or fuzzy_only_tx:
+            st.warning(
+                (f"⚠️ **{len(fuzzy_only_inv)}** investment(s) and " if not _tx_mode else "⚠️ ")
+                + f"**{len(fuzzy_only_tx)}** transaction(s) match existing records by "
+                "date/amount but have a different description key — "
+                "marked **⚠️ Likely duplicate** and will be skipped."
+            )
+        if ign_inv_count or ign_tx_count:
+            st.info(
+                (f"⏭️ **{ign_inv_count}** investment(s) and " if not _tx_mode else "⏭️ ")
+                + f"**{ign_tx_count}** transaction(s) are on the ignore list and will be skipped."
+            )
+
+        # Show mode-appropriate metrics
+        if _tx_mode:
+            m1, m2 = st.columns(2)
+            m1.metric("🆕 New transactions",  len(truly_new_tx))
+            m2.metric("🔄 Skip transactions", _skip_tx + ign_tx_count,
+                      help="✅ Exact key match + ⚠️ Likely duplicates + ⏭️ Ignored")
+        else:
+            r1, r2, r3, r4 = st.columns(4)
+            r1.metric("🆕 New investments",   len(truly_new_inv))
+            r2.metric("🔄 Skip investments",  _skip_inv + ign_inv_count,
+                      help="✅ Exact key match + ⚠️ Likely duplicates + ⏭️ Ignored")
+            r3.metric("🆕 New transactions",  len(truly_new_tx))
+            r4.metric("🔄 Skip transactions", _skip_tx  + ign_tx_count,
+                      help="✅ Exact key match + ⚠️ Likely duplicates + ⏭️ Ignored")
+
+        # ── Preview ──────────────────────────────────────────────────────────
+        st.markdown("### 👁️ Preview")
+        _revs_preview_with_status(
+            inv_records, tx_records,
+            existing_inv, existing_tx,
+            fuzzy_inv, fuzzy_tx,
+            ignored_descs=ignored_descs,
+        )
+
+        # ── Ignore manager ────────────────────────────────────────────────────
+        _ignore_manager_ui(
+            "Revolut Savings",
+            inv_records, tx_records,
+            existing_inv, existing_tx,
+            fuzzy_inv, fuzzy_tx,
+            ignored_descs,
+            session_key="revs",
+        )
+
+        # ── Import ───────────────────────────────────────────────────────────
+        st.divider()
+        st.markdown("### 💾 Import")
+        st.caption(
+            f"Target account: **{acc_name}** (ID {acc_id}) — "
+            f"{'💳 Transaction mode' if _tx_mode else '📈 Investment mode'}"
+        )
+
+        if _tx_mode:
+            # Transaction mode: only transactions exist, single checkbox
+            _import_tx  = st.checkbox("💳 Import cash transactions", value=True, key="revs_import_tx")
+            _imp_inv    = []
+            _imp_tx     = (truly_new_tx if not replace_mode else tx_records) if _import_tx else []
+        else:
+            # Investment mode: both record types may exist
+            _rcol1, _rcol2 = st.columns(2)
+            _import_inv = _rcol1.checkbox("📈 Import investments",       value=True, key="revs_import_inv")
+            _import_tx  = _rcol2.checkbox("💳 Import cash transactions", value=True, key="revs_import_tx")
+            _imp_inv    = (truly_new_inv if not replace_mode else inv_records) if _import_inv else []
+            _imp_tx     = (truly_new_tx  if not replace_mode else tx_records)  if _import_tx  else []
+
+        _new_total = len(_imp_inv) + len(_imp_tx)
+
+        if _new_total == 0 and not replace_mode:
+            st.info(
+                "No records to import.  "
+                "Enable **Replace mode** above if you want to force a clean re-import."
+            )
+        else:
+            _btn_suffix = (
+                f" ({_new_total} record{'s' if _new_total != 1 else ''})"
+                if not replace_mode else " (replace mode)"
+            )
+            if st.button(f"✅ Confirm Import{_btn_suffix}", key="revs_confirm", type="primary"):
+                from data.revolut_importer import run_savings_import
+                prog = st.progress(0.0, text="Importing…")
+                try:
+                    counts = run_savings_import(
+                        _imp_inv, _imp_tx, acc_id,
+                        replace_mode=replace_mode,
+                        progress_cb=lambda p: prog.progress(p, text="Importing…"),
+                    )
+                    prog.empty()
+                    st.success("✅ Import complete!")
+                    _import_summary(counts)
+                    for k in ("revs_parsed", "revs_parsed_mode",
+                              "revs_inv_records", "revs_tx_records",
+                              "revs_df_raw", "revs_existing_inv", "revs_existing_tx",
+                              "revs_fuzzy_inv", "revs_fuzzy_tx", "revs_ignored"):
+                        st.session_state.pop(k, None)
+                    _load_accounts.clear()
+                    st.cache_data.clear()
+                except Exception as exc:
+                    prog.empty()
+                    st.error(f"Import failed: {exc}")
+                    st.code(traceback.format_exc())
+
+
+# ===========================================================================
 # Brokerage section — top-level container (called from ui/importers.py)
 # ===========================================================================
 
