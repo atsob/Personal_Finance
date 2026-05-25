@@ -16,7 +16,7 @@ from ui.reports import render_reports
 from ui.market_data import render_market_data
 from ui.ai_assistant import render_ai_assistant
 from ui.tools import render_tools
-from ui.bank_import import render_bank_import
+from ui.importers import render_importers
 from ui.static_data import render_static_data
 
 @st.cache_resource
@@ -179,7 +179,7 @@ def main():
             "⏳ Reports",
             "📋 Static Data",
             "🌍 Market Data",
-            "🏦 Bank Import",
+            "📥 Importers",
             "🛠️ Tools",
             "🧠 AI Assistant",
         ]
@@ -208,8 +208,8 @@ def main():
             render_static_data()
         elif menu == "🌍 Market Data":
             render_market_data()
-        elif menu == "🏦 Bank Import":
-            render_bank_import()
+        elif menu == "📥 Importers":
+            render_importers()
         elif menu == "🛠️ Tools":
             render_tools(conn)       
         elif menu == "🧠 AI Assistant":

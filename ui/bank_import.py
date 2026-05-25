@@ -493,10 +493,9 @@ def match_statement_to_app(df_stmt: pd.DataFrame, df_app: pd.DataFrame,
 # Main render function
 # ---------------------------------------------------------------------------
 
-def render_bank_import():
-    """Render the Bank Statement Import & Reconciliation page."""
-    st.title("🏦 Bank Import & Reconciliation")
-    st.caption(
+def render_bank_section() -> None:
+    """Bank import section — called from the Importers page (no page title)."""
+    st.markdown(
         "Import a CSV or Excel bank statement export, automatically match transactions "
         "already recorded in the app, import new ones with payee learning, and mark "
         "everything as reconciled — all in one workflow."
@@ -508,8 +507,9 @@ def render_bank_import():
     conn.close()
     _seed_default_profiles()
 
-    tab_import, tab_profiles, tab_rules, tab_history = st.tabs([
+    tab_import, tab_revolut, tab_profiles, tab_rules, tab_history = st.tabs([
         "📥 Import & Reconcile",
+        "💚 Revolut Personal",
         "⚙️ Import Profiles",
         "🏷️ Payee Rules",
         "📋 Reconciliation History",
@@ -522,22 +522,35 @@ def render_bank_import():
         _render_import_tab()
 
     # =========================================================
-    # TAB 2 — Import Profiles
+    # TAB 2 — Revolut Personal (bank account CSV)
+    # =========================================================
+    with tab_revolut:
+        from ui.broker_import import render_revolut_import
+        render_revolut_import()
+
+    # =========================================================
+    # TAB 3 — Import Profiles
     # =========================================================
     with tab_profiles:
         _render_profiles_tab()
 
     # =========================================================
-    # TAB 3 — Payee Rules
+    # TAB 4 — Payee Rules
     # =========================================================
     with tab_rules:
         _render_rules_tab()
 
     # =========================================================
-    # TAB 4 — Reconciliation History
+    # TAB 5 — Reconciliation History
     # =========================================================
     with tab_history:
         _render_history_tab()
+
+
+def render_bank_import() -> None:
+    """Legacy entry point — shows page title then delegates to render_bank_section()."""
+    st.title("🏦 Bank Import & Reconciliation")
+    render_bank_section()
 
 
 # ---------------------------------------------------------------------------

@@ -1,10 +1,6 @@
 import re
 import streamlit as st
 import pandas as pd
-from data.qif_importer import render_qif_importer
-from data.transfer_issues import render_transfer_issues
-from data.capitalcom_importer import render_capitalcom_importer
-from data.fxpro_importer import render_fxpro_importer
 from database.backup import render_backup_restore
 from database.connection import get_connection
 from database.queries import get_price_anomalies, get_missing_tx_prices, get_investments_with_dummy_prices
@@ -835,15 +831,9 @@ def _render_normalize_investments():
 
 
 _CATEGORIES = {
-    "📁 Importers": [
-        "📁 QIF Importer",
-        "📝 QIF Importer: Transfer Issues",
-        "📈 Capital.com Importer",
-        "📈 FxPro Importer",
-    ],
     "💾 Database": [
         "💾 Backup & Restore",
-        "🔧 DB Maintenance",        
+        "🔧 DB Maintenance",
         "🛢 SQL Interface",
     ],
     "📊 Market Data & Prices": [
@@ -854,10 +844,6 @@ _CATEGORIES = {
 }
 
 _TOOL_RENDERERS = {
-    "📁 QIF Importer":           render_qif_importer,
-    "📝 QIF Importer: Transfer Issues":        render_transfer_issues,
-    "📈 Capital.com Importer":   render_capitalcom_importer,
-    "📈 FxPro Importer":         render_fxpro_importer,
     "💾 Backup & Restore":       render_backup_restore,
     "🛢 SQL Interface":          _render_sql_interface,
     "🔧 DB Maintenance":         _render_db_maintenance,

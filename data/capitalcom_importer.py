@@ -316,16 +316,44 @@ def _get_or_create_account(cur, name: str) -> int:
     return cur.fetchone()[0]
 
 
-def _get_or_create_security(cur, symbol: str, name: str, currency: str) -> int:
-    # Try by exact name
-    cur.execute(
-        "SELECT Securities_Id FROM Securities WHERE Securities_Name = %s LIMIT 1", (name,)
-    )
-    row = cur.fetchone()
-    if row:
-        return row[0]
+def _get_or_create_security(cur, symbol: str, name: str, currency: str,
+                             _cached_mappings: dict | None = None) -> int:
+    """Resolve or create a Security record.
+
+    Match priority:
+      0. Saved mapping in import_security_mappings (user-defined override, keyed by symbol)
+      1. Exact name match in Securities
+      2. Ticker match in Securities (instrument symbol)
+      3. Create new security
+    """
+    # 0. Saved mapping
+    if _cached_mappings is None:
+        from database.queries import get_security_mappings as _get_map
+        _cached_mappings = _get_map("Capital.com")
+    if symbol and symbol in _cached_mappings:
+        return _cached_mappings[symbol]
+
+    # 1. Exact name match
+    if name:
+        cur.execute(
+            "SELECT Securities_Id FROM Securities WHERE Securities_Name = %s LIMIT 1", (name,)
+        )
+        row = cur.fetchone()
+        if row:
+            return row[0]
+
+    # 2. Ticker / symbol match
+    if symbol:
+        cur.execute(
+            "SELECT Securities_Id FROM Securities WHERE Ticker = %s LIMIT 1", (symbol,)
+        )
+        row = cur.fetchone()
+        if row:
+            return row[0]
+
+    # 3. Create new
     sec_type = _classify_security(symbol, name, currency)
-    ticker   = symbol or name[:20]   # ticker is NOT NULL; use symbol, fall back to truncated name
+    ticker   = symbol or name[:20]
     cur.execute(
         """INSERT INTO Securities (Ticker, Securities_Name, Securities_Type, Currencies_Id)
            VALUES (%s, %s, %s,
@@ -399,9 +427,16 @@ def run_import(
         total = len(inv_records) + len(tx_records)
         done  = 0
 
+        # Load user-defined security mappings once to avoid a DB call per record
+        from database.queries import get_security_mappings as _get_sec_map
+        _cap_mappings = _get_sec_map("Capital.com")
+
         # ── Investments ───────────────────────────────────────────────────────
         for rec in inv_records:
-            sec_id = _get_or_create_security(cur, rec['symbol'], rec['name'], rec.get('currency', ''))
+            sec_id = _get_or_create_security(
+                cur, rec['symbol'], rec['name'], rec.get('currency', ''),
+                _cached_mappings=_cap_mappings,
+            )
             if not replace_mode and _investment_exists(cur, account_id, rec['desc']):
                 counts['investments_skip'] += 1
             else:
@@ -449,6 +484,127 @@ def run_import(
         conn.close()
 
     return counts
+
+
+# ── Security Mapping UI ───────────────────────────────────────────────────────
+
+def _render_cap_security_mapping(trades_df: pd.DataFrame) -> None:
+    """Show the security mapping panel for Capital.com instrument symbols.
+
+    Identifies instruments that have no saved mapping and no automatic match
+    (by name or ticker) and lets the user link them to existing DB securities.
+    Mappings are persisted to import_security_mappings under source='Capital.com'.
+    """
+    from database.queries import get_security_mappings, save_security_mappings
+
+    # Unique instruments that appear in trade records
+    instr_df = (
+        trades_df[trades_df['Status'].isin(['OPENED', 'CLOSED', 'DIVIDEND', 'SWAP'])]
+        [['Instrument Symbol', 'Instrument Name', 'Currency']]
+        .drop_duplicates()
+        .sort_values('Instrument Name')
+    )
+    if instr_df.empty:
+        return
+
+    saved_ids = get_security_mappings("Capital.com")   # {symbol → sec_id}
+
+    # Load all DB securities
+    conn = get_connection()
+    all_secs = pd.read_sql(
+        """SELECT s.Securities_Id   AS securities_id,
+                  s.Ticker          AS ticker,
+                  s.Securities_Name AS name
+           FROM   Securities s
+           ORDER  BY s.Securities_Name""",
+        conn,
+    )
+    conn.close()
+
+    name_to_id   = dict(zip(all_secs["name"],   all_secs["securities_id"].astype(int)))
+    ticker_to_id = dict(zip(all_secs["ticker"], all_secs["securities_id"].astype(int)))
+    id_to_name   = dict(zip(all_secs["securities_id"].astype(int), all_secs["name"]))
+
+    # Find instruments with no resolved match
+    unmapped: list[dict] = []
+    for _, row in instr_df.iterrows():
+        sym  = str(row["Instrument Symbol"]).strip()
+        nm   = str(row["Instrument Name"]).strip()
+        ccy  = str(row.get("Currency", "")).strip()
+        if sym in saved_ids:
+            continue                                    # already mapped
+        if nm in name_to_id or sym in ticker_to_id:
+            continue                                    # auto-matched
+        unmapped.append({"symbol": sym, "name": nm, "currency": ccy})
+
+    # Always show the expander so users can review / update saved mappings
+    saved_count   = len(saved_ids)
+    unmapped_count = len(unmapped)
+
+    with st.expander(
+        f"🗺️ Security Mappings — {unmapped_count} unmapped · {saved_count} saved",
+        expanded=bool(unmapped_count),
+    ):
+        if unmapped_count == 0 and saved_count == 0:
+            st.success("All instruments matched automatically — no manual mapping needed.")
+            return
+
+        if unmapped_count:
+            st.caption(
+                "These instruments could not be matched in your database by name or ticker. "
+                "Select the corresponding DB security for each one, then click **💾 Save Mappings**. "
+                "Mappings are permanent and used for all future Capital.com imports."
+            )
+            sec_options = ["(create new — will be added on import)"] + all_secs["name"].tolist()
+            pending: dict[str, int] = {}
+
+            for item in unmapped:
+                sym = item["symbol"]
+                c1, c2, c3 = st.columns([1, 2, 3])
+                with c1:
+                    st.markdown(f"**{sym}**")
+                with c2:
+                    st.caption(item["name"])
+                with c3:
+                    chosen = st.selectbox(
+                        f"Map {sym}",
+                        sec_options,
+                        key=f"cap_map_{sym.replace(' ', '_').replace('/', '_').replace('#', 'h')}",
+                        label_visibility="collapsed",
+                    )
+                    if not chosen.startswith("(create new"):
+                        sid = name_to_id.get(chosen)
+                        if sid:
+                            pending[sym] = int(sid)
+
+            if pending:
+                if st.button("💾 Save Mappings", key="cap_save_mappings", type="primary"):
+                    try:
+                        save_security_mappings("Capital.com", pending)
+                        st.success(f"✅ Saved {len(pending)} mapping(s).")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Failed to save mappings: {exc}")
+
+        # Show / manage already-saved mappings
+        if saved_count:
+            st.divider()
+            st.markdown(f"**Saved mappings** ({saved_count}):")
+            rows = [
+                {"Symbol": sym, "Mapped to": id_to_name.get(int(sid), f"id={sid}")}
+                for sym, sid in saved_ids.items()
+            ]
+            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+            to_delete = st.multiselect(
+                "Remove mappings:", list(saved_ids.keys()), key="cap_del_mappings"
+            )
+            if to_delete and st.button("🗑️ Remove selected", key="cap_del_mappings_btn"):
+                from database.queries import delete_security_mapping
+                for sym in to_delete:
+                    delete_security_mapping("Capital.com", sym)
+                st.success(f"Removed {len(to_delete)} mapping(s).")
+                st.rerun()
 
 
 # ── Streamlit UI ──────────────────────────────────────────────────────────────
@@ -511,6 +667,11 @@ def render_capitalcom_importer():
 | **Swap fees** | €{swap:,.2f} |
 | **Net** | €{dep+wdl+pnl+swap:,.2f} |
 """)
+
+    st.divider()
+
+    # ── Security Mapping ──────────────────────────────────────────────────────
+    _render_cap_security_mapping(trades_df)
 
     st.divider()
 

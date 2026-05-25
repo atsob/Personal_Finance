@@ -713,6 +713,190 @@ def get_all_securities_for_filter():
     return df
 
 
+def get_app_setting(key: str) -> str | None:
+    """Read a single text value from app_settings. Returns None if not found."""
+    conn = get_connection()
+    cur  = conn.cursor()
+    try:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT)
+        """)
+        conn.commit()
+        cur.execute("SELECT value FROM app_settings WHERE key = %s", (key,))
+        row = cur.fetchone()
+        return row[0] if row else None
+    except Exception:
+        conn.rollback()
+        return None
+    finally:
+        cur.close()
+        conn.close()
+
+
+def save_app_setting(key: str, value: str) -> None:
+    """Upsert a single text value into app_settings."""
+    conn = get_connection()
+    cur  = conn.cursor()
+    try:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT)
+        """)
+        cur.execute("""
+            INSERT INTO app_settings (key, value) VALUES (%s, %s)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        """, (key, value))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Import: ignored records  (source, desc_key) → skip forever
+# ---------------------------------------------------------------------------
+
+_SQL_CREATE_IGNORED = """
+    CREATE TABLE IF NOT EXISTS import_ignored_records (
+        source     TEXT        NOT NULL,
+        desc_key   TEXT        NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        PRIMARY KEY (source, desc_key)
+    )
+"""
+
+
+def get_ignored_records(source: str) -> set:
+    """Return all desc_keys currently marked as 'ignore' for *source*."""
+    conn = get_connection()
+    cur  = conn.cursor()
+    try:
+        cur.execute(_SQL_CREATE_IGNORED)
+        conn.commit()
+        cur.execute(
+            "SELECT desc_key FROM import_ignored_records WHERE source = %s",
+            (source,),
+        )
+        return {row[0] for row in cur.fetchall()}
+    finally:
+        cur.close()
+        conn.close()
+
+
+def save_ignored_records(source: str, desc_keys: list) -> None:
+    """Add desc_keys to the ignore list (idempotent)."""
+    if not desc_keys:
+        return
+    conn = get_connection()
+    cur  = conn.cursor()
+    try:
+        cur.execute(_SQL_CREATE_IGNORED)
+        for key in desc_keys:
+            cur.execute(
+                "INSERT INTO import_ignored_records (source, desc_key) "
+                "VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                (source, key),
+            )
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+
+def remove_ignored_records(source: str, desc_keys: list) -> None:
+    """Remove desc_keys from the ignore list."""
+    if not desc_keys:
+        return
+    conn = get_connection()
+    cur  = conn.cursor()
+    try:
+        cur.execute(_SQL_CREATE_IGNORED)
+        for key in desc_keys:
+            cur.execute(
+                "DELETE FROM import_ignored_records "
+                "WHERE source = %s AND desc_key = %s",
+                (source, key),
+            )
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Import: security mappings  (source, source_symbol) → securities_id
+# ---------------------------------------------------------------------------
+
+_SQL_CREATE_MAPPINGS = """
+    CREATE TABLE IF NOT EXISTS import_security_mappings (
+        source          TEXT    NOT NULL,
+        source_symbol   TEXT    NOT NULL,
+        securities_id   INTEGER NOT NULL,
+        PRIMARY KEY (source, source_symbol)
+    )
+"""
+
+
+def get_security_mappings(source: str) -> dict:
+    """Return {source_symbol → securities_id} for *source*."""
+    conn = get_connection()
+    cur  = conn.cursor()
+    try:
+        cur.execute(_SQL_CREATE_MAPPINGS)
+        conn.commit()
+        cur.execute(
+            "SELECT source_symbol, securities_id "
+            "FROM import_security_mappings WHERE source = %s",
+            (source,),
+        )
+        return {row[0]: row[1] for row in cur.fetchall()}
+    finally:
+        cur.close()
+        conn.close()
+
+
+def save_security_mappings(source: str, mappings: dict) -> None:
+    """Upsert {source_symbol → securities_id} for *source*."""
+    if not mappings:
+        return
+    conn = get_connection()
+    cur  = conn.cursor()
+    try:
+        cur.execute(_SQL_CREATE_MAPPINGS)
+        for symbol, sec_id in mappings.items():
+            cur.execute(
+                """INSERT INTO import_security_mappings
+                       (source, source_symbol, securities_id)
+                   VALUES (%s, %s, %s)
+                   ON CONFLICT (source, source_symbol)
+                   DO UPDATE SET securities_id = EXCLUDED.securities_id""",
+                (source, symbol, sec_id),
+            )
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+
+def delete_security_mapping(source: str, source_symbol: str) -> None:
+    """Remove one mapping."""
+    conn = get_connection()
+    cur  = conn.cursor()
+    try:
+        cur.execute(_SQL_CREATE_MAPPINGS)
+        cur.execute(
+            "DELETE FROM import_security_mappings "
+            "WHERE source = %s AND source_symbol = %s",
+            (source, source_symbol),
+        )
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+
 def get_nwr_account_selection(settings_key: str = 'nwr_account_ids'):
     """Load saved account selection from app_settings. Returns list of ints or None."""
     conn = get_connection()

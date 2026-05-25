@@ -16,23 +16,52 @@ from database.crud import update_investment_balances, update_holdings, update_ac
 
 _FXP_PREFIX = 'FXP|'
 
-# Persisted security mapping: {pdf_symbol → "ticker | name | currency" label}
+# Legacy JSON file — kept only for one-time migration to the DB table.
 _MAPPING_FILE = Path(__file__).parent / 'fxpro_security_map.json'
 
 
-def _load_saved_mapping() -> dict:
+def _load_saved_mapping() -> dict[str, int]:
+    """Return {pdf_symbol → securities_id} from the DB.
+
+    On the very first call after upgrading from the JSON-file approach this
+    function silently migrates the old label-based JSON into the DB and renames
+    the JSON file so the migration only runs once.
+    """
+    from database.queries import get_security_mappings, save_security_mappings
+
+    # One-time migration: JSON file exists but DB is empty for FxPro
     if _MAPPING_FILE.exists():
         try:
-            return json.loads(_MAPPING_FILE.read_text(encoding='utf-8'))
+            existing_db = get_security_mappings("FxPro")
+            if not existing_db:
+                label_map = json.loads(_MAPPING_FILE.read_text(encoding='utf-8'))
+                if label_map:
+                    db_df = _load_db_securities()
+                    label_to_id = {
+                        f"{r['ticker']} | {r['name']} | {r['currency']}": int(r['sec_id'])
+                        for _, r in db_df.iterrows()
+                    }
+                    to_save = {
+                        sym: label_to_id[label]
+                        for sym, label in label_map.items()
+                        if label in label_to_id
+                    }
+                    if to_save:
+                        save_security_mappings("FxPro", to_save)
+            # Rename the JSON file so we don't attempt migration again
+            _MAPPING_FILE.rename(_MAPPING_FILE.with_suffix('.json.migrated'))
         except Exception:
-            return {}
-    return {}
+            pass  # migration is best-effort; never block the UI
+
+    return get_security_mappings("FxPro")
 
 
-def _save_mapping(label_map: dict) -> None:
-    _MAPPING_FILE.write_text(
-        json.dumps(label_map, indent=2, ensure_ascii=False), encoding='utf-8'
-    )
+def _save_mapping(sec_id_map: dict[str, int]) -> None:
+    """Persist {pdf_symbol → securities_id} to the DB (non-None values only)."""
+    from database.queries import save_security_mappings
+    to_save = {sym: sid for sym, sid in sec_id_map.items() if sid is not None}
+    if to_save:
+        save_security_mappings("FxPro", to_save)
 
 # ── Security classification ──────────────────────────────────────────────────
 
@@ -805,13 +834,31 @@ def _get_or_create_account(cur, name: str) -> int:
     return cur.fetchone()[0]
 
 
-def _get_or_create_security(cur, symbol: str) -> int:
+def _get_or_create_security(cur, symbol: str,
+                             _cached_mappings: dict | None = None) -> int:
+    """Resolve or create a Security record for *symbol*.
+
+    Match priority:
+      0. Saved mapping in import_security_mappings (user-defined override)
+      1. Ticker match in Securities
+      2. Create new security
+    """
+    # 0. Saved mapping
+    if _cached_mappings is None:
+        from database.queries import get_security_mappings as _get_map
+        _cached_mappings = _get_map("FxPro")
+    if symbol in _cached_mappings:
+        return _cached_mappings[symbol]
+
+    # 1. Ticker match
     cur.execute(
         "SELECT Securities_Id FROM Securities WHERE Ticker = %s LIMIT 1", (symbol,)
     )
     row = cur.fetchone()
     if row:
         return row[0]
+
+    # 2. Create new
     sec_type = _classify_security(symbol)
     name = symbol.lstrip('#')
     cur.execute(
@@ -869,12 +916,14 @@ def _best_db_match(symbol: str, db_df: pd.DataFrame) -> dict | None:
     return None
 
 
-def _render_security_mapping(symbols: list, db_df: pd.DataFrame) -> tuple:
+def _render_security_mapping(symbols: list, db_df: pd.DataFrame) -> dict:
     """Render the security-mapping table.
 
-    Returns (sec_id_map, label_map) where:
-      sec_id_map  = {pdf_symbol: int | None}  — None means 'create new'
-      label_map   = {pdf_symbol: label_str}   — suitable for persistence
+    Returns ``sec_id_map = {pdf_symbol: int | None}`` where *None* means
+    'create new security on import'.
+
+    Mappings are now stored in the ``import_security_mappings`` DB table
+    (source = 'FxPro') instead of the legacy JSON file.
     """
     _NONE_LABEL = '— Create new —'
 
@@ -886,8 +935,10 @@ def _render_security_mapping(symbols: list, db_df: pd.DataFrame) -> tuple:
         f"{r['ticker']} | {r['name']} | {r['currency']}": int(r['sec_id'])
         for _, r in db_df.iterrows()
     }
+    id_to_label = {v: k for k, v in label_to_id.items()}
 
-    saved = _load_saved_mapping()
+    # Load saved {symbol → sec_id} from DB (includes one-time JSON migration)
+    saved_ids = _load_saved_mapping()
 
     rows = []
     for sym in symbols:
@@ -899,9 +950,12 @@ def _render_security_mapping(symbols: list, db_df: pd.DataFrame) -> tuple:
             auto_label = _NONE_LABEL
             db_ticker = db_name = db_currency = ''
 
-        # Priority: saved > auto-match > Create new
-        saved_label = saved.get(sym, '')
-        default = saved_label if saved_label in label_to_id or saved_label == _NONE_LABEL else auto_label
+        # Priority: saved DB mapping > auto-match by ticker > Create new
+        saved_sid = saved_ids.get(sym)
+        if saved_sid is not None:
+            default = id_to_label.get(int(saved_sid), auto_label)
+        else:
+            default = auto_label
 
         rows.append({
             'PDF Symbol':   sym,
@@ -934,12 +988,11 @@ def _render_security_mapping(symbols: list, db_df: pd.DataFrame) -> tuple:
         key='fxp_sec_mapping',
     )
 
-    sec_id_map, label_map = {}, {}
+    sec_id_map = {}
     for _, row in edited.iterrows():
         sel = row['Map to']
-        sec_id_map[row['PDF Symbol']] = label_to_id.get(sel)  # None → create new
-        label_map[row['PDF Symbol']]  = sel
-    return sec_id_map, label_map
+        sec_id_map[row['PDF Symbol']] = label_to_id.get(sel)   # None → create new
+    return sec_id_map
 
 
 # ── Per-file parse cache ──────────────────────────────────────────────────────
@@ -1038,10 +1091,15 @@ def run_import(
         total = len(all_inv) + len(all_tx)
         done = 0
 
+        # Merge UI-supplied overrides on top of DB mappings (UI wins).
+        # Load DB mappings once to avoid a round-trip per record.
+        from database.queries import get_security_mappings as _get_sec_map
+        _fxp_mappings = _get_sec_map("FxPro")
+        if security_map:
+            _fxp_mappings = {**_fxp_mappings, **{k: v for k, v in security_map.items() if v is not None}}
+
         for rec in all_inv:
-            # Use the user-supplied mapping if available; fall back to auto-create.
-            mapped_id = (security_map or {}).get(rec['symbol'])
-            sec_id = mapped_id if mapped_id is not None else _get_or_create_security(cur, rec['symbol'])
+            sec_id = _get_or_create_security(cur, rec['symbol'], _cached_mappings=_fxp_mappings)
             if not replace_mode and _investment_exists(cur, account_id, rec['desc']):
                 counts['investments_skip'] += 1
             else:
@@ -1230,16 +1288,16 @@ def render_fxpro_importer():
         "The **DB** columns show the best automatic match by ticker. "
         "Override **Map to DB Security** to link to a different existing security, "
         "or leave as '— Create new —' to insert a new one on import. "
-        "Changes are saved automatically on import and can be saved independently below."
+        "Mappings are stored in the database and applied automatically on future imports."
     )
     db_df = _load_db_securities()
-    security_map, label_map = _render_security_mapping(symbols, db_df)
+    security_map = _render_security_mapping(symbols, db_df)
 
     col_save_map, _ = st.columns([1, 5])
     with col_save_map:
         if st.button("💾 Save Mapping", key="fxp_save_map_btn"):
-            _save_mapping(label_map)
-            st.success("Mapping saved.")
+            _save_mapping(security_map)
+            st.success("Mapping saved to database.")
 
     st.divider()
 
@@ -1277,7 +1335,7 @@ def render_fxpro_importer():
                 security_map=security_map,
                 progress_cb=lambda p: progress.progress(p, text="Importing…"),
             )
-            _save_mapping(label_map)   # persist mapping after every successful import
+            _save_mapping(security_map)   # persist mapping after every successful import
             progress.progress(1.0, text="Done.")
             deleted_msg = (
                 f" Deleted first: {counts['deleted_investments']} investments · "
