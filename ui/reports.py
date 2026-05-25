@@ -1867,9 +1867,9 @@ def render_reports():
         if st.sidebar.button("🔄 Refresh All Market Data", key="refresh_all_btn"):
             st.cache_data.clear()
             with st.spinner("Refreshing all market data... This may take a while."):
-                download_historical_fx("3y")
-                download_historical_prices_from_yahoo("3y")
-                download_historical_prices_from_tradingview("3y")
+                download_historical_fx("6m")
+                download_historical_prices_from_yahoo("6m")
+                download_historical_prices_from_tradingview("6m")
                 download_bond_prices_from_solidus()
                 download_securities_info_from_yahoo()
                 download_securities_info_from_tradingview()
@@ -2035,39 +2035,71 @@ def render_reports():
         with tab_inv_signals:
             st.subheader("🎯 Risk-Reward Analysis")
             df_plot = df_data.copy()
-              
-            # Αντικατάσταση NaN με 0
-            df_plot['quality_score'] = df_plot['quality_score'].fillna(0)
-            
-            # Προσαρμογή του μεγέθους: 
-            # Προσθέτουμε μια σταθερή τιμή ή παίρνουμε το Max(0, score) 
-            # για να μην έχουμε αρνητικά μεγέθη στις τελείες
-            df_plot['marker_size'] = df_plot['quality_score'].apply(lambda x: max(x, 0) + 5)
 
-            # 1. Scatter Chart με Plotly για καλύτερο interactivity
+            # Fill NaN quality scores and compute bubble size
+            df_plot['quality_score'] = df_plot['quality_score'].fillna(0)
+            df_plot['marker_size']   = df_plot['quality_score'].apply(lambda x: max(x, 0) + 5)
+
+            # ── User-controlled outlier filter ────────────────────────────────
+            _fc1, _fc2 = st.columns([3, 1])
+            with _fc1:
+                vol_cap_pct = st.slider(
+                    "Volatility cap (percentile)",
+                    min_value=50, max_value=100, value=95, step=1,
+                    key="spa_vol_cap_pct",
+                    help=(
+                        "Securities above this volatility percentile are hidden from the "
+                        "chart to preserve readability. Set to 100 to show all. "
+                        "They always appear in the table below regardless of this setting."
+                    ),
+                )
+            # Compute the absolute threshold from the chosen percentile
+            if vol_cap_pct >= 100:
+                vol_cap  = float('inf')
+                df_chart = df_plot.copy()
+            else:
+                vol_cap  = max(df_plot['vol_1y_ann'].quantile(vol_cap_pct / 100.0), 10.0)
+                df_chart = df_plot[df_plot['vol_1y_ann'] <= vol_cap].copy()
+
+            n_hidden = len(df_plot) - len(df_chart)
+            with _fc2:
+                if vol_cap_pct < 100:
+                    st.metric("Cap at", f"{vol_cap:.0f}%", help="Absolute volatility threshold derived from the chosen percentile.")
+
+            if n_hidden > 0:
+                hidden_names = (
+                    df_plot[df_plot['vol_1y_ann'] > vol_cap]['securities_name']
+                    .tolist()
+                )
+                st.caption(
+                    f"ℹ️ {n_hidden} securit{'y' if n_hidden == 1 else 'ies'} "
+                    f"with volatility > {vol_cap:.0f}% hidden from chart "
+                    f"({', '.join(hidden_names)}). They still appear in the table below."
+                )
+
+            # 1. Scatter Chart
             fig = px.scatter(
-                df_plot,
+                df_chart,
                 x="vol_1y_ann",
                 y="annual_chg_pct",
-                size="marker_size",      # Χρησιμοποιούμε τη νέα διορθωμένη στήλη
-                color="sharpe_ratio", 
+                size="marker_size",
+                color="sharpe_ratio",
                 hover_name="securities_name",
-                # Προσθέτουμε το πραγματικό score στο hover για να φαίνεται σωστά
                 hover_data={"marker_size": False, "quality_score": True, "sharpe_ratio": ":.2f"},
                 labels={
-                    "vol_1y_ann": "Annual Volatility (%)",
-                    "annual_chg_pct": "Annual Return (%)",
-                    "sharpe_ratio": "Sharpe Ratio",
-                    "quality_score": "Quality Score"
+                    "vol_1y_ann":      "Annual Volatility (%)",
+                    "annual_chg_pct":  "Annual Return (%)",
+                    "sharpe_ratio":    "Sharpe Ratio",
+                    "quality_score":   "Quality Score",
                 },
                 title="Risk vs. Reward Matrix",
-                color_continuous_scale=px.colors.diverging.RdYlGn
+                color_continuous_scale=px.colors.diverging.RdYlGn,
             )
 
-            # Προσθήκη γραμμών "σταυρού" για τα quadrants
+            # Quadrant reference lines
             fig.add_hline(y=0, line_dash="dash", line_color="white")
-            fig.add_vline(x=df_data["vol_1y_ann"].median(), line_dash="dash", line_color="gray")
-            
+            fig.add_vline(x=df_chart["vol_1y_ann"].median(), line_dash="dash", line_color="gray")
+
             pf_plotly_chart(fig)
 
             # 2. Top Efficiency Picks Table
@@ -6239,10 +6271,9 @@ def _xirr(cashflows: list, dates: list) -> float | None:
     cashflows : list of floats  (negative = money out, positive = money in)
     dates     : list of datetime-like objects
     Returns annualised rate or None if no solution found.
-    """
-    from scipy.optimize import brentq
-    import datetime as _dt
 
+    Uses a pure-Python bisection root-finder so scipy is not required.
+    """
     if len(cashflows) < 2:
         return None
 
@@ -6257,7 +6288,20 @@ def _xirr(cashflows: list, dates: list) -> float | None:
         return sum(cf / (1.0 + rate) ** day_frac(d) for cf, d in zip(cashflows, dates))
 
     try:
-        return brentq(npv, -0.9999, 100.0, maxiter=1000)
+        lo, hi = -0.9999, 100.0
+        f_lo, f_hi = npv(lo), npv(hi)
+        if f_lo * f_hi > 0:
+            return None          # no sign change → no root in interval
+        for _ in range(300):
+            mid   = (lo + hi) / 2.0
+            f_mid = npv(mid)
+            if abs(f_mid) < 1e-12 or (hi - lo) < 1e-12:
+                return mid
+            if f_lo * f_mid < 0:
+                hi, f_hi = mid, f_mid
+            else:
+                lo, f_lo = mid, f_mid
+        return (lo + hi) / 2.0
     except Exception:
         return None
 

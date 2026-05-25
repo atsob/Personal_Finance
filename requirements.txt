@@ -22,3 +22,4 @@ requests
 tradingview-datafeed
 tradingview-screener
 schedule>=1.2.0
+scipy>=1.11.0
