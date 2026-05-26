@@ -3162,9 +3162,11 @@ def get_investment_income_report(tax_year: int):
             COALESCE(s.Is_Tax_Exempt, FALSE)                               AS is_tax_exempt,
             CASE
                 WHEN i.Transactions_Id IS NOT NULL AND t_cash.Total_Amount IS NOT NULL
-                    THEN ABS(t_cash.Total_Amount)
+                --    THEN ABS(t_cash.Total_Amount)
+                    THEN t_cash.Total_Amount 
                 WHEN c.Currencies_ShortName != 'EUR'
-                    THEN ABS(i.Total_Amount) * COALESCE(
+                --    THEN ABS(i.Total_Amount) * COALESCE(
+                    THEN i.Total_Amount * COALESCE(
                         (SELECT fx.FX_Rate FROM Historical_FX fx
                          WHERE fx.Currencies_Id_1 = c.Currencies_Id
                            AND fx.Date <= i.Date
@@ -3173,7 +3175,8 @@ def get_investment_income_report(tax_year: int):
                          WHERE fx.Currencies_Id_1 = c.Currencies_Id
                          ORDER BY fx.Date ASC LIMIT 1),
                         1.0)
-                ELSE ABS(i.Total_Amount)
+            --    ELSE ABS(i.Total_Amount)
+                ELSE i.Total_Amount
             END                                                             AS amount_eur
         FROM Investments i
         JOIN Securities   s      ON s.Securities_Id      = i.Securities_Id
@@ -3182,7 +3185,8 @@ def get_investment_income_report(tax_year: int):
         LEFT JOIN Transactions t_cash ON t_cash.Transactions_Id = i.Transactions_Id
         WHERE i.Action IN ('Dividend', 'IntInc', 'Reinvest', 'RtrnCap')
           AND EXTRACT(year FROM i.Date) = %(tax_year)s
-          AND i.Total_Amount > 0
+    --      AND i.Total_Amount > 0
+          AND i.Total_Amount <> 0
         ORDER BY i.Date DESC, s.Securities_Name
     """, conn, params={"tax_year": tax_year})
     conn.close()

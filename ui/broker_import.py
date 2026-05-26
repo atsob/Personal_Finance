@@ -105,7 +105,7 @@ def _preview_records(inv_records: list, tx_records: list,
     with tab_inv:
         if inv_records:
             df = inv_df_fn(inv_records)
-            st.dataframe(df, hide_index=True, use_container_width=True,
+            st.dataframe(df, hide_index=True, width="stretch",
                          column_config={
                              "date":           "Date",
                              "action":         "Action",
@@ -124,7 +124,7 @@ def _preview_records(inv_records: list, tx_records: list,
     with tab_tx:
         if tx_records:
             df = tx_df_fn(tx_records)
-            st.dataframe(df, hide_index=True, use_container_width=True,
+            st.dataframe(df, hide_index=True, width="stretch",
                          column_config={
                              "date":        "Date",
                              "description": "Description",
@@ -196,7 +196,7 @@ def _ib_preview_with_status(
             st.dataframe(
                 df_inv,
                 hide_index=True,
-                use_container_width=True,
+                width="stretch",
                 column_config={
                     "status":         "Status",
                     "date":           "Date",
@@ -235,7 +235,7 @@ def _ib_preview_with_status(
             st.dataframe(
                 df_tx,
                 hide_index=True,
-                use_container_width=True,
+                width="stretch",
                 column_config={
                     "status":      "Status",
                     "date":        "Date",
@@ -309,7 +309,7 @@ def _revt_preview_with_status(
             st.dataframe(
                 df_inv,
                 hide_index=True,
-                use_container_width=True,
+                width="stretch",
                 column_config={
                     "status":         "Status",
                     "date":           "Date",
@@ -347,7 +347,7 @@ def _revt_preview_with_status(
             st.dataframe(
                 df_tx,
                 hide_index=True,
-                use_container_width=True,
+                width="stretch",
                 column_config={
                     "status":      "Status",
                     "date":        "Date",
@@ -576,7 +576,7 @@ def _ignore_manager_ui(
             edited = st.data_editor(
                 df_new[["type", "record", "ignore"]],
                 hide_index=True,
-                use_container_width=True,
+                width="stretch",
                 column_config={
                     "type":   st.column_config.TextColumn("Type",   disabled=True),
                     "record": st.column_config.TextColumn("Record", disabled=True),
@@ -1222,7 +1222,7 @@ def render_revolut_brokerage_import() -> None:
                 st.dataframe(
                     type_counts,
                     hide_index=True,
-                    use_container_width=True,
+                    width="stretch",
                     column_config={
                         "raw_type": "Type",
                         "count":    st.column_config.NumberColumn("# Rows",    format="%d"),
@@ -1399,7 +1399,7 @@ def _revs_preview_with_status(
                     "asset_category", "desc"]
             df_inv = df_inv[[c for c in cols if c in df_inv.columns]]
             st.dataframe(
-                df_inv, hide_index=True, use_container_width=True,
+                df_inv, hide_index=True, width="stretch",
                 column_config={
                     "status":         "Status",
                     "date":           "Date",
@@ -1434,7 +1434,7 @@ def _revs_preview_with_status(
             cols = ["status", "date", "description", "amount", "currency"]
             df_tx = df_tx[[c for c in cols if c in df_tx.columns]]
             st.dataframe(
-                df_tx, hide_index=True, use_container_width=True,
+                df_tx, hide_index=True, width="stretch",
                 column_config={
                     "status":      "Status",
                     "date":        "Date",
@@ -1734,7 +1734,7 @@ def render_revolut_savings_import() -> None:
                     .sort_values("count", ascending=False)
                 )
                 st.dataframe(
-                    type_counts, hide_index=True, use_container_width=True,
+                    type_counts, hide_index=True, width="stretch",
                     column_config={
                         "type":  "Type",
                         "count": st.column_config.NumberColumn("# Rows",     format="%d"),
@@ -1883,14 +1883,594 @@ def render_revolut_savings_import() -> None:
 
 
 # ===========================================================================
+# Coinbase — security mapping UI
+# ===========================================================================
+
+def _cb_security_mapping_ui(sec_matches: dict) -> None:
+    """Expander UI for mapping unmapped Coinbase crypto tickers to DB securities.
+
+    Only shown when one or more assets could not be matched by ticker, name,
+    or a previously saved mapping.  The mapping key is the crypto symbol (e.g.
+    "BTC", "ETH").  Saved mappings are persisted to import_security_mappings
+    and applied on all future Coinbase imports.
+    """
+    unmapped = {sym: info for sym, info in sec_matches.items() if info[1] == "new"}
+    if not unmapped:
+        return
+
+    with st.expander(
+        f"🗺️ Security Mappings — {len(unmapped)} unmapped asset(s) — click to configure",
+        expanded=True,
+    ):
+        st.caption(
+            "These crypto symbols were not found in your Securities database by ticker "
+            "or name.  Select the matching security for each one, then click "
+            "**💾 Save Mappings**.  Saved mappings are permanent and take priority "
+            "on all future Coinbase imports."
+        )
+
+        all_secs = _load_all_securities()
+        if all_secs.empty:
+            st.warning("No securities found in the database. Create them in Static Data first.")
+            return
+
+        sec_options = ["(create new — will be added on import)"] + all_secs["name"].tolist()
+        pending_mappings: dict[str, int] = {}
+
+        for sym in sorted(unmapped):
+            c1, c2 = st.columns([1, 3])
+            with c1:
+                st.markdown(f"**{sym}**")
+            with c2:
+                chosen = st.selectbox(
+                    f"Map {sym} to",
+                    sec_options,
+                    key=f"cb_map_{sym}",
+                    label_visibility="collapsed",
+                )
+                if not chosen.startswith("(create new"):
+                    sec_row = all_secs[all_secs["name"] == chosen]
+                    if not sec_row.empty:
+                        pending_mappings[sym] = int(sec_row.iloc[0]["securities_id"])
+
+        if pending_mappings:
+            if st.button("💾 Save Mappings", key="cb_save_mappings", type="primary"):
+                from database.queries import save_security_mappings
+                try:
+                    save_security_mappings("Coinbase", pending_mappings)
+                    _updated = dict(st.session_state.get("cb_sec_matches", {}))
+                    for sym, sec_id in pending_mappings.items():
+                        sec_row  = all_secs[all_secs["securities_id"] == sec_id]
+                        sec_name = sec_row.iloc[0]["name"] if not sec_row.empty else sym
+                        _updated[sym] = (sec_id, f"mapped:{sec_name}")
+                    st.session_state["cb_sec_matches"] = _updated
+                    _load_all_securities.clear()
+                    st.success(
+                        f"✅ Saved {len(pending_mappings)} mapping(s). "
+                        "Re-fetch to see the updated Security Match column."
+                    )
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Failed to save mappings: {exc}")
+        else:
+            st.info("Select at least one mapping above and click Save.")
+
+
+# ===========================================================================
+# Coinbase — preview helper with reconciliation status
+# ===========================================================================
+
+def _cb_preview_with_status(
+    inv_records:  list,
+    tx_records:   list,
+    existing_inv: set,
+    existing_tx:  set,
+    fuzzy_inv:    set,
+    fuzzy_tx:     set,
+    sec_matches:  dict,
+    ignored_descs: set | None = None,
+) -> None:
+    """Preview table for Coinbase records with 4-state Status + Security Match."""
+    ignored_descs = ignored_descs or set()
+    tab_inv, tab_tx = st.tabs([
+        f"📈 Investments ({len(inv_records)})",
+        f"💳 Cash Transactions ({len(tx_records)})",
+    ])
+
+    with tab_inv:
+        if inv_records:
+            rows = []
+            for r in inv_records:
+                if r["desc"] in existing_inv:
+                    status = "✅ Exists"
+                elif r["desc"] in fuzzy_inv:
+                    status = "⚠️ Likely duplicate"
+                elif r["desc"] in ignored_descs:
+                    status = "⏭️ Ignored"
+                else:
+                    status = "🆕 New"
+                sym        = (r.get("symbol") or "").strip()
+                match_info = sec_matches.get(sym, (None, "new"))
+                match_type = match_info[1]
+                if match_type.startswith("mapped:"):
+                    sec_label = f"🗺️ {match_type[7:]}"
+                elif match_type in ("ticker", "name"):
+                    sec_label = f"🔗 {match_type.capitalize()} match"
+                else:
+                    sec_label = "🆕 New security"
+                rows.append({**r, "status": status, "security_match": sec_label})
+
+            df_inv = pd.DataFrame(rows)
+            cols = ["status", "date", "action", "symbol", "name",
+                    "quantity", "price", "total_eur", "commission",
+                    "currency", "asset_category", "security_match", "desc"]
+            df_inv = df_inv[[c for c in cols if c in df_inv.columns]]
+            st.dataframe(
+                df_inv, hide_index=True, width="stretch",
+                column_config={
+                    "status":         "Status",
+                    "date":           "Date",
+                    "action":         "Action",
+                    "symbol":         "Symbol",
+                    "name":           "Name",
+                    "quantity":       st.column_config.NumberColumn("Qty",          format="%.8f"),
+                    "price":          st.column_config.NumberColumn("Price (€)",    format="%.4f"),
+                    "total_eur":      st.column_config.NumberColumn("Total (€)",    format="%.4f"),
+                    "commission":     st.column_config.NumberColumn("Commission",   format="%.4f"),
+                    "currency":       "Ccy",
+                    "asset_category": "Asset",
+                    "security_match": "Security Match",
+                    "desc":           "Dedup Key",
+                },
+            )
+        else:
+            st.info("No investment records fetched.")
+
+    with tab_tx:
+        if tx_records:
+            rows = []
+            for r in tx_records:
+                if r["desc"] in existing_tx:
+                    status = "✅ Exists"
+                elif r["desc"] in fuzzy_tx:
+                    status = "⚠️ Likely duplicate"
+                elif r["desc"] in ignored_descs:
+                    status = "⏭️ Ignored"
+                else:
+                    status = "🆕 New"
+                rows.append({**r, "status": status})
+            df_tx = pd.DataFrame(rows)
+            cols  = ["status", "date", "description", "amount", "currency"]
+            df_tx = df_tx[[c for c in cols if c in df_tx.columns]]
+            st.dataframe(
+                df_tx, hide_index=True, width="stretch",
+                column_config={
+                    "status":      "Status",
+                    "date":        "Date",
+                    "description": "Description",
+                    "amount":      st.column_config.NumberColumn("Amount", format="%.4f"),
+                    "currency":    "Ccy",
+                },
+            )
+        else:
+            st.info("No cash transaction records fetched.")
+
+
+# ===========================================================================
+# Coinbase — main render function
+# ===========================================================================
+
+def render_coinbase_import() -> None:
+    """Coinbase API importer — buys, sells, staking rewards, deposits/withdrawals."""
+    from database.queries import get_app_setting, save_app_setting
+
+    st.markdown(
+        "Import trades, staking rewards, and transfers from **Coinbase** using the "
+        "REST API.  Staking rewards are recorded as **Reinvest** (new units received "
+        "as income, cost basis set at FMV on receipt date)."
+    )
+
+    with st.expander("ℹ️ How to create Coinbase API keys (click to expand)", expanded=False):
+        st.markdown("""
+Both **CDP keys** (current) and **Legacy keys** (older) are supported — the importer
+detects the format automatically.
+
+---
+
+#### Option A — CDP / Cloud API keys *(recommended, current Coinbase default)*
+1. Go to [cloud.coinbase.com/access/api](https://cloud.coinbase.com/access/api) → **Create API Key**.
+2. Under **Permissions**, enable:
+   - ✅ `wallet:accounts:read`
+   - ✅ `wallet:transactions:read`
+3. Click **Create & Download** — you receive:
+   - **Key Name** — looks like `organizations/abc.../apiKeys/xyz...`
+   - **Private Key** — a PEM block starting with `-----BEGIN EC PRIVATE KEY-----`
+4. Paste the **Key Name** into *API Key* and the full **PEM block** into *API Secret*.
+
+> The PEM private key spans multiple lines — paste it exactly as shown in the portal
+> (newlines included).  It is stored encrypted in the app database when you tick
+> *Remember credentials*.
+
+---
+
+#### Option B — Legacy API keys *(older format)*
+1. Log in to [coinbase.com](https://www.coinbase.com) → avatar → **Settings** → **API** → **New API Key**.
+2. Tick `wallet:accounts:read` + `wallet:transactions:read` → **Create**.
+3. Copy the short **API Key** and **API Secret** strings and paste them below.
+""")
+
+    st.divider()
+
+    # ── Credentials ──────────────────────────────────────────────────────────
+    st.markdown("### 🔑 API Credentials")
+
+    if "cb_api_key" not in st.session_state:
+        st.session_state["cb_api_key"]    = get_app_setting("cb_api_key")    or ""
+        st.session_state["cb_api_secret"] = get_app_setting("cb_api_secret") or ""
+        if st.session_state["cb_api_key"]:
+            st.session_state.setdefault("cb_remember", True)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        api_key    = st.text_input(
+            "API Key (or CDP Key Name)",
+            key="cb_api_key",
+            help=(
+                "CDP keys: paste the full key name — "
+                "organizations/{org_id}/apiKeys/{key_id}.\n\n"
+                "Legacy keys: paste the short alphanumeric key string."
+            ),
+        )
+    with col2:
+        api_secret = st.text_input(
+            "API Secret (or CDP Private Key PEM)",
+            key="cb_api_secret",
+            type="password",
+            help=(
+                "CDP keys: paste the entire PEM block including the "
+                "-----BEGIN / -----END lines.\n\n"
+                "Legacy keys: paste the secret string shown on key creation."
+            ),
+        )
+
+    remember = st.checkbox(
+        "💾 Remember credentials (stored encrypted in app settings)",
+        key="cb_remember",
+        help="Saves Key + Secret to the database so they are pre-filled next visit.",
+    )
+
+    st.divider()
+
+    # ── Date filter ──────────────────────────────────────────────────────────
+    st.markdown("### 📅 Date Filter")
+    st.caption(
+        "The Coinbase API has no server-side date filter — all pages are fetched "
+        "then filtered on the client.  Set a narrow range to reduce fetch time."
+    )
+    _df_col1, _df_col2 = st.columns(2)
+    with _df_col1:
+        cb_from = st.date_input("Fetch from", value=None, key="cb_filter_from",
+                                help="Only import records on or after this date.")
+    with _df_col2:
+        cb_to   = st.date_input("Fetch to",   value=None, key="cb_filter_to",
+                                help="Only import records on or before this date.")
+
+    st.divider()
+
+    # ── Account mapping ──────────────────────────────────────────────────────
+    st.markdown("### 🏦 Account Mapping")
+    st.caption(
+        "Select the app account that will hold the imported **investment** records "
+        "(buys, sells, staking rewards).  Cash transactions (fiat deposits/withdrawals, "
+        "sends/receives) will also be imported into this account."
+    )
+    acc_id, acc_name = _account_selectbox(
+        "Import into account",
+        key="cb_account",
+        type_filter=["Brokerage", "Other Investment", "Pension", "Savings"],
+    )
+
+    st.divider()
+
+    # ── Options ──────────────────────────────────────────────────────────────
+    st.markdown("### ⚙️ Options")
+    replace_mode = st.checkbox(
+        "Replace mode — delete all existing Coinbase records for this account before importing",
+        value=False, key="cb_replace",
+        help="All Investment and Transaction rows whose Description starts with 'CB|' "
+             "will be deleted first.",
+    )
+
+    st.divider()
+
+    # ── Test Connection / Fetch ───────────────────────────────────────────────
+    if not api_key.strip() or not api_secret.strip():
+        st.info("Enter your API Key and Secret above to continue.")
+        return
+
+    _test_btn  = st.button("🔌 Test Connection", key="cb_test")
+    _fetch_btn = st.button("📡 Fetch & Preview", key="cb_fetch",
+                           type="primary", disabled=acc_id is None)
+
+    if _test_btn:
+        if remember:
+            try:
+                save_app_setting("cb_api_key",    api_key.strip())
+                save_app_setting("cb_api_secret", api_secret.strip())
+            except Exception:
+                pass
+        try:
+            from data.coinbase_connector import test_connection as _cb_test
+            with st.spinner("Connecting to Coinbase…"):
+                accounts = _cb_test(api_key.strip(), api_secret.strip())
+            st.success(f"✅ Connected — {len(accounts)} account(s) found:")
+            df_accs = pd.DataFrame(accounts)[
+                ["currency_code", "name", "balance", "native_balance",
+                 "native_currency", "type"]
+            ]
+            st.dataframe(
+                df_accs, hide_index=True, width="stretch",
+                column_config={
+                    "currency_code":   "Currency",
+                    "name":            "Account Name",
+                    "balance":         st.column_config.NumberColumn("Balance",  format="%.8f"),
+                    "native_balance":  st.column_config.NumberColumn("Value",    format="%.2f"),
+                    "native_currency": "Ccy",
+                    "type":            "Type",
+                },
+            )
+            st.session_state["cb_accounts"] = accounts
+        except Exception as exc:
+            st.error(f"Connection failed: {exc}")
+        return
+
+    if _fetch_btn or st.session_state.get("cb_parsed"):
+        from data.coinbase_connector import (
+            test_connection     as _cb_conn,
+            fetch_all_transactions as _cb_fetch,
+            build_coinbase_records as _cb_build,
+            check_existing_records as _cb_exist,
+            check_fuzzy_duplicates  as _cb_fuzzy,
+            preview_security_matches as _cb_sec,
+        )
+
+        if _fetch_btn:
+            # Save credentials if requested
+            if remember:
+                try:
+                    save_app_setting("cb_api_key",    api_key.strip())
+                    save_app_setting("cb_api_secret", api_secret.strip())
+                except Exception:
+                    pass
+
+            status_box = st.empty()
+
+            try:
+                def _status(msg):
+                    status_box.info(f"⏳ {msg}")
+
+                _status("Fetching Coinbase account list…")
+                accounts = _cb_conn(api_key.strip(), api_secret.strip())
+
+                crypto_accs = [a for a in accounts if not a["is_fiat"]]
+                fiat_accs   = [a for a in accounts if a["is_fiat"]]
+                _status(
+                    f"Found {len(accounts)} accounts "
+                    f"({len(crypto_accs)} crypto, {len(fiat_accs)} fiat). "
+                    "Fetching transactions — this may take a moment…"
+                )
+
+                all_txns = _cb_fetch(
+                    api_key.strip(), api_secret.strip(),
+                    accounts,
+                    start_date=cb_from,
+                    end_date=cb_to,
+                    progress_cb=_status,
+                )
+                status_box.empty()
+
+            except Exception as exc:
+                status_box.empty()
+                st.error(f"Failed to fetch from Coinbase: {exc}")
+                st.code(traceback.format_exc())
+                return
+
+            try:
+                inv_records, tx_records = _cb_build(all_txns)
+            except Exception as exc:
+                st.error(f"Failed to build records: {exc}")
+                st.code(traceback.format_exc())
+                return
+
+            existing_inv, existing_tx = _cb_exist(inv_records, tx_records, acc_id)
+            fuzzy_inv, fuzzy_tx       = _cb_fuzzy(inv_records, tx_records, acc_id)
+            fuzzy_inv -= existing_inv
+            fuzzy_tx  -= existing_tx
+            sec_matches = _cb_sec(inv_records)
+
+            from database.queries import get_ignored_records as _get_ign_cb
+            ignored_descs = _get_ign_cb("Coinbase")
+
+            st.session_state["cb_inv_records"]  = inv_records
+            st.session_state["cb_tx_records"]   = tx_records
+            st.session_state["cb_raw_txn_count"]= len(all_txns)
+            st.session_state["cb_existing_inv"] = existing_inv
+            st.session_state["cb_existing_tx"]  = existing_tx
+            st.session_state["cb_fuzzy_inv"]    = fuzzy_inv
+            st.session_state["cb_fuzzy_tx"]     = fuzzy_tx
+            st.session_state["cb_sec_matches"]  = sec_matches
+            st.session_state["cb_ignored"]      = ignored_descs
+            st.session_state["cb_parsed"]       = True
+
+        inv_records   = st.session_state.get("cb_inv_records",  [])
+        tx_records    = st.session_state.get("cb_tx_records",   [])
+        existing_inv  = st.session_state.get("cb_existing_inv", set())
+        existing_tx   = st.session_state.get("cb_existing_tx",  set())
+        fuzzy_inv     = st.session_state.get("cb_fuzzy_inv",    set())
+        fuzzy_tx      = st.session_state.get("cb_fuzzy_tx",     set())
+        sec_matches   = st.session_state.get("cb_sec_matches",  {})
+        ignored_descs = st.session_state.get("cb_ignored",      set())
+        raw_count     = st.session_state.get("cb_raw_txn_count", 0)
+
+        # ── Fetch summary ─────────────────────────────────────────────────
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Raw API transactions", raw_count)
+        m2.metric("Investment records",   len(inv_records))
+        m3.metric("Cash transactions",    len(tx_records))
+
+        if not inv_records and not tx_records:
+            st.warning(
+                "No importable records found. "
+                "Check your date filter and that your API key has "
+                "`wallet:transactions:read` permission."
+            )
+            return
+
+        # ── Action breakdown ──────────────────────────────────────────────
+        if inv_records:
+            with st.expander("📊 Investment action breakdown"):
+                import collections
+                action_counts = collections.Counter(r["action"] for r in inv_records)
+                df_ac = pd.DataFrame(
+                    [{"action": k, "count": v} for k, v in action_counts.most_common()]
+                )
+                st.dataframe(df_ac, hide_index=True, width="stretch",
+                             column_config={
+                                 "action": "Action",
+                                 "count":  st.column_config.NumberColumn("# Records", format="%d"),
+                             })
+
+        # ── Reconciliation summary ────────────────────────────────────────
+        truly_new_inv   = [r for r in inv_records
+                           if r["desc"] not in existing_inv
+                           and r["desc"] not in fuzzy_inv
+                           and r["desc"] not in ignored_descs]
+        truly_new_tx    = [r for r in tx_records
+                           if r["desc"] not in existing_tx
+                           and r["desc"] not in fuzzy_tx
+                           and r["desc"] not in ignored_descs]
+        fuzzy_only_inv  = [r for r in inv_records if r["desc"] in fuzzy_inv]
+        fuzzy_only_tx   = [r for r in tx_records  if r["desc"] in fuzzy_tx]
+        exist_inv_count = sum(1 for r in inv_records if r["desc"] in existing_inv)
+        exist_tx_count  = sum(1 for r in tx_records  if r["desc"] in existing_tx)
+        ign_inv_count   = sum(1 for r in inv_records if r["desc"] in ignored_descs)
+        ign_tx_count    = sum(1 for r in tx_records  if r["desc"] in ignored_descs)
+        _skip_inv = exist_inv_count + len(fuzzy_only_inv)
+        _skip_tx  = exist_tx_count  + len(fuzzy_only_tx)
+
+        if not truly_new_inv and not truly_new_tx and not replace_mode:
+            st.info(
+                f"✅ Nothing genuinely new — "
+                f"**{exist_inv_count}** inv exact + **{len(fuzzy_only_inv)}** likely-dup, "
+                f"**{exist_tx_count}** tx exact + **{len(fuzzy_only_tx)}** likely-dup."
+            )
+        else:
+            st.success(
+                f"Found **{len(truly_new_inv)}** new investment record(s) and "
+                f"**{len(truly_new_tx)}** new cash transaction(s) to import."
+            )
+        if fuzzy_only_inv or fuzzy_only_tx:
+            st.warning(
+                f"⚠️ **{len(fuzzy_only_inv)}** investment(s) and "
+                f"**{len(fuzzy_only_tx)}** transaction(s) match by date/amount but have "
+                "a different key — marked **⚠️ Likely duplicate** and will be skipped."
+            )
+        if ign_inv_count or ign_tx_count:
+            st.info(
+                f"⏭️ **{ign_inv_count}** investment(s) and "
+                f"**{ign_tx_count}** transaction(s) are on the ignore list and will be skipped."
+            )
+
+        r1, r2, r3, r4 = st.columns(4)
+        r1.metric("🆕 New investments",   len(truly_new_inv))
+        r2.metric("🔄 Skip investments",  _skip_inv + ign_inv_count,
+                  help="✅ Exact key match + ⚠️ Likely duplicates + ⏭️ Ignored")
+        r3.metric("🆕 New transactions",  len(truly_new_tx))
+        r4.metric("🔄 Skip transactions", _skip_tx + ign_tx_count,
+                  help="✅ Exact key match + ⚠️ Likely duplicates + ⏭️ Ignored")
+
+        # ── Preview ───────────────────────────────────────────────────────
+        st.markdown("### 👁️ Preview")
+        _cb_preview_with_status(
+            inv_records, tx_records,
+            existing_inv, existing_tx,
+            fuzzy_inv, fuzzy_tx,
+            sec_matches,
+            ignored_descs=ignored_descs,
+        )
+
+        # ── Security Mappings ─────────────────────────────────────────────
+        _cb_security_mapping_ui(sec_matches)
+
+        # ── Ignore manager ────────────────────────────────────────────────
+        _ignore_manager_ui(
+            "Coinbase",
+            inv_records, tx_records,
+            existing_inv, existing_tx,
+            fuzzy_inv, fuzzy_tx,
+            ignored_descs,
+            session_key="cb",
+        )
+
+        # ── Import ────────────────────────────────────────────────────────
+        st.divider()
+        st.markdown("### 💾 Import")
+        st.caption(f"Target account: **{acc_name}** (ID {acc_id})")
+
+        _cicol1, _cicol2 = st.columns(2)
+        _import_inv = _cicol1.checkbox("📈 Import investments",       value=True, key="cb_import_inv")
+        _import_tx  = _cicol2.checkbox("💳 Import cash transactions", value=True, key="cb_import_tx")
+
+        _imp_inv   = (truly_new_inv if not replace_mode else inv_records) if _import_inv else []
+        _imp_tx    = (truly_new_tx  if not replace_mode else tx_records)  if _import_tx  else []
+        _new_total = len(_imp_inv) + len(_imp_tx)
+
+        if _new_total == 0 and not replace_mode:
+            st.info(
+                "No records to import.  "
+                "Enable **Replace mode** above if you want a clean re-import."
+            )
+        else:
+            _btn_suffix = (
+                f" ({_new_total} record{'s' if _new_total != 1 else ''})"
+                if not replace_mode else " (replace mode)"
+            )
+            if st.button(f"✅ Confirm Import{_btn_suffix}",
+                         key="cb_confirm", type="primary"):
+                from data.coinbase_connector import run_coinbase_import
+                prog = st.progress(0.0, text="Importing…")
+                try:
+                    counts = run_coinbase_import(
+                        _imp_inv, _imp_tx, acc_id,
+                        replace_mode=replace_mode,
+                        progress_cb=lambda p: prog.progress(p, text="Importing…"),
+                    )
+                    prog.empty()
+                    st.success("✅ Import complete!")
+                    _import_summary(counts)
+                    for k in ("cb_parsed", "cb_inv_records", "cb_tx_records",
+                              "cb_raw_txn_count", "cb_existing_inv", "cb_existing_tx",
+                              "cb_fuzzy_inv", "cb_fuzzy_tx", "cb_sec_matches",
+                              "cb_ignored", "cb_accounts"):
+                        st.session_state.pop(k, None)
+                    _load_accounts.clear()
+                    st.cache_data.clear()
+                except Exception as exc:
+                    prog.empty()
+                    st.error(f"Import failed: {exc}")
+                    st.code(traceback.format_exc())
+
+
+# ===========================================================================
 # Brokerage section — top-level container (called from ui/importers.py)
 # ===========================================================================
 
 def render_brokerage_section() -> None:
-    """Render brokerage importers as tabs (IB · Revolut Trading · Capital.com · FxPro)."""
-    tab_ib, tab_revt, tab_capital, tab_fxpro = st.tabs([
+    """Render brokerage importers as tabs (IB · Revolut Trading · Coinbase · Capital.com · FxPro)."""
+    tab_ib, tab_revt, tab_cb, tab_capital, tab_fxpro = st.tabs([
         "📊 Interactive Brokers",
         "💚 Revolut Trading",
+        "₿ Coinbase",
         "📈 Capital.com",
         "📈 FxPro",
     ])
@@ -1904,6 +2484,10 @@ def render_brokerage_section() -> None:
         _brand_header("https://logo.clearbit.com/revolut.com",
                       "Revolut Trading")
         render_revolut_brokerage_import()
+
+    with tab_cb:
+        _brand_header("https://logo.clearbit.com/coinbase.com", "Coinbase")
+        render_coinbase_import()
 
     with tab_capital:
         _brand_header("https://logo.clearbit.com/capital.com",
@@ -2041,7 +2625,7 @@ def render_revolut_import() -> None:
                 st.dataframe(
                     type_counts,
                     hide_index=True,
-                    use_container_width=True,
+                    width="stretch",
                     column_config={
                         "type":  "Type",
                         "count": st.column_config.NumberColumn("# Rows", format="%d"),

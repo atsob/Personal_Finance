@@ -724,7 +724,7 @@ def _render_statement_pipeline(df_stmt: pd.DataFrame, selected_acc_id: int,
                                        ),
                 },
                 hide_index=True,
-                use_container_width=True,
+                width="stretch",
                 key=f"{kp}_app_txn_editor",
             )
 
@@ -865,7 +865,7 @@ def _render_statement_pipeline(df_stmt: pd.DataFrame, selected_acc_id: int,
     edited = st.data_editor(
         df_review[display_cols],
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         num_rows="fixed",
         key=f"{kp}_review_table",
         column_config={
@@ -1260,7 +1260,7 @@ def _render_profiles_tab():
         st.dataframe(
             profiles_df.drop(columns=['profile_id', 'skip_rows', 'encoding'], errors='ignore'),
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
             column_config={
                 "profile_name":   st.column_config.Column("profile_name", pinned=True),
                 "invert_amounts": st.column_config.CheckboxColumn("Invert Amounts"),
@@ -1420,7 +1420,7 @@ def _render_rules_tab():
     if not rules_df.empty:
         st.dataframe(
             rules_df[['rule_id', 'pattern', 'match_type', 'payee_name', 'category_name', 'priority']],
-            hide_index=True, use_container_width=True,
+            hide_index=True, width="stretch",
             column_config={"rule_id": st.column_config.NumberColumn("ID", format="%d")},
         )
 
@@ -1610,7 +1610,7 @@ def _render_history_tab():
             "app_balance":       _fmt(",.2f"),
             "difference":        _fmt("+,.2f"),
         }),
-        hide_index=True, use_container_width=True,
+        hide_index=True, width="stretch",
         column_config={
             "session_id":        st.column_config.NumberColumn("ID",      format="%d"),
             "session_date":      "Session Date",

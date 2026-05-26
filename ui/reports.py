@@ -134,10 +134,10 @@ def render_custom_reports():
         placeholder="Preset name to save as…", key=f"cr_preset_name_{sel_preset}",
         label_visibility="collapsed",
     )
-    save_btn = pp3.button("\U0001f4be Save", key="cr_save_btn", use_container_width=True)
+    save_btn = pp3.button("\U0001f4be Save", key="cr_save_btn", width="stretch")
     del_btn  = pp4.button("\U0001f5d1️ Delete", key="cr_del_btn",
                           disabled=(sel_preset == "(New Report)"),
-                          use_container_width=True)
+                          width="stretch")
 
     loaded_cfg: dict = {}
     if sel_preset != "(New Report)" and sel_preset in preset_map:
@@ -335,7 +335,7 @@ def render_custom_reports():
     st.divider()
     run_col, _ = st.columns([1, 4])
     if run_col.button("▶️ Run Report", type="primary", key="cr_run",
-                      use_container_width=True):
+                      width="stretch"):
         if use_all_cats == "Selected Categories" and not category_ids:
             st.warning("Select at least one category or switch to 'All Expense Categories'.")
         elif use_all_accts == "Selected Accounts" and not account_ids:
@@ -433,7 +433,7 @@ def render_custom_reports():
     st.dataframe(
         df_display.style.format(fmt).apply(_style_pivot, axis=1),
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         column_config={
             "Category": st.column_config.Column(pinned=True),
         },
@@ -511,7 +511,7 @@ def render_custom_reports():
                 "notes":      st.column_config.TextColumn("Notes"),
             },
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
             key=f"cr_dd_editor_{sel_cat}_{sel_period}",
         )
 
@@ -698,12 +698,12 @@ def render_reports():
                     label_visibility="collapsed",
                 )
             with _pp3:
-                _perf_save = st.button("💾 Save", key="perf_save_btn", use_container_width=True)
+                _perf_save = st.button("💾 Save", key="perf_save_btn", width="stretch")
             with _pp4:
                 _perf_del = st.button(
                     "🗑️ Delete", key="perf_del_btn",
                     disabled=(sel_preset == _PERF_BUILTIN),
-                    use_container_width=True,
+                    width="stretch",
                 )
 
             if sel_preset == _PERF_BUILTIN:
@@ -4874,7 +4874,7 @@ def render_spending_trends():
                 "amount_eur": "{:,.2f} €",
                 "share_pct":  "{:.1f}%",
             }),
-            hide_index=True, use_container_width=True,
+            hide_index=True, width="stretch",
             column_config={
                 "payee":      "Payee",
                 "tx_count":   st.column_config.NumberColumn("# Txns", format="%d"),
@@ -4939,7 +4939,7 @@ def render_spending_trends():
             "notes":      st.column_config.TextColumn("Notes"),
         },
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         key=f"st_txn_editor_{selected_payee}_{selected_category}",
     )
 
@@ -5234,7 +5234,7 @@ def render_capital_gains():
         }
         st.dataframe(
             disp.style.format(fmt).map(color_negative_red, subset=['gain_loss_eur']),
-            hide_index=True, use_container_width=True, column_config=col_cfg,
+            hide_index=True, width="stretch", column_config=col_cfg,
         )
         copy_df_button(disp, key=key)
 
@@ -5504,7 +5504,7 @@ def render_investment_income():
         st.dataframe(
             df_t_disp.style.format({"amount_eur": "{:,.2f} €"}),
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
             column_config={
                 "securities_name": "Security",
                 "account_name":    "Account",
@@ -5535,7 +5535,7 @@ def render_investment_income():
         st.dataframe(
             df_e_disp.style.format({"amount_eur": "{:,.2f} €"}),
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
             column_config={
                 "securities_name": "Security",
                 "account_name":    "Account",
@@ -5555,7 +5555,7 @@ def render_investment_income():
             st.dataframe(
                 df_r_disp.style.format({"amount_eur": "{:,.2f} €"}),
                 hide_index=True,
-                use_container_width=True,
+                width="stretch",
                 column_config={
                     "securities_name": "Security",
                     "account_name":    "Account",
@@ -6431,7 +6431,7 @@ def render_twr_mwr(account_ids: tuple = None):
             st.dataframe(
                 df_cf_disp.style.format({"cashflow_eur": "{:+,.2f} €"})
                     .map(color_negative_red, subset=['cashflow_eur']),
-                hide_index=True, use_container_width=True,
+                hide_index=True, width="stretch",
                 column_config={
                     "date":         "Date",
                     "action":       "Action",

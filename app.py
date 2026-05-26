@@ -186,7 +186,7 @@ def main():
     )
 
     st.sidebar.divider()
-    if st.sidebar.button("Clear Cache", use_container_width=True):
+    if st.sidebar.button("Clear Cache", width="stretch"):
         st.cache_data.clear()
         st.sidebar.success("Cache cleared.")
 
