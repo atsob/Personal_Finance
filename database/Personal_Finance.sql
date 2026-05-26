@@ -119,13 +119,20 @@ CREATE TABLE Securities (
     Yahoo_Ticker         VARCHAR(30),
     TV_Symbol            VARCHAR(30),
     TV_Exchange          VARCHAR(30),
-    ISIN                 VARCHAR(12) UNIQUE,
+    ISIN                 VARCHAR(12),
     Maturity_Date        DATE,
     Coupon_Rate          NUMERIC(6, 4),
     Face_Value           NUMERIC(20, 8),
     Coupon_Frequency     VARCHAR(20) DEFAULT 'Annual',
     Is_Tax_Exempt        BOOLEAN DEFAULT FALSE,      -- if TRUE, capital gains are always tax-exempt
                                                      -- (overridden when traded as CFD/CFDOnETF etc.)
+    Dividend_Yield       NUMERIC(8,4),
+    Dividend_Rate        NUMERIC(16,6),
+    Dividend_Frequency   VARCHAR(20),
+    Ex_Dividend_Date     DATE,
+    Dividend_Pay_Date    DATE,
+    Payout_Ratio         NUMERIC(8,4),
+    Five_Year_Avg_Yield  NUMERIC(8,4),
     embedding            vector(768)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_securities_id           ON Securities(Securities_Id);
@@ -133,6 +140,18 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_securities_name         ON Securities(Secu
 CREATE        INDEX IF NOT EXISTS idx_securities_yahoo_ticker ON Securities(Yahoo_Ticker)  WHERE Yahoo_Ticker IS NOT NULL;
 CREATE        INDEX IF NOT EXISTS idx_securities_tv_symbol    ON Securities(TV_Symbol)     WHERE TV_Symbol IS NOT NULL;
 
+-- Historical dividend records
+CREATE TABLE IF NOT EXISTS Securities_Dividends (
+    Dividend_Id    SERIAL PRIMARY KEY,
+    Securities_Id  INTEGER NOT NULL
+                   REFERENCES Securities(Securities_Id) ON DELETE CASCADE,
+    Ex_Date        DATE    NOT NULL,
+    Pay_Date       DATE,
+    Amount         NUMERIC(16,6) NOT NULL,
+    UNIQUE (Securities_Id, Ex_Date)
+);
+CREATE INDEX IF NOT EXISTS idx_sec_div_sec_id  ON Securities_Dividends(Securities_Id);
+CREATE INDEX IF NOT EXISTS idx_sec_div_ex_date ON Securities_Dividends(Ex_Date);
 
 -- =============================================================================
 -- ACCOUNTS & HOLDINGS

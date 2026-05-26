@@ -28,6 +28,7 @@ from data.downloaders import (
     download_historical_fx,
     download_securities_info_from_yahoo,
     download_securities_info_from_tradingview,
+    download_dividend_history,
 )
 from ai.update_vector import update_all_embeddings
 from database.backup import DatabaseBackup
@@ -121,11 +122,12 @@ def _market_data_job():
 
 
 def _securities_info_job():
-    """Download securities metadata (sector, industry, rating, target price) once per day.
+    """Download securities metadata (sector, industry, rating, target price,
+    dividend summary) once per day.
 
-    Yahoo Finance runs first (broker analyst consensus); TradingView fills any
-    remaining NULL fields (sector/industry/target price) for securities not
-    covered by Yahoo (e.g. ATHEX stocks).
+    Yahoo Finance runs first (broker analyst consensus + dividend fields);
+    TradingView fills any remaining NULL fields (sector/industry/target price)
+    for securities not covered by Yahoo (e.g. ATHEX stocks).
     """
     logging.info("Running securities info refresh…")
     try:
@@ -134,6 +136,20 @@ def _securities_info_job():
         logging.info("Securities info refreshed.")
     except Exception as e:
         logging.error(f"Securities info refresh failed: {e}", exc_info=True)
+
+
+def _dividend_history_job():
+    """Download full historical dividend records once per week (Sunday at 06:30).
+
+    Runs weekly rather than daily — dividend histories change slowly and each
+    call fetches a full time series per ticker (heavier than the daily info fetch).
+    """
+    logging.info("Running weekly dividend history refresh…")
+    try:
+        download_dividend_history()
+        logging.info("Dividend history refresh complete.")
+    except Exception as e:
+        logging.error(f"Dividend history refresh failed: {e}", exc_info=True)
 
 
 def _backup_job():
@@ -247,6 +263,9 @@ if __name__ == "__main__":
     _securities_info_job()
     _last_securities_info_date = date.today()
 
+    # Dividend history: weekly (Sunday); skip if already ran this week
+    _last_dividend_history_week: date = date.min
+
     # Morning maintenance (VACUUM ANALYZE + embeddings): skip if already ran today
     _last_maintenance_date: date = date.min
     _now_startup = datetime.now()
@@ -301,3 +320,14 @@ if __name__ == "__main__":
         ):
             _morning_maintenance_job()
             _last_maintenance_date = date.today()
+
+        # ── Dividend history: Sunday at 06:30 (once per week) ────────────────
+        _this_week_start = _current_week_start()
+        if (
+            now.weekday() == 6          # Sunday
+            and now.hour == 6
+            and 30 <= now.minute < 35
+            and _last_dividend_history_week != _this_week_start
+        ):
+            _dividend_history_job()
+            _last_dividend_history_week = _this_week_start

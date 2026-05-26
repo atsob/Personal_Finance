@@ -3340,30 +3340,81 @@ def render_dividend_tracker():
         / ann_days
     ).fillna(0)
 
+    # ── Enrich with Yahoo Finance security metadata ───────────────────────────
+    # Join Dividend_Yield (fwd market yield), Ex_Dividend_Date, Dividend_Frequency
+    # so the user can compare their actual YOC vs what a new buyer would earn today.
+    from database.connection import get_db as _get_db
+    with _get_db() as _conn_yh:
+        df_sec_meta = pd.read_sql("""
+            SELECT Securities_Name,
+                   Dividend_Yield    AS fwd_yield_pct,
+                   Ex_Dividend_Date  AS ex_div_date,
+                   Dividend_Frequency AS div_frequency
+            FROM   Securities
+            WHERE  Dividend_Yield IS NOT NULL
+               OR  Ex_Dividend_Date IS NOT NULL
+               OR  Dividend_Frequency IS NOT NULL
+        """, _conn_yh)
+
+    if not df_sec_meta.empty:
+        df_sec_meta.columns = df_sec_meta.columns.str.lower()
+        df_t12 = df_t12.merge(
+            df_sec_meta,
+            left_on='securities_name', right_on='securities_name',
+            how='left',
+        )
+    else:
+        df_t12['fwd_yield_pct']  = None
+        df_t12['ex_div_date']    = None
+        df_t12['div_frequency']  = None
+
     m1, m2, m3 = st.columns(3)
     m1.metric(f"Total ({period_label})", f"€ {df_t12['period_income_eur'].sum():,.2f}")
     m2.metric("Securities paying", str(len(df_t12)))
     _avg_yoc = df_t12[df_t12['yoc_pct'] > 0]['yoc_pct'].mean()
     m3.metric("Avg Ann. YOC", f"{_avg_yoc:.2f}%" if not pd.isna(_avg_yoc) else "N/A")
 
+    _disp_cols = ['securities_name', 'securities_type',
+                  'period_income_eur', 'cost_basis_eur', 'yoc_pct',
+                  'fwd_yield_pct', 'ex_div_date', 'div_frequency']
+    _disp_cols = [c for c in _disp_cols if c in df_t12.columns]
+
     st.dataframe(
-        df_t12[['securities_name','securities_type','period_income_eur','cost_basis_eur','yoc_pct']].style.format({
+        df_t12[_disp_cols].style.format({
             'period_income_eur': '{:,.2f} €',
             'cost_basis_eur':    '{:,.2f} €',
             'yoc_pct':           '{:.2f}%',
+            'fwd_yield_pct':     lambda v: f'{v:.2f}%' if pd.notna(v) else '—',
         }),
         hide_index=True, width='stretch',
         column_config={
             'securities_name':   'Security',
             'securities_type':   'Type',
-            'period_income_eur': st.column_config.NumberColumn(f'Income ({period_label})', format='%,.2f €'),
-            'cost_basis_eur':    st.column_config.NumberColumn('Cost Basis (€)', format='%,.2f €',
-                                     help='Average FIFO cost basis across all income payments in the period (EUR). Expire/Reinvest on the same date as the income payment are excluded so closed positions show their true cost.'),
-            'yoc_pct':           st.column_config.NumberColumn('Ann. YOC %', format='%.2f%%',
-                                     help='Annualised yield on cost: (total period income / FIFO cost at last payment) × (365 / days from oldest held lot to last dividend). MiscExp deducted from income.'),
+            'period_income_eur': st.column_config.NumberColumn(
+                f'Income ({period_label})', format='%,.2f €'),
+            'cost_basis_eur':    st.column_config.NumberColumn(
+                'Cost Basis (€)', format='%,.2f €',
+                help='Average FIFO cost basis across all income payments in the period (EUR). '
+                     'Expire/Reinvest on the same date as the income payment are excluded so '
+                     'closed positions show their true cost.'),
+            'yoc_pct':           st.column_config.NumberColumn(
+                'Ann. YOC %', format='%.2f%%',
+                help='Annualised yield on cost: (total period income / FIFO cost at last '
+                     'payment) × (365 / days). YOC > Fwd Yield = you bought at a better '
+                     'price than today.'),
+            'fwd_yield_pct':     st.column_config.NumberColumn(
+                'Fwd. Yield %', format='%.2f%%',
+                help='Current forward dividend yield from Yahoo Finance (based on today\'s '
+                     'market price). Compare with Ann. YOC to see if you beat the market.'),
+            'ex_div_date':       st.column_config.DateColumn(
+                'Ex-Div Date', format='DD/MM/YYYY',
+                help='Next ex-dividend date from Yahoo Finance.'),
+            'div_frequency':     st.column_config.TextColumn(
+                'Frequency',
+                help='Dividend payment frequency from Yahoo Finance.'),
         }
     )
-    copy_df_button(df_t12, key="dl_rpt_div_t12")
+    copy_df_button(df_t12[_disp_cols], key="dl_rpt_div_t12")
 
     # ── Pie chart: income allocation by Security Type ─────────────────────────
     df_by_type = (

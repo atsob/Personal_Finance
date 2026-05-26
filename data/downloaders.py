@@ -83,13 +83,30 @@ def download_historical_fx(tsperiod=None, currencies_id=None):
         cur.close()
         conn.close()
 
+def _ts_to_date(ts):
+    """Convert a Yahoo Finance Unix timestamp (int or None) to a date, or None."""
+    if not ts:
+        return None
+    try:
+        return datetime.fromtimestamp(int(ts)).date()
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
 def download_securities_info_from_yahoo(target_sec_id=None):
     """Download securities information from Yahoo Finance.
 
-    Fetches sector, industry, analyst rating and target price for all
-    securities that have a Yahoo_Ticker defined.  Requests are made in
-    parallel (up to MAX_WORKERS concurrent threads) to minimise wall-clock
-    time; DB writes are batched into a single executemany + commit.
+    Fetches sector, industry, analyst rating, target price, and dividend
+    summary fields (yield, rate, ex-date, pay-date, payout ratio, 5Y avg
+    yield) for all securities that have a Yahoo_Ticker defined.
+
+    Requests are made in parallel (up to MAX_WORKERS concurrent threads) to
+    minimise wall-clock time; DB writes are batched into a single
+    executemany + commit.
+
+    Dividend fields come from the same ticker.info call — no extra API
+    requests.  Historical dividend records and frequency are downloaded
+    separately via download_dividend_history().
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -102,7 +119,10 @@ def download_securities_info_from_yahoo(target_sec_id=None):
     def _fetch(sec_id, sec_name, symbol):
         """Fetch Yahoo info for one ticker; returns a result tuple."""
         try:
-            info = yf.Ticker(symbol, session=custom_session).info
+            ticker = yf.Ticker(symbol, session=custom_session)
+            info   = ticker.info
+
+            # ── Existing fields ────────────────────────────────────────────
             sector   = info.get('sector')   or None
             industry = info.get('industry') or None
             _raw     = info.get('recommendationKey')
@@ -112,9 +132,54 @@ def download_securities_info_from_yahoo(target_sec_id=None):
                 else str(_raw).strip().lower()
             )
             target_price = info.get('targetMeanPrice') or None
-            return (sec_id, sec_name, symbol, sector, industry, rating, target_price, None)
+
+            # ISIN — not in ticker.info; requires the dedicated ticker.isin
+            # property which hits a separate Yahoo search endpoint.
+            # Validate: must be exactly 12 alphanumeric characters.
+            isin = None
+            try:
+                _isin_raw = ticker.isin
+                if (isinstance(_isin_raw, str)
+                        and len(_isin_raw.strip()) == 12
+                        and _isin_raw.strip().upper() not in ('-', 'N/A', 'NONE')):
+                    isin = _isin_raw.strip().upper()
+            except Exception:
+                pass   # not available for this ticker — leave as None
+
+            # ── Dividend summary (free — already in ticker.info) ───────────
+            # Yahoo's dividendYield is already expressed as a percentage value
+            # (e.g. 0.96 means 0.96%, 3.55 means 3.55%) — store as-is, no ×100.
+            _dy = info.get('dividendYield')
+            div_yield = round(float(_dy), 4) if _dy else None
+
+            div_rate = info.get('dividendRate') or None  # annual per share
+
+            # fiveYearAvgDividendYield is already in % (e.g. 2.34).
+            _fa = info.get('fiveYearAvgDividendYield')
+            five_yr_avg = round(float(_fa), 4) if _fa else None
+
+            # payoutRatio is a decimal (0.45 = 45 %); store as %.
+            _pr = info.get('payoutRatio')
+            payout = round(float(_pr) * 100, 4) if _pr else None
+
+            ex_div_date  = _ts_to_date(info.get('exDividendDate'))
+            div_pay_date = _ts_to_date(
+                info.get('dividendDate') or info.get('lastDividendDate')
+            )
+
+            return (sec_id, sec_name, symbol,
+                    sector, industry, rating, target_price,
+                    div_yield, div_rate, five_yr_avg, payout,
+                    ex_div_date, div_pay_date,
+                    isin,
+                    None)
         except Exception as exc:
-            return (sec_id, sec_name, symbol, None, None, None, None, str(exc))
+            return (sec_id, sec_name, symbol,
+                    None, None, None, None,
+                    None, None, None, None,
+                    None, None,
+                    None,
+                    str(exc))
 
     try:
         base_query = """
@@ -151,23 +216,54 @@ def download_securities_info_from_yahoo(target_sec_id=None):
                 results.append(f.result())
 
         # ── Batch DB update ───────────────────────────────────────────────────
-        updates = []
-        for sec_id, sec_name, symbol, sector, industry, rating, target_price, err in results:
+        sec_industry_updates = []    # rows that have sector/industry
+        div_updates          = []    # ALL rows that returned without error
+        isin_updates         = []    # (isin, sec_id) where Yahoo returned an ISIN
+
+        for row in results:
+            (sec_id, sec_name, symbol,
+             sector, industry, rating, target_price,
+             div_yield, div_rate, five_yr_avg, payout,
+             ex_div_date, div_pay_date,
+             isin,
+             err) = row
+
             if err:
                 print(f"  ⚠️ Error fetching {sec_name} ({symbol}): {err}")
                 logging.warning(f"Yahoo info error for {sec_name} ({symbol}): {err}")
                 continue
-            if not sector or not industry:
-                print(f"  ⚠️ Limited data for {sec_name} ({symbol}) — skipping")
-                logging.warning(f"Limited Yahoo data for {sec_name} ({symbol})")
-                continue
-            print(f"  ✔ {sec_name}: sector={sector}, industry={industry}, "
-                  f"rating={rating}, target={target_price}")
-            logging.info(f"Yahoo info {sec_name}: sector={sector}, industry={industry}, "
-                         f"rating={rating}, target={target_price}")
-            updates.append((sector, industry, rating, target_price, sec_id))
 
-        if updates:
+            # Sector / industry update (only when both are present)
+            if sector and industry:
+                print(f"  ✔ {sec_name}: sector={sector}, industry={industry}, "
+                      f"rating={rating}, target={target_price}")
+                logging.info(f"Yahoo info {sec_name}: sector={sector}, "
+                             f"industry={industry}, rating={rating}, target={target_price}")
+                sec_industry_updates.append(
+                    (sector, industry, rating, target_price, sec_id)
+                )
+            else:
+                print(f"  ⚠️ No sector/industry for {sec_name} ({symbol})")
+                logging.warning(f"No sector/industry for {sec_name} ({symbol})")
+
+            # Dividend update (always, even for crypto/ETFs with no sector)
+            has_div = any(v is not None for v in
+                          (div_yield, div_rate, ex_div_date, div_pay_date))
+            if has_div:
+                print(f"       div: yield={div_yield}% rate={div_rate} "
+                      f"ex={ex_div_date} pay={div_pay_date} "
+                      f"payout={payout}% 5yr={five_yr_avg}%")
+            div_updates.append(
+                (div_yield, div_rate, five_yr_avg, payout,
+                 ex_div_date, div_pay_date, sec_id)
+            )
+
+            # ISIN update (separate — only when Yahoo returned a valid ISIN)
+            if isin:
+                print(f"       isin={isin}")
+                isin_updates.append((isin, sec_id))
+
+        if sec_industry_updates:
             cur.executemany("""
                 UPDATE Securities
                 SET    Sector               = %s,
@@ -175,11 +271,175 @@ def download_securities_info_from_yahoo(target_sec_id=None):
                        Analyst_Rating       = COALESCE(%s, Analyst_Rating),
                        Analyst_Target_Price = COALESCE(%s, Analyst_Target_Price)
                 WHERE  Securities_Id = %s
-            """, updates)
-            conn.commit()
+            """, sec_industry_updates)
 
-        print(f"Yahoo info update complete — {len(updates)}/{total} securities updated.")
-        logging.info(f"Yahoo info update complete — {len(updates)}/{total} updated.")
+        if div_updates:
+            cur.executemany("""
+                UPDATE Securities
+                SET    Dividend_Yield      = COALESCE(%s, Dividend_Yield),
+                       Dividend_Rate       = COALESCE(%s, Dividend_Rate),
+                       Five_Year_Avg_Yield = COALESCE(%s, Five_Year_Avg_Yield),
+                       Payout_Ratio        = COALESCE(%s, Payout_Ratio),
+                       Ex_Dividend_Date    = COALESCE(%s, Ex_Dividend_Date),
+                       Dividend_Pay_Date   = COALESCE(%s, Dividend_Pay_Date)
+                WHERE  Securities_Id = %s
+            """, div_updates)
+
+        # ISIN: dedicated pass — only fills NULL/empty slots, never overwrites
+        # a manually entered ISIN with Yahoo's value.
+        if isin_updates:
+            cur.executemany("""
+                UPDATE Securities
+                SET    ISIN = %s
+                WHERE  Securities_Id = %s
+                  AND  (ISIN IS NULL OR ISIN = '')
+            """, isin_updates)
+            print(f"  ISIN: {len(isin_updates)} securities with Yahoo ISIN "
+                  f"(only NULL/empty slots written).")
+
+        conn.commit()
+        print(f"Yahoo info update complete — "
+              f"{len(sec_industry_updates)} sector/industry, "
+              f"{sum(1 for r in div_updates)} dividend fields, "
+              f"{len(isin_updates)} ISIN(s) updated "
+              f"(out of {total} securities).")
+        logging.info(f"Yahoo info update complete — {len(sec_industry_updates)} "
+                     f"sector/industry, dividend fields for {len(div_updates)} securities, "
+                     f"{len(isin_updates)} ISIN(s) written.")
+
+    except Exception as e:
+        st.error(f"❌ Error: {e}")
+        logging.error(f"Error: {e}")
+    finally:
+        cur.close()
+        conn.close()
+
+
+def download_dividend_history(target_sec_id=None):
+    """Download full historical dividend records from Yahoo Finance.
+
+    Populates the Securities_Dividends table (one row per ex-date per
+    security) and back-fills Dividend_Frequency on the Securities row by
+    analysing how many payments occurred in the most recent full calendar
+    year.
+
+    This is kept separate from download_securities_info_from_yahoo because
+    ticker.dividends is a heavier API call (returns a time series, not just
+    a scalar) and is not needed as frequently.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    MAX_WORKERS = 5
+
+    conn = get_connection()
+    cur  = conn.cursor()
+    custom_session = get_custom_session()
+
+    def _infer_frequency(dividends: "pd.Series") -> "str | None":
+        """Return frequency label from a yfinance dividends Series."""
+        if dividends is None or dividends.empty:
+            return None
+        # Use the most recent full calendar year with at least one payment
+        years = sorted(dividends.index.year.unique(), reverse=True)
+        for yr in years:
+            count = int((dividends.index.year == yr).sum())
+            if count == 0:
+                continue
+            if count >= 10:
+                return "Monthly"
+            if count >= 4:
+                return "Quarterly"
+            if count >= 2:
+                return "Semi-Annual"
+            return "Annual"
+        return None
+
+    def _fetch(sec_id, sec_name, symbol):
+        try:
+            ticker  = yf.Ticker(symbol, session=custom_session)
+            divs    = ticker.dividends          # pandas Series, index = ex-date
+            if divs is None or divs.empty:
+                return sec_id, sec_name, symbol, [], None, None
+            rows = []
+            for ts, amount in divs.items():
+                ex_date = ts.date() if hasattr(ts, 'date') else None
+                if ex_date is None or amount <= 0:
+                    continue
+                rows.append((sec_id, ex_date, float(amount)))
+            frequency = _infer_frequency(divs)
+            return sec_id, sec_name, symbol, rows, frequency, None
+        except Exception as exc:
+            return sec_id, sec_name, symbol, [], None, str(exc)
+
+    try:
+        base_query = """
+            SELECT Securities_Id, Securities_Name, Yahoo_Ticker
+            FROM   Securities
+            WHERE  Yahoo_Ticker IS NOT NULL
+              AND  Yahoo_Ticker != ''
+              AND  Securities_Name NOT LIKE 'Hellenic T-Bill%'
+        """
+        if target_sec_id:
+            base_query += f" AND Securities_Id = {int(target_sec_id)}"
+        base_query += " ORDER BY Securities_Name ASC"
+
+        cur.execute(base_query)
+        securities = cur.fetchall()
+
+        if not securities:
+            logging.warning("No securities with Yahoo Ticker found.")
+            return
+
+        total = len(securities)
+        print(f"Downloading dividend history for {total} securities…")
+
+        futures = {}
+        results = []
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            for sec_id, sec_name, symbol in securities:
+                f = pool.submit(_fetch, sec_id, sec_name, symbol)
+                futures[f] = sec_name
+            for f in as_completed(futures):
+                results.append(f.result())
+
+        all_rows      = []   # (sec_id, ex_date, amount) for Securities_Dividends
+        freq_updates  = []   # (frequency, sec_id) for Securities
+
+        for sec_id, sec_name, symbol, rows, frequency, err in results:
+            if err:
+                print(f"  ⚠️ {sec_name} ({symbol}): {err}")
+                logging.warning(f"Dividend history error {sec_name}: {err}")
+                continue
+            if not rows:
+                print(f"  — {sec_name}: no dividends")
+                continue
+            print(f"  ✔ {sec_name}: {len(rows)} records, frequency={frequency}")
+            all_rows.extend(rows)
+            if frequency:
+                freq_updates.append((frequency, sec_id))
+
+        # ── Upsert dividend rows ──────────────────────────────────────────────
+        if all_rows:
+            execute_batch(cur, """
+                INSERT INTO Securities_Dividends (Securities_Id, Ex_Date, Amount)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (Securities_Id, Ex_Date)
+                DO UPDATE SET Amount = EXCLUDED.Amount
+            """, all_rows, page_size=500)
+
+        # ── Back-fill frequency on Securities ────────────────────────────────
+        if freq_updates:
+            cur.executemany("""
+                UPDATE Securities
+                SET    Dividend_Frequency = %s
+                WHERE  Securities_Id = %s
+            """, freq_updates)
+
+        conn.commit()
+        print(f"Dividend history complete — "
+              f"{len(all_rows)} records upserted across "
+              f"{sum(1 for r in results if r[3])} securities.")
+        logging.info(f"Dividend history: {len(all_rows)} rows upserted.")
 
     except Exception as e:
         st.error(f"❌ Error: {e}")

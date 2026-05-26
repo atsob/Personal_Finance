@@ -15,6 +15,7 @@ from data.downloaders import (
     download_bond_prices_from_solidus,
     download_securities_info_from_yahoo,
     download_securities_info_from_tradingview,
+    download_dividend_history,
 )
 
 
@@ -44,7 +45,7 @@ def _md_load_securities_with_price_stats():
     with get_db() as conn:
         return pd.read_sql("""
             SELECT s.Securities_Id, s.Securities_Name,
-                   s.Yahoo_Ticker, s.TV_Symbol,
+                   s.Yahoo_Ticker, s.TV_Symbol, s.TV_Exchange, s.ISIN,
                    COALESCE(hp.NoOfRecords, 0)          AS NoOfRecords,
                    COALESCE(hp.MaxDate, '1900-01-01')   AS MaxDate
             FROM Securities s
@@ -204,6 +205,7 @@ def render_market_data():
                        COALESCE(s.Is_Tax_Exempt, FALSE) AS Is_Tax_Exempt,
                        s.Yahoo_Ticker, s.TV_Symbol, s.TV_Exchange, s.ISIN,
                        s.Maturity_Date, s.Coupon_Rate, s.Face_Value, s.Coupon_Frequency,
+                       s.Dividend_Yield, s.Dividend_Frequency, s.Ex_Dividend_Date,
                        s.embedding,
                        COALESCE(ic.cnt, 0) AS investment_count
                 FROM Securities s
@@ -216,10 +218,13 @@ def render_market_data():
             """, conn)
 
         _sec_sort_labels = {
-            "ticker":           "Ticker",
-            "securities_name":  "Security Name",
-            "securities_type":  "Type",
-            "investment_count": "Investment Count",
+            "ticker":             "Ticker",
+            "securities_name":    "Security Name",
+            "securities_type":    "Type",
+            "investment_count":   "Investment Count",
+            "dividend_yield":     "Div. Yield (%)",
+            "dividend_frequency": "Div. Frequency",
+            "ex_dividend_date":   "Ex-Div Date",
         }
         _c1, _c2 = st.columns([2, 1])
         with _c1:
@@ -266,11 +271,14 @@ def render_market_data():
                 "face_value":           st.column_config.NumberColumn("Face Value",     width="small", format="%,.2f"),
                 "coupon_frequency":     st.column_config.SelectboxColumn("Coupon Frequency",
                     options=["Annual","Semi-Annual","Quarterly","Monthly","At Maturity"], width="small"),
+                "dividend_yield":       st.column_config.NumberColumn("Div. Yield (%)",   width="small", format="%.4f", disabled=True),
+                "dividend_frequency":   st.column_config.TextColumn("Div. Frequency",     width="small", disabled=True),
+                "ex_dividend_date":     st.column_config.DateColumn("Ex-Div Date",        width="small", disabled=True),
                 "investment_count":     st.column_config.NumberColumn("Investment Count", width="small", disabled=True),
                 "embedding":            None,
             },
         )
-        _sec_computed   = ["investment_count"]
+        _sec_computed   = ["investment_count", "dividend_yield", "dividend_frequency", "ex_dividend_date"]
         df_sec_save     = df_sec.drop(columns=[c for c in _sec_computed if c in df_sec.columns])
         edited_sec_save = edited_sec.drop(columns=[c for c in _sec_computed if c in edited_sec.columns])
         if not edited_sec_save.equals(df_sec_save):
@@ -279,8 +287,14 @@ def render_market_data():
             _md_load_securities_with_price_stats.clear()
 
         if st.button("🚀 Update Securities Information from Yahoo", key="mkt_download_sec_info", width="stretch"):
-            with st.spinner("Fetching sector, industry, rating & target price from Yahoo…"):
+            with st.spinner("Fetching sector, industry, analyst rating, target price & dividend summary from Yahoo…"):
                 download_securities_info_from_yahoo()
+            _md_load_securities_list.clear()
+            st.rerun()
+
+        if st.button("📅 Download Dividend History from Yahoo", key="mkt_download_div_history", width="stretch"):
+            with st.spinner("Fetching full dividend history & inferring frequency from Yahoo…"):
+                download_dividend_history()
             _md_load_securities_list.clear()
             st.rerun()
 
@@ -321,11 +335,12 @@ def render_market_data():
             inv_sec_id = selected_inv_sec['securities_id']
 
             # ── Inner sub-tabs ────────────────────────────────────────────────
-            st_prices, st_inv_txs, st_anomalies, st_dummy = st.tabs([
+            st_prices, st_inv_txs, st_anomalies, st_dummy, st_divs = st.tabs([
                 "📈 Prices",
                 "🧾 Investment Transactions",
                 "🔍 Price Anomalies",
                 "⚖ Dummy Prices",
+                "💰 Dividends",
             ])
 
             # ─────────────────────────────────────────────────────────────────
@@ -949,3 +964,112 @@ def render_market_data():
                             "Recalculates the Holdings table from Investments data. "
                             "Run this after normalization to update portfolio quantities and P&L."
                         )
+
+            # ─────────────────────────────────────────────────────────────────
+            # SUB-TAB: Dividends
+            # ─────────────────────────────────────────────────────────────────
+            with st_divs:
+                # Load dividend summary + history for the selected security
+                with get_db() as _conn_div:
+                    df_div_info = pd.read_sql("""
+                        SELECT Dividend_Yield, Dividend_Rate, Five_Year_Avg_Yield,
+                               Payout_Ratio, Ex_Dividend_Date, Dividend_Pay_Date,
+                               Dividend_Frequency
+                        FROM   Securities
+                        WHERE  Securities_Id = %(sid)s
+                    """, _conn_div, params={"sid": inv_sec_id})
+
+                    df_div_hist = pd.read_sql("""
+                        SELECT Ex_Date AS "Ex-Date", Amount AS "Amount"
+                        FROM   Securities_Dividends
+                        WHERE  Securities_Id = %(sid)s
+                        ORDER  BY Ex_Date DESC
+                    """, _conn_div, params={"sid": inv_sec_id})
+
+                # ── Summary metric cards ──────────────────────────────────────
+                _has_div_info = (
+                    not df_div_info.empty
+                    and not df_div_info.iloc[0].isnull().all()
+                )
+                if _has_div_info:
+                    _di = df_div_info.iloc[0]
+
+                    def _fmt_pct(v):
+                        return f"{v:.2f}%" if pd.notna(v) else "—"
+                    def _fmt_num(v):
+                        return f"{v:,.4f}" if pd.notna(v) else "—"
+                    def _fmt_date(v):
+                        return str(v) if pd.notna(v) else "—"
+                    def _fmt_str(v):
+                        return str(v) if pd.notna(v) else "—"
+
+                    _d1, _d2, _d3, _d4 = st.columns(4)
+                    with _d1: st.metric("Dividend Yield",  _fmt_pct(_di.get("dividend_yield")))
+                    with _d2: st.metric("Annual Rate",     _fmt_num(_di.get("dividend_rate")))
+                    with _d3: st.metric("5Y Avg Yield",    _fmt_pct(_di.get("five_year_avg_yield")))
+                    with _d4: st.metric("Payout Ratio",    _fmt_pct(_di.get("payout_ratio")))
+
+                    _d5, _d6, _d7, _ = st.columns(4)
+                    with _d5: st.metric("Ex-Dividend Date", _fmt_date(_di.get("ex_dividend_date")))
+                    with _d6: st.metric("Payment Date",     _fmt_date(_di.get("dividend_pay_date")))
+                    with _d7: st.metric("Frequency",        _fmt_str(_di.get("dividend_frequency")))
+                else:
+                    st.info(
+                        "No dividend summary data stored for this security. "
+                        "Use the download button below to fetch it from Yahoo Finance."
+                    )
+
+                # ── Historical dividend bar chart + table ─────────────────────
+                if not df_div_hist.empty:
+                    st.subheader("📅 Dividend History")
+
+                    _df_chart = df_div_hist.copy()
+                    _df_chart["Ex-Date"] = pd.to_datetime(_df_chart["Ex-Date"])
+                    _df_chart["Year"]    = _df_chart["Ex-Date"].dt.year
+                    _df_annual = (
+                        _df_chart.groupby("Year")["Amount"]
+                        .sum().reset_index().sort_values("Year")
+                    )
+                    fig_div = go.Figure(go.Bar(
+                        x=_df_annual["Year"].astype(str),
+                        y=_df_annual["Amount"],
+                        marker_color="steelblue",
+                        hovertemplate="Year: %{x}<br>Total: %{y:.4f}<extra></extra>",
+                    ))
+                    fig_div.update_layout(
+                        xaxis_title="Year", yaxis_title="Total Dividend per Share",
+                        margin=dict(l=0, r=0, t=0, b=0), height=280,
+                        template="plotly_white",
+                    )
+                    st.plotly_chart(fig_div, width="stretch")
+
+                    st.dataframe(
+                        df_div_hist,
+                        hide_index=True, width="stretch",
+                        column_config={
+                            "Ex-Date": st.column_config.DateColumn("Ex-Date", format="DD/MM/YYYY"),
+                            "Amount":  st.column_config.NumberColumn("Amount",  format="%,.4f"),
+                        },
+                    )
+                    copy_df_button(df_div_hist, key=f"mkt_dl_div_hist_{inv_sec_id}")
+                else:
+                    st.info("No historical dividend records found for this security.")
+
+                # ── Targeted download button ──────────────────────────────────
+                st.divider()
+                _yh_ticker_div = selected_inv_sec.get("yahoo_ticker")
+                _has_yahoo_div = bool(pd.notna(_yh_ticker_div) and _yh_ticker_div)
+                if _has_yahoo_div:
+                    if st.button(
+                            "📅 Update dividend data for this security",
+                            key=f"mkt_div_update_{inv_sec_id}", width="stretch"):
+                        with st.spinner("Fetching dividend data from Yahoo…"):
+                            download_securities_info_from_yahoo(target_sec_id=inv_sec_id)
+                            download_dividend_history(target_sec_id=inv_sec_id)
+                        _md_load_securities_list.clear()
+                        st.rerun()
+                else:
+                    st.caption(
+                        f"ℹ️ No Yahoo ticker defined for {selected_inv_sec['securities_name']} "
+                        "— cannot fetch dividend data."
+                    )
