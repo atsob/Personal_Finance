@@ -289,6 +289,18 @@ def _parse_trades(statement: ET.Element) -> tuple[list, int]:
             # Unknown action (e.g. exercise, assignment) — skip
             continue
 
+        # Back-calculate commission from netCash when ibCommission is not reported.
+        # Both fields are in trade currency, so:
+        #   Buy : abs(netCash) = qty × price + commission  →  comm = abs(netCash) − qty×price
+        #   Sell: abs(netCash) = qty × price − commission  →  comm = qty×price − abs(netCash)
+        # In both cases comm = abs(abs(netCash) − qty × price).
+        # Only apply when ibCommission was truly absent/zero AND the arithmetic gives a
+        # meaningful non-zero result (> 0.0001) to avoid storing rounding noise.
+        if commission == 0 and quantity > 0 and price > 0:
+            _back_comm = abs(abs(net_cash) - quantity * price)
+            if _back_comm > 0.0001:
+                commission = round(_back_comm, 4)
+
         total_eur = abs(net_cash) * fx_rate
 
         records.append({
@@ -555,7 +567,8 @@ def _tx_exists(cur, acc_id: int, desc: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def check_existing_records(
-    inv_records: list, tx_records: list, account_id: int
+    inv_records: list, tx_records: list, account_id: int,
+    cash_account_id: int | None = None,
 ) -> tuple[set, set]:
     """Return (existing_inv_descs, existing_tx_descs) — description keys that
     already exist in the DB for this account.  Uses IN-list queries so it works
@@ -578,13 +591,14 @@ def check_existing_records(
             )
             existing_inv = {row[0] for row in cur.fetchall()}
 
+        tx_check_id = cash_account_id if cash_account_id else account_id
         tx_descs = [r["desc"] for r in tx_records]
         if tx_descs:
             placeholders = ",".join(["%s"] * len(tx_descs))
             cur.execute(
                 f"SELECT Description FROM Transactions "
                 f"WHERE Accounts_Id = %s AND Description IN ({placeholders})",
-                [account_id] + tx_descs,
+                [tx_check_id] + tx_descs,
             )
             existing_tx = {row[0] for row in cur.fetchall()}
 
@@ -595,7 +609,8 @@ def check_existing_records(
 
 
 def check_fuzzy_duplicates(
-    inv_records: list, tx_records: list, account_id: int
+    inv_records: list, tx_records: list, account_id: int,
+    cash_account_id: int | None = None,
 ) -> tuple[set, set]:
     """Secondary duplicate detection using date + action + quantity/amount.
 
@@ -625,6 +640,7 @@ def check_fuzzy_duplicates(
             if cur.fetchone():
                 fuzzy_inv.add(rec["desc"])
 
+        tx_check_id = cash_account_id if cash_account_id else account_id
         for rec in tx_records:
             cur.execute(
                 """SELECT 1 FROM Transactions
@@ -632,7 +648,7 @@ def check_fuzzy_duplicates(
                      AND Date                 = %s
                      AND ABS(Total_Amount - %s) < 0.01
                    LIMIT 1""",
-                (account_id, rec["date"], rec["amount"]),
+                (tx_check_id, rec["date"], rec["amount"]),
             )
             if cur.fetchone():
                 fuzzy_tx.add(rec["desc"])
@@ -713,6 +729,7 @@ def run_import(
     inv_records: list,
     tx_records:  list,
     account_id:  int,
+    cash_account_id: int | None = None,
     replace_mode: bool = False,
     progress_cb=None,
 ) -> dict:
@@ -728,11 +745,17 @@ def run_import(
     }
 
     try:
+        tx_dest_id = cash_account_id if cash_account_id else account_id
         if replace_mode:
             cur.execute("DELETE FROM Investments WHERE Accounts_Id = %s AND Description LIKE %s",
                         (account_id, f"{_IB_PREFIX}%"))
+            # Always clean the margin account (handles prior imports without a cash account)
             cur.execute("DELETE FROM Transactions WHERE Accounts_Id = %s AND Description LIKE %s",
                         (account_id, f"IB %"))
+            # Also clean the cash account when configured separately
+            if cash_account_id and cash_account_id != account_id:
+                cur.execute("DELETE FROM Transactions WHERE Accounts_Id = %s AND Description LIKE %s",
+                            (cash_account_id, f"IB %"))
 
         total = len(inv_records) + len(tx_records)
         done  = 0
@@ -754,10 +777,12 @@ def run_import(
                 cur.execute(
                     """INSERT INTO Investments
                            (Accounts_Id, Securities_Id, Date, Action, Quantity,
-                            Price_Per_Share, Total_Amount, Description)
-                       VALUES (%s, %s, %s, %s::investments_action, %s, %s, %s, %s)""",
+                            Price_Per_Share, Commission, Total_Amount, Description)
+                       VALUES (%s, %s, %s, %s::investments_action, %s, %s, %s, %s, %s)""",
                     (account_id, sec_id, rec["date"], rec["action"],
-                     rec["quantity"], rec["price"], rec["total_eur"], rec["desc"]),
+                     rec["quantity"], rec["price"],
+                     rec.get("commission") or None,
+                     rec["total_eur"], rec["desc"]),
                 )
                 counts["investments"] += 1
             done += 1
@@ -765,14 +790,14 @@ def run_import(
                 progress_cb(done / total)
 
         for rec in tx_records:
-            if not replace_mode and _tx_exists(cur, account_id, rec["desc"]):
+            if not replace_mode and _tx_exists(cur, tx_dest_id, rec["desc"]):
                 counts["transactions_skip"] += 1
             else:
                 cur.execute(
                     """INSERT INTO Transactions
                            (Accounts_Id, Date, Total_Amount, Description, Cleared)
                        VALUES (%s, %s, %s, %s, TRUE)""",
-                    (account_id, rec["date"], rec["amount"], rec["desc"]),
+                    (tx_dest_id, rec["date"], rec["amount"], rec["desc"]),
                 )
                 counts["transactions"] += 1
             done += 1

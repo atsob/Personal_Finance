@@ -716,7 +716,7 @@ def _render_new_investment_form(acc_id, acc_type, df_accs, df_securities, get_db
     # ── Action metadata ────────────────────────────────────────────────────────
     ALL_ACTIONS = [
         'Buy', 'Sell', 'Dividend', 'Reinvest', 'IntInc', 'RtrnCap',
-        'MiscExp', 'ShrIn', 'ShrOut', 'CashIn', 'CashOut',
+        'MiscExp', 'MiscInc', 'ShrIn', 'ShrOut', 'CashIn', 'CashOut',
         'Split', 'Vest', 'Grant', 'Exercise', 'Expire',
     ]
     CASH_OUT_ACTIONS = {'Buy', 'MiscExp'}
@@ -1020,6 +1020,470 @@ def _render_new_investment_form(acc_id, acc_type, df_accs, df_securities, get_db
                 st.error(f"Error saving investment transaction: {exc}")
 
 
+def _render_edit_investment_form(acc_id, acc_type, df_accs, df_securities, get_db_fn,
+                                  update_holdings_fn, update_investment_balances_fn):
+    """Edit an existing investment transaction with optional linked cash account management.
+
+    Mirrors _render_new_investment_form but operates on an existing Investments row:
+      - Lets the user search by date range then pick a record from a selectbox.
+      - Pre-fills all fields from the selected row.
+      - On save: UPDATEs the Investments row and creates / updates / deletes the
+        linked Transactions row in the cash account (Investments.Transactions_Id).
+    """
+
+    ALL_ACTIONS = [
+        'Buy', 'Sell', 'Dividend', 'Reinvest', 'IntInc', 'RtrnCap',
+        'MiscExp', 'MiscInc', 'ShrIn', 'ShrOut', 'CashIn', 'CashOut',
+        'Split', 'Vest', 'Grant', 'Exercise', 'Expire',
+    ]
+    CASH_OUT_ACTIONS     = {'Buy', 'MiscExp'}
+    CASH_IN_ACTIONS      = {'Sell', 'Dividend', 'IntInc', 'RtrnCap'}
+    LINKED_CAPABLE       = CASH_OUT_ACTIONS | CASH_IN_ACTIONS
+    NO_SECURITY_ACTIONS  = {'CashIn', 'CashOut'}
+    QTY_REQUIRED_ACTIONS = {'Buy', 'Sell', 'ShrIn', 'ShrOut', 'Reinvest', 'Split',
+                             'Vest', 'Grant', 'Exercise', 'Expire'}
+    _INSTRUMENT_TYPES    = [
+        "", "Stock", "ETF", "Bond", "CFD", "CEF", "CFDOnETF", "CFDOnStock",
+        "CFDOnIndex", "CFDOnFutures", "CFDOnFund", "Fund", "Option", "FX Spot", "Other",
+    ]
+
+    # ── Account metadata ───────────────────────────────────────────────────────
+    acc_row = df_accs[df_accs['accounts_id'] == acc_id].iloc[0]
+    acc_currencies_id = int(acc_row['currencies_id'])
+    acc_linked_default = acc_row.get('accounts_id_linked')
+    if pd.isna(acc_linked_default):
+        acc_linked_default = None
+    else:
+        acc_linked_default = int(acc_linked_default)
+
+    INV_TYPES = {'Brokerage', 'Pension', 'Other Investment', 'Margin'}
+    cash_acc_options = {
+        int(row['accounts_id']): f"{row['accounts_name']} ({row['accounts_balance']:,.2f})"
+        for _, row in df_accs.iterrows()
+        if row['accounts_type'] not in INV_TYPES and row['accounts_id'] != acc_id
+    }
+    cash_acc_ids = list(cash_acc_options.keys())
+
+    # ── Step 1: Date range filter + investment picker ──────────────────────────
+    st.markdown("#### 🔍 Select Investment to Edit")
+    _fc1, _fc2 = st.columns(2)
+    with _fc1:
+        _edit_from = st.date_input("From", value=date.today() - timedelta(days=90),
+                                    key=f"inv_edit_from_{acc_id}")
+    with _fc2:
+        _edit_to = st.date_input("To", value=date.today(),
+                                  key=f"inv_edit_to_{acc_id}")
+
+    with get_db_fn() as _conn_load:
+        df_inv = pd.read_sql(
+            """SELECT i.investments_id, i.date, i.action, i.quantity,
+                      i.price_per_share, i.commission, i.total_amount,
+                      i.description, i.transactions_id, i.securities_id,
+                      i.instrument_type,
+                      s.securities_name
+               FROM   Investments i
+               LEFT JOIN Securities s ON s.Securities_Id = i.Securities_Id
+               WHERE  i.Accounts_Id = %s
+                 AND  i.Date BETWEEN %s AND %s
+               ORDER  BY i.Date DESC, i.Investments_Id DESC""",
+            _conn_load,
+            params=(acc_id, _edit_from, _edit_to),
+        )
+
+    if df_inv.empty:
+        st.info("No investments found in the selected date range.")
+        return
+
+    _inv_opts: dict = {}
+    for _, _r in df_inv.iterrows():
+        _lbl = f"{_r['date']}  |  {_r['action']}  |  {_r.get('securities_name') or '—'}"
+        if _r['total_amount'] is not None:
+            _lbl += f"  |  {float(_r['total_amount']):,.4f}"
+        _inv_opts[int(_r['investments_id'])] = _lbl
+
+    sel_inv_id = st.selectbox(
+        "Investment to edit",
+        options=list(_inv_opts.keys()),
+        format_func=lambda x: _inv_opts.get(x, str(x)),
+        key=f"inv_edit_sel_{acc_id}",
+    )
+
+    if sel_inv_id is None:
+        return
+
+    sel_row = df_inv[df_inv['investments_id'] == sel_inv_id].iloc[0]
+
+    # ── Load existing linked transaction ──────────────────────────────────────
+    _raw_tx_id = sel_row.get('transactions_id')
+    existing_linked_tx: dict | None = None
+    existing_linked_acc_id: int | None = None
+    if _raw_tx_id is not None and not pd.isna(_raw_tx_id):
+        with get_db_fn() as _conn_tx:
+            _cur_tx = _conn_tx.cursor()
+            _cur_tx.execute(
+                """SELECT transactions_id, accounts_id, total_amount, date
+                   FROM   Transactions WHERE Transactions_Id = %s""",
+                (int(_raw_tx_id),),
+            )
+            _tx_row = _cur_tx.fetchone()
+            if _tx_row:
+                existing_linked_tx = {
+                    'transactions_id': _tx_row[0],
+                    'accounts_id':     _tx_row[1],
+                    'total_amount':    _tx_row[2],
+                    'date':            _tx_row[3],
+                }
+                existing_linked_acc_id = _tx_row[1]
+
+    # ── Detect selection change → write DB values into session state ───────────
+    # Streamlit ignores value=/index= when a key already exists in session state,
+    # so we must SET the target values ourselves instead of just clearing keys.
+    _last_sel_key = f"inv_edit_last_{acc_id}"
+    if st.session_state.get(_last_sel_key) != sel_inv_id:
+        _act = str(sel_row['action']) if sel_row['action'] else ALL_ACTIONS[0]
+        _raw_sec = sel_row.get('securities_id')
+        _sec_id  = int(_raw_sec) if (_raw_sec is not None and pd.notna(_raw_sec)) else None
+        _dv = sel_row['date']
+        if hasattr(_dv, 'date'):   # pandas Timestamp → plain date
+            _dv = _dv.date()
+        def _f(col):
+            v = sel_row.get(col)
+            return float(v) if (v is not None and pd.notna(v)) else 0.0
+
+        st.session_state[f"inv_edit_date_{acc_id}"]       = _dv
+        st.session_state[f"inv_edit_action_{acc_id}"]     = _act
+        st.session_state[f"inv_edit_sec_{acc_id}"]        = _sec_id
+        st.session_state[f"inv_edit_qty_{acc_id}"]        = _f('quantity')
+        st.session_state[f"inv_edit_price_{acc_id}"]      = _f('price_per_share')
+        st.session_state[f"inv_edit_comm_{acc_id}"]       = _f('commission')
+        st.session_state[f"inv_edit_total_{acc_id}"]      = _f('total_amount')
+        st.session_state[f"inv_edit_memo_{acc_id}"]       = sel_row.get('description') or ""
+        st.session_state[f"inv_edit_instr_{acc_id}"]      = sel_row.get('instrument_type') or ""
+        st.session_state[f"inv_edit_linked_chk_{acc_id}"] = (
+            existing_linked_tx is not None or acc_linked_default is not None)
+        _def_linked = (existing_linked_acc_id if existing_linked_acc_id in cash_acc_ids
+                       else (acc_linked_default if acc_linked_default in cash_acc_ids else None))
+        if _def_linked is not None:
+            st.session_state[f"inv_edit_linked_acc_{acc_id}"] = _def_linked
+        st.session_state.pop(f"inv_edit_linked_target_{acc_id}", None)
+        st.session_state[_last_sel_key] = sel_inv_id
+
+    # ── Linked-account selectbox (outside form for FX pre-calc) ───────────────
+    enable_linked = st.checkbox(
+        "Maintain linked cash account transfer (BuyX / SellX / DivX)",
+        value=(existing_linked_tx is not None or acc_linked_default is not None),
+        key=f"inv_edit_linked_chk_{acc_id}",
+    )
+    linked_acc_id: int | None = None
+    linked_acc_curr: int | None = None
+    fx_rate = 1.0
+
+    if enable_linked:
+        if not cash_acc_ids:
+            st.warning("No eligible cash/bank accounts found.")
+            enable_linked = False
+        else:
+            _default_linked = (
+                existing_linked_acc_id
+                if existing_linked_acc_id in cash_acc_ids
+                else (acc_linked_default if acc_linked_default in cash_acc_ids else None)
+            )
+            _def_idx = cash_acc_ids.index(_default_linked) if _default_linked in cash_acc_ids else 0
+            linked_acc_id = st.selectbox(
+                "Linked Cash Account",
+                options=cash_acc_ids,
+                format_func=lambda x: cash_acc_options.get(x, "Unknown"),
+                index=_def_idx,
+                key=f"inv_edit_linked_acc_{acc_id}",
+            )
+            _linked_row = df_accs[df_accs['accounts_id'] == linked_acc_id]
+            if not _linked_row.empty:
+                linked_acc_curr = int(_linked_row.iloc[0]['currencies_id'])
+            if linked_acc_curr and linked_acc_curr != acc_currencies_id:
+                with get_db_fn() as _conn_fx:
+                    fx_rate = get_latest_fx_rate(_conn_fx.cursor(),
+                                                  acc_currencies_id, linked_acc_curr)
+
+    if existing_linked_tx:
+        if enable_linked:
+            st.caption(
+                f"ℹ️ Linked to transaction #{existing_linked_tx['transactions_id']} "
+                f"(amount: {float(existing_linked_tx['total_amount']):,.4f}, "
+                f"date: {existing_linked_tx['date']}). Will be updated on save."
+            )
+        else:
+            st.warning(
+                f"⚠️ Currently linked to transaction #{existing_linked_tx['transactions_id']}. "
+                f"Saving with link **disabled** will **delete** that transaction."
+            )
+
+    # ── Edit fields ───────────────────────────────────────────────────────────
+    st.divider()
+
+    # Include the existing security even if it doesn't match the account currency filter
+    df_sec_filtered = df_securities[df_securities['currencies_id'] == acc_currencies_id].copy()
+    existing_sec_id: int | None = None
+    _raw_sec = sel_row.get('securities_id')
+    if _raw_sec is not None and not pd.isna(_raw_sec):
+        existing_sec_id = int(_raw_sec)
+    sec_options = {int(r['securities_id']): r['securities_name']
+                   for _, r in df_sec_filtered.iterrows()}
+    if existing_sec_id and existing_sec_id not in sec_options:
+        _extra = df_securities[df_securities['securities_id'] == existing_sec_id]
+        if not _extra.empty:
+            sec_options[existing_sec_id] = _extra.iloc[0]['securities_name']
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        inv_date = st.date_input(
+            "Date",
+            value=sel_row['date'],
+            key=f"inv_edit_date_{acc_id}",
+        )
+
+        _existing_action = str(sel_row['action']) if sel_row['action'] else ALL_ACTIONS[0]
+        _action_idx = ALL_ACTIONS.index(_existing_action) if _existing_action in ALL_ACTIONS else 0
+        inv_action = st.selectbox(
+            "Action", ALL_ACTIONS,
+            index=_action_idx,
+            key=f"inv_edit_action_{acc_id}",
+        )
+
+        _sec_ids = [None] + list(sec_options.keys())
+        _sec_def_idx = _sec_ids.index(existing_sec_id) if existing_sec_id in _sec_ids else 0
+        inv_security = st.selectbox(
+            "Security",
+            options=_sec_ids,
+            format_func=lambda x: sec_options.get(x, "— none —"),
+            index=_sec_def_idx,
+            key=f"inv_edit_sec_{acc_id}",
+        )
+
+        _existing_instr = sel_row.get('instrument_type') or ""
+        _instr_idx = _INSTRUMENT_TYPES.index(_existing_instr) if _existing_instr in _INSTRUMENT_TYPES else 0
+        inv_instrument_type = st.selectbox(
+            "Instrument Type (optional)",
+            options=_INSTRUMENT_TYPES,
+            index=_instr_idx,
+            key=f"inv_edit_instr_{acc_id}",
+        )
+
+    with col2:
+        inv_qty = st.number_input(
+            "Quantity", min_value=0.0,
+            value=float(sel_row['quantity']) if sel_row.get('quantity') is not None else 0.0,
+            step=0.0001, format="%.8f",
+            key=f"inv_edit_qty_{acc_id}",
+        )
+        inv_price = st.number_input(
+            "Price Per Share", min_value=0.0,
+            value=float(sel_row['price_per_share']) if sel_row.get('price_per_share') is not None else 0.0,
+            step=0.0001, format="%.4f",
+            key=f"inv_edit_price_{acc_id}",
+        )
+        inv_comm = st.number_input(
+            "Commission", min_value=0.0,
+            value=float(sel_row['commission']) if sel_row.get('commission') is not None else 0.0,
+            step=0.01, format="%.4f",
+            key=f"inv_edit_comm_{acc_id}",
+        )
+        inv_total_override = st.number_input(
+            "Total Amount (0 to auto-calculate)",
+            value=float(sel_row['total_amount']) if sel_row.get('total_amount') is not None else 0.0,
+            step=0.01, format="%.4f",
+            key=f"inv_edit_total_{acc_id}",
+            help="Buy = qty×price + commission | Sell = qty×price − commission | others = qty×price",
+        )
+        inv_memo = st.text_input(
+            "Memo / Description",
+            value=sel_row.get('description') or "",
+            key=f"inv_edit_memo_{acc_id}",
+        )
+
+    # ── Cross-currency target amount ───────────────────────────────────────────
+    linked_target_amount = None
+    if enable_linked and linked_acc_id and linked_acc_curr and linked_acc_curr != acc_currencies_id:
+        st.divider()
+        st.caption(
+            f"Linked account is in a different currency. "
+            f"Target amount pre-calculated using FX rate **{fx_rate:.6f}** (editable)."
+        )
+        linked_target_amount = st.number_input(
+            "Target Amount in Linked Account Currency",
+            value=0.0, step=0.01, format="%.4f",
+            key=f"inv_edit_linked_target_{acc_id}",
+        )
+    elif enable_linked and linked_acc_id:
+        st.caption("Linked account uses the same currency — no conversion needed.")
+
+    if enable_linked and linked_acc_id and inv_action not in LINKED_CAPABLE:
+        st.warning(f"**{inv_action}** does not support a linked cash transfer.")
+
+    # ── Save ──────────────────────────────────────────────────────────────────
+    if st.button("💾 Update Investment Transaction", key=f"inv_edit_submit_{acc_id}"):
+        errors = []
+        if inv_action not in NO_SECURITY_ACTIONS and not inv_security:
+            errors.append("Please select a Security (required for this action).")
+        if inv_action in QTY_REQUIRED_ACTIONS and inv_qty <= 0:
+            errors.append(f"Quantity must be > 0 for action '{inv_action}'.")
+        if enable_linked and not linked_acc_id:
+            errors.append("Please select a linked cash account.")
+
+        if errors:
+            for e in errors:
+                st.error(e)
+        else:
+            # Auto-calculate total
+            if inv_total_override != 0:
+                calc_total = inv_total_override
+            elif inv_qty > 0 and inv_price > 0:
+                if inv_action == 'Buy':
+                    calc_total = inv_qty * inv_price + inv_comm
+                elif inv_action == 'Sell':
+                    calc_total = inv_qty * inv_price - inv_comm
+                else:
+                    calc_total = inv_qty * inv_price
+            else:
+                calc_total = inv_total_override
+
+            try:
+                with get_db_fn() as conn:
+                    cur = conn.cursor()
+
+                    # 1. UPDATE Investments row
+                    cur.execute(
+                        """UPDATE Investments SET
+                               Securities_Id   = %s,
+                               Date            = %s,
+                               Action          = %s::investments_action,
+                               Quantity        = %s,
+                               Price_Per_Share = %s,
+                               Commission      = %s,
+                               Total_Amount    = %s,
+                               Description     = %s,
+                               Instrument_Type = %s
+                           WHERE Investments_Id = %s""",
+                        (
+                            inv_security,
+                            inv_date,
+                            inv_action,
+                            inv_qty   if inv_qty   > 0 else None,
+                            inv_price if inv_price > 0 else None,
+                            inv_comm  if inv_comm  > 0 else None,
+                            calc_total if calc_total != 0 else None,
+                            inv_memo or None,
+                            inv_instrument_type or None,
+                            sel_inv_id,
+                        ),
+                    )
+
+                    # 2. Handle linked cash transaction
+                    wants_link = enable_linked and linked_acc_id and inv_action in LINKED_CAPABLE
+                    has_link   = existing_linked_tx is not None
+
+                    if has_link and not wants_link:
+                        # Remove link: delete cash transaction, clear FK
+                        cur.execute("DELETE FROM Transactions WHERE Transactions_Id = %s",
+                                    (existing_linked_tx['transactions_id'],))
+                        cur.execute("UPDATE Investments SET Transactions_Id = NULL "
+                                    "WHERE Investments_Id = %s", (sel_inv_id,))
+
+                    elif wants_link:
+                        # Build cash-side amounts
+                        cash_tx_amount = (-abs(calc_total) if inv_action in CASH_OUT_ACTIONS
+                                         else abs(calc_total))
+                        sec_name = sec_options.get(inv_security) if inv_security else None
+                        payee_id = get_or_create_payee_id(cur, sec_name) if sec_name else None
+                        cash_description = sec_name or inv_memo or inv_action
+
+                        if linked_acc_curr and linked_acc_curr != acc_currencies_id:
+                            if linked_target_amount and linked_target_amount != 0:
+                                target_amt = abs(linked_target_amount)
+                            else:
+                                actual_fx = get_latest_fx_rate(
+                                    cur, acc_currencies_id, linked_acc_curr, inv_date)
+                                target_amt = abs(calc_total) * actual_fx
+                            cash_tx_amount_linked = (-abs(target_amt) if inv_action in CASH_OUT_ACTIONS
+                                                     else abs(target_amt))
+                        else:
+                            cash_tx_amount_linked = cash_tx_amount
+                            target_amt = None
+
+                        _linked_acc_id_int = int(linked_acc_id)
+                        if has_link and _linked_acc_id_int == existing_linked_acc_id:
+                            # Same cash account → UPDATE existing transaction
+                            cur.execute(
+                                """UPDATE Transactions SET
+                                       Date               = %s,
+                                       Payees_Id          = %s,
+                                       Description        = %s,
+                                       Total_Amount       = %s,
+                                       Accounts_Id_Target = %s,
+                                       Total_Amount_Target = %s
+                                   WHERE Transactions_Id = %s""",
+                                (
+                                    inv_date, payee_id, cash_description,
+                                    cash_tx_amount_linked,
+                                    acc_id, abs(calc_total),
+                                    existing_linked_tx['transactions_id'],
+                                ),
+                            )
+                        else:
+                            # Different / new cash account → delete old (if any), create new
+                            if has_link:
+                                cur.execute("DELETE FROM Transactions WHERE Transactions_Id = %s",
+                                            (existing_linked_tx['transactions_id'],))
+                            cur.execute(
+                                """INSERT INTO Transactions
+                                       (Accounts_Id, Date, Payees_Id, Description,
+                                        Total_Amount, Cleared,
+                                        Accounts_Id_Target, Total_Amount_Target, Transfers_Id)
+                                   VALUES (%s, %s, %s, %s, %s, TRUE, %s, %s, NULL)
+                                   RETURNING Transactions_Id""",
+                                (
+                                    _linked_acc_id_int, inv_date, payee_id, cash_description,
+                                    cash_tx_amount_linked,
+                                    acc_id, abs(calc_total),
+                                ),
+                            )
+                            _new_tx_id = cur.fetchone()[0]
+                            cur.execute(
+                                "UPDATE Investments SET Transactions_Id = %s "
+                                "WHERE Investments_Id = %s",
+                                (_new_tx_id, sel_inv_id),
+                            )
+
+                st.success("✅ Investment transaction updated!")
+                update_holdings_fn()
+                if acc_type in ('Brokerage', 'Margin', 'Other Investment'):
+                    update_investment_balances_fn()
+                else:
+                    update_pension_balances()
+
+                if wants_link or (has_link and not wants_link):
+                    update_accounts_balances()
+
+                # Clear register caches
+                _inv_prefix = f"inv_reg_{acc_id}_"
+                for _k in [k for k in st.session_state if k.startswith(_inv_prefix) and k.endswith("_orig")]:
+                    st.session_state.pop(_k, None)
+                if enable_linked and linked_acc_id:
+                    _cash_prefix = f"set_reg_{linked_acc_id}_"
+                    for _k in [k for k in st.session_state if k.startswith(_cash_prefix) and k.endswith("_orig")]:
+                        st.session_state.pop(_k, None)
+                st.session_state.pop("df_accs", None)
+                st.cache_data.clear()
+
+                # Reset picker so the form shows freshly after save
+                st.session_state.pop(_last_sel_key, None)
+                st.session_state.pop(f"inv_edit_sel_{acc_id}", None)
+                st.rerun()
+
+            except Exception as exc:
+                st.error(f"Error updating investment transaction: {exc}")
+
+
 def _render_security_transactions(acc_id: int, sec_options: dict, key_suffix: str):
     """Render a security selector and, once chosen, all investment transactions
     for that security within the current account.
@@ -1069,22 +1533,25 @@ def _render_security_transactions(acc_id: int, sec_options: dict, key_suffix: st
         return
 
     # ── Summary metrics ──────────────────────────────────────────────────────
-    buy_mask  = df_inv['action'].isin(['Buy', 'ShrIn', 'Reinvest', 'Vest'])
-    sell_mask = df_inv['action'].isin(['Sell', 'ShrOut', 'Expire'])
-    misc_mask = df_inv['action'] == 'MiscExp'
+    buy_mask      = df_inv['action'].isin(['Buy', 'ShrIn', 'Reinvest', 'Vest'])
+    sell_mask     = df_inv['action'].isin(['Sell', 'ShrOut', 'Expire'])
+    misc_exp_mask = df_inv['action'] == 'MiscExp'
+    misc_inc_mask = df_inv['action'] == 'MiscInc'
 
-    net_qty   = df_inv.loc[buy_mask, 'quantity'].sum() - df_inv.loc[sell_mask, 'quantity'].sum()
-    buy_amt   = df_inv.loc[buy_mask,  'total_amount'].sum()
-    sell_amt  = df_inv.loc[sell_mask, 'total_amount'].sum()
-    misc_amt  = df_inv.loc[misc_mask, 'total_amount'].sum()
-    net_pnl   = sell_amt - buy_amt - misc_amt
+    net_qty      = df_inv.loc[buy_mask,      'quantity'].sum() - df_inv.loc[sell_mask, 'quantity'].sum()
+    buy_amt      = df_inv.loc[buy_mask,      'total_amount'].sum()
+    sell_amt     = df_inv.loc[sell_mask,     'total_amount'].sum()
+    misc_exp_amt = df_inv.loc[misc_exp_mask, 'total_amount'].sum()
+    misc_inc_amt = df_inv.loc[misc_inc_mask, 'total_amount'].sum()
+    net_pnl      = sell_amt + misc_inc_amt - buy_amt - misc_exp_amt
 
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Net Qty",       f"{net_qty:,.6f}")
     c2.metric("Buy Amount",    f"{buy_amt:,.2f}")
     c3.metric("Sell Amount",   f"{sell_amt:,.2f}")
-    c4.metric("Costs",         f"{misc_amt:,.2f}")
-    c5.metric("Net P&L",       f"{net_pnl:,.2f}", delta_color="normal")
+    c4.metric("Misc Exp",      f"{misc_exp_amt:,.2f}")
+    c5.metric("Misc Inc",      f"{misc_inc_amt:,.2f}")
+    c6.metric("Net P&L",       f"{net_pnl:,.2f}", delta_color="normal")
 
     # ── Transaction table ────────────────────────────────────────────────────
     def _colour_action(val):
@@ -1094,6 +1561,7 @@ def _render_security_transactions(acc_id: int, sec_options: dict, key_suffix: st
             'Sell': 'color:#e74c3c', 'ShrOut': 'color:#e74c3c', 'Expire': 'color:#e74c3c',
             'Dividend': 'color:#3498db', 'RtrnCap': 'color:#3498db',
             'MiscExp': 'color:#e67e22',
+            'MiscInc': 'color:#9b59b6',
         }
         return colours.get(val, '')
 
@@ -1799,9 +2267,10 @@ def render_register():
         with t_view:
             _render_transaction_table(acc_id, payee_options, acc_options, cat_options, "bank", acc_balance)
     else:
-        tab_inv_new, tab_inv_view, tab_view_hold, tab_edit_hold, cash_view = st.tabs([
-            "➕ New Investment Transaction", "📓 Investment Register",
-            "📊 Current Holdings", "✏️ Edit Holdings", "👁️ Cash Transaction Register",
+        tab_inv_new, tab_inv_edit, tab_inv_view, tab_view_hold, tab_edit_hold, cash_view = st.tabs([
+            "➕ New Investment Transaction", "✏️ Edit Investment",
+            "📓 Investment Register", "📊 Current Holdings",
+            "✏️ Edit Holdings", "👁️ Cash Transaction Register",
         ])
         with cash_view:
             _render_transaction_table(acc_id, payee_options, acc_options, cat_options, "cash", acc_balance)
@@ -1809,6 +2278,13 @@ def render_register():
         # ── New investment transaction form ────────────────────────────────────
         with tab_inv_new:
             _render_new_investment_form(
+                acc_id, acc_type, df_accs, df_securities, get_db,
+                update_holdings, update_investment_balances
+            )
+
+        # ── Edit investment transaction form ───────────────────────────────────
+        with tab_inv_edit:
+            _render_edit_investment_form(
                 acc_id, acc_type, df_accs, df_securities, get_db,
                 update_holdings, update_investment_balances
             )
@@ -1886,21 +2362,28 @@ def render_register():
                     "securities_id": st.column_config.SelectboxColumn(
                         "Security",
                         options=list(_full_sec_options.keys()),
-                        format_func=lambda x: _full_sec_options.get(x, "Unknown"),
+                        format_func=lambda x: (
+                            "" if (x is None or (hasattr(x, "__float__") and __import__("math").isnan(float(x))))
+                            else _full_sec_options.get(x, str(x))
+                        ),
                         width="large"
                     ),
                     "action": st.column_config.SelectboxColumn(
                         "Action",
-                        options=['Buy', 'Sell', 'Dividend', 'Reinvest', 'Split', 'ShrIn', 'ShrOut', 'IntInc', 'CashIn', 'CashOut', 'Vest', 'Expire', 'Grant', 'Exercise', 'MiscExp', 'RtrnCap'],
+                        options=['Buy', 'Sell', 'Dividend', 'Reinvest', 'Split',
+                                 'ShrIn', 'ShrOut', 'IntInc', 'CashIn', 'CashOut',
+                                 'Vest', 'Expire', 'Grant', 'Exercise',
+                                 'MiscExp', 'MiscInc', 'RtrnCap'],
                         required=True
                     ),
                     "instrument_type": st.column_config.SelectboxColumn(
                         "Instrument Type",
                         options=["", "Stock", "ETF", "Bond", "CFD", "CEF", "CFDOnETF", "CFDOnStock",
-                                 "CFDOnIndex", "CFDOnFutures", "CFDOnFund", "Fund", "Option", "Other"],
+                                 "CFDOnIndex", "CFDOnFutures", "CFDOnFund", "Fund", "Option",
+                                 "FX Spot", "Other"],
                         width="small",
-                        help="Specific traded instrument (e.g. CFDOnETF for Saxo CFD trades). "
-                             "Leave blank for standard transactions.",
+                        help="Specific traded instrument (e.g. CFDOnETF for Saxo CFD trades, "
+                             "FX Spot for currency pairs). Leave blank for standard transactions.",
                     ),
                     "quantity": st.column_config.NumberColumn(
                         "Quantity",

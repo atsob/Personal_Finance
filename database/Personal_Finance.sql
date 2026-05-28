@@ -39,7 +39,13 @@ CREATE TYPE Categories_Type AS ENUM (
 CREATE TYPE Investments_Action AS ENUM (
     'Buy', 'Sell', 'Dividend', 'Reinvest', 'Split',
     'ShrIn', 'ShrOut', 'IntInc', 'CashIn', 'CashOut',
-    'Grant', 'Vest', 'Exercise', 'Expire', 'MiscExp', 'RtrnCap'
+    'Grant', 'Vest', 'Exercise', 'Expire', 'MiscExp', 'MiscInc', 'RtrnCap'
+);
+
+-- Migration 001: CREATE TYPE then ALTER TABLE (see database/migrations/001_instrument_type_enum.sql)
+CREATE TYPE Investments_Instrument_Type AS ENUM (
+    'Stock', 'ETF', 'Bond', 'CFD', 'CEF', 'CFDOnETF', 'CFDOnStock',
+    'CFDOnIndex', 'CFDOnFutures', 'CFDOnFund', 'Fund', 'Option', 'FX Spot', 'Other'
 );
 
 CREATE SEQUENCE IF NOT EXISTS transfers_id_seq START 1 INCREMENT 1;
@@ -326,8 +332,8 @@ CREATE TABLE Investments (
     Total_Amount     NUMERIC(28, 18),
     Description      TEXT,
     Transactions_Id  INTEGER REFERENCES Transactions(Transactions_Id),  -- linked cash-side row (BuyX/SellX/DivX)
-    Instrument_Type  VARCHAR(50),   -- optional: actual traded instrument (e.g. CFDOnETF, CFDOnStock)
-                                    -- overrides Security.Is_Tax_Exempt for tax calculations when set
+    Instrument_Type  Investments_Instrument_Type,  -- optional: actual traded instrument (e.g. CFDOnETF, CFDOnStock)
+                                                  -- overrides Security.Is_Tax_Exempt for tax calculations when set
     embedding        vector(768)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_investments_id          ON Investments(Investments_Id);

@@ -456,11 +456,11 @@ def update_investment_balances():
         cur.execute("""
             UPDATE Accounts a
             SET Accounts_Balance = COALESCE((
-                SELECT  
-                    SUM(CASE WHEN Action IN ('Dividend', 'CashIn', 'IntInc', 'Sell') THEN Total_Amount 
-                             WHEN Action IN ('CashOut', 'Buy') THEN -Total_Amount 
+                SELECT
+                    SUM(CASE WHEN Action IN ('Dividend', 'CashIn', 'IntInc', 'MiscInc', 'Sell') THEN Total_Amount
+                             WHEN Action IN ('CashOut', 'MiscExp', 'Buy') THEN -Total_Amount
                              ELSE 0 END)
-                FROM Investments t 
+                FROM Investments t
                 WHERE t.Accounts_Id = a.Accounts_Id
             ), 0) +  COALESCE((
                     SELECT SUM(Total_Amount) 
