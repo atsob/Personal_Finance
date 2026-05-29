@@ -398,6 +398,13 @@ def build_trading_records(df: pd.DataFrame) -> "tuple[list, list]":
         else:
             base_type = raw_type
 
+        # FX convention: Revolut's fx_rate = sec_currency / acc_currency (e.g. USD/EUR).
+        # Our DB convention: FX_Rate = acc_currency / sec_currency (e.g. EUR/USD).
+        # total_sec_cur = abs(total) is the raw amount in the security's currency.
+        _rev_fx_db    = round(1.0 / fx_rate, 8) if fx_rate else 1.0
+        _total_sec    = round(abs(total), 8)
+        _total_acc    = round(abs(total) / fx_rate, 2) if fx_rate else round(abs(total), 2)
+
         if base_type == "BUY":
             inv_records.append({
                 "record_type":    "investment",
@@ -413,7 +420,9 @@ def build_trading_records(df: pd.DataFrame) -> "tuple[list, list]":
                 "quantity":       round(abs(qty), 6),
                 "price":          round(abs(price), 6),
                 "commission":     0.0,
-                "total_eur":      round(abs(total) / fx_rate, 2),
+                "total_eur":      _total_acc,
+                "total_sec_cur":  _total_sec,
+                "fx_rate_db":     _rev_fx_db,
             })
 
         elif base_type == "SELL":
@@ -431,7 +440,9 @@ def build_trading_records(df: pd.DataFrame) -> "tuple[list, list]":
                 "quantity":       round(abs(qty), 6),
                 "price":          round(abs(price), 6),
                 "commission":     0.0,
-                "total_eur":      round(abs(total) / fx_rate, 2),
+                "total_eur":      _total_acc,
+                "total_sec_cur":  _total_sec,
+                "fx_rate_db":     _rev_fx_db,
             })
 
         elif base_type == "DIVIDEND":
@@ -447,9 +458,11 @@ def build_trading_records(df: pd.DataFrame) -> "tuple[list, list]":
                 "date":           dt,
                 "action":         "Dividend",
                 "quantity":       1.0,
-                "price":          round(abs(total) / fx_rate, 4),
+                "price":          round(_total_acc, 4),
                 "commission":     0.0,
-                "total_eur":      round(abs(total) / fx_rate, 2),
+                "total_eur":      _total_acc,
+                "total_sec_cur":  _total_sec,
+                "fx_rate_db":     _rev_fx_db,
             })
 
         elif base_type in ("CUSTODY FEE", "CUSTODYFEE"):
@@ -525,7 +538,7 @@ def run_trading_import(
 ) -> dict:
     """Insert parsed Revolut Trading records into the database."""
     from database.connection import get_connection as _get_conn
-    from database.crud import update_holdings, update_accounts_balances
+    from database.crud import update_holdings, update_accounts_balances, update_investment_balances
 
     conn = _get_conn()
     cur  = conn.cursor()
@@ -558,13 +571,20 @@ def run_trading_import(
             if not replace_mode and _inv_exists(cur, account_id, desc):
                 counts["investments_skip"] += 1
             else:
+                # total_sec_cur and fx_rate_db are set by build_trading_records
+                _rt_sec = rec.get("total_sec_cur", rec["total_eur"])
+                _rt_fx  = rec.get("fx_rate_db", 1.0)
                 cur.execute(
                     """INSERT INTO Investments
                            (Accounts_Id, Securities_Id, Date, Action, Quantity,
-                            Price_Per_Share, Total_Amount, Description)
-                       VALUES (%s, %s, %s, %s::investments_action, %s, %s, %s, %s)""",
+                            Price_Per_Share,
+                            Total_Amount_AccCur, Total_Amount_SecCur, FX_Rate,
+                            Description)
+                       VALUES (%s, %s, %s, %s::investments_action, %s, %s, %s, %s, %s, %s)""",
                     (account_id, sec_id, rec["date"], rec["action"],
-                     rec["quantity"], rec["price"], rec["total_eur"], desc),
+                     rec["quantity"], rec["price"],
+                     rec["total_eur"], _rt_sec, _rt_fx,
+                     desc),
                 )
                 counts["investments"] += 1
             done += 1
@@ -590,12 +610,22 @@ def run_trading_import(
         conn.commit()
         update_holdings()
         update_accounts_balances()
+        update_investment_balances()
 
     except Exception:
         conn.rollback()
         raise
     finally:
         cur.close()
+
+    # Auto-create linked cash transactions when the investment account has a
+    # configured linked cash account.
+    from database.crud import create_linked_cash_transactions_for_unlinked, get_linked_account_id
+    _rt_linked = get_linked_account_id(account_id)
+    if _rt_linked:
+        create_linked_cash_transactions_for_unlinked(account_id, _rt_linked)
+        update_accounts_balances(_rt_linked)
+        update_investment_balances()
 
     return counts
 
@@ -877,7 +907,7 @@ def run_import(
 ) -> dict:
     """Insert parsed Revolut records into the database."""
     from database.connection import get_connection
-    from database.crud import update_holdings, update_accounts_balances
+    from database.crud import update_holdings, update_accounts_balances, update_investment_balances
 
     conn = get_connection()
     cur  = conn.cursor()
@@ -908,13 +938,22 @@ def run_import(
             if not replace_mode and _inv_exists(cur, account_id, rec["desc"]):
                 counts["investments_skip"] += 1
             else:
+                # Revolut supplies the native-currency amount and FX rate at
+                # parse time; they are embedded in the record as total_sec_cur
+                # and fx_rate_db (our acc/sec convention).
+                _rev_sec  = rec.get("total_sec_cur", rec["total_eur"])
+                _rev_fx   = rec.get("fx_rate_db", 1.0)
                 cur.execute(
                     """INSERT INTO Investments
                            (Accounts_Id, Securities_Id, Date, Action, Quantity,
-                            Price_Per_Share, Total_Amount, Description)
-                       VALUES (%s, %s, %s, %s::investments_action, %s, %s, %s, %s)""",
+                            Price_Per_Share,
+                            Total_Amount_AccCur, Total_Amount_SecCur, FX_Rate,
+                            Description)
+                       VALUES (%s, %s, %s, %s::investments_action, %s, %s, %s, %s, %s, %s)""",
                     (account_id, sec_id, rec["date"], rec["action"],
-                     rec["quantity"], rec["price"], rec["total_eur"], rec["desc"]),
+                     rec["quantity"], rec["price"],
+                     rec["total_eur"], _rev_sec, _rev_fx,
+                     rec["desc"]),
                 )
                 counts["investments"] += 1
             done += 1
@@ -939,12 +978,22 @@ def run_import(
         conn.commit()
         update_holdings()
         update_accounts_balances()
+        update_investment_balances()
 
     except Exception:
         conn.rollback()
         raise
     finally:
         cur.close()
+
+    # Auto-create linked cash transactions when the investment account has a
+    # configured linked cash account.
+    from database.crud import create_linked_cash_transactions_for_unlinked, get_linked_account_id
+    _rev_linked = get_linked_account_id(account_id)
+    if _rev_linked:
+        create_linked_cash_transactions_for_unlinked(account_id, _rev_linked)
+        update_accounts_balances(_rev_linked)
+        update_investment_balances()
 
     return counts
 
@@ -1296,7 +1345,7 @@ def run_savings_import(
 ) -> dict:
     """Insert parsed Revolut Savings records into the database."""
     from database.connection import get_connection as _get_conn
-    from database.crud import update_holdings, update_accounts_balances
+    from database.crud import update_holdings, update_accounts_balances, update_investment_balances
 
     conn = _get_conn()
     cur  = conn.cursor()
@@ -1330,13 +1379,18 @@ def run_savings_import(
             if not replace_mode and _inv_exists(cur, account_id, desc):
                 counts["investments_skip"] += 1
             else:
+                # Revolut Savings is a EUR money-market fund; FX_Rate = 1.0
                 cur.execute(
                     """INSERT INTO Investments
                            (Accounts_Id, Securities_Id, Date, Action, Quantity,
-                            Price_Per_Share, Total_Amount, Description)
-                       VALUES (%s, %s, %s, %s::investments_action, %s, %s, %s, %s)""",
+                            Price_Per_Share,
+                            Total_Amount_AccCur, Total_Amount_SecCur, FX_Rate,
+                            Description)
+                       VALUES (%s, %s, %s, %s::investments_action, %s, %s, %s, %s, %s, %s)""",
                     (account_id, sec_id, rec["date"], rec["action"],
-                     rec["quantity"], rec["price"], rec["total_eur"], desc),
+                     rec["quantity"], rec["price"],
+                     rec["total_eur"], rec["total_eur"], 1.0,
+                     desc),
                 )
                 counts["investments"] += 1
             done += 1
@@ -1362,11 +1416,21 @@ def run_savings_import(
         conn.commit()
         update_holdings()
         update_accounts_balances()
+        update_investment_balances()
 
     except Exception:
         conn.rollback()
         raise
     finally:
         cur.close()
+
+    # Auto-create linked cash transactions when the investment account has a
+    # configured linked cash account.
+    from database.crud import create_linked_cash_transactions_for_unlinked, get_linked_account_id
+    _rsav_linked = get_linked_account_id(account_id)
+    if _rsav_linked:
+        create_linked_cash_transactions_for_unlinked(account_id, _rsav_linked)
+        update_accounts_balances(_rsav_linked)
+        update_investment_balances()
 
     return counts

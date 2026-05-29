@@ -646,7 +646,7 @@ def render_market_data():
                             COALESCE(i.quantity, 0)                AS "Quantity",
                             COALESCE(i.price_per_share, 0)         AS "Price/Share",
                             COALESCE(i.commission, 0)              AS "Commission",
-                            COALESCE(i.total_amount, 0)            AS "Total Amount",
+                            COALESCE(i.total_amount_acccur, 0)     AS "Total Amount",
                             i.description                          AS "Description"
                         FROM Investments i
                         JOIN Accounts a ON a.accounts_id = i.accounts_id
@@ -671,9 +671,9 @@ def render_market_data():
                                 ELSE 0 END)                                           AS "Qty Held",
                             SUM(CASE
                                 WHEN i.action IN ('Buy','ShrIn','Reinvest','Vest','Grant','Exercise')
-                                     THEN  COALESCE(i.total_amount, 0)
+                                     THEN  COALESCE(i.total_amount_acccur, 0)
                                 WHEN i.action IN ('Sell','ShrOut','Expire')
-                                     THEN -COALESCE(i.total_amount, 0)
+                                     THEN -COALESCE(i.total_amount_acccur, 0)
                                 ELSE 0 END)                                           AS "Cost Basis"
                         FROM Investments i
                         JOIN Accounts a ON a.accounts_id = i.accounts_id

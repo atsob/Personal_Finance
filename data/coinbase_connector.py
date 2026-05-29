@@ -81,8 +81,10 @@ _FIAT_CODES = {
     "EUR", "USD", "GBP", "CHF", "CAD", "AUD", "JPY", "SGD",
     "HKD", "NOK", "SEK", "DKK", "NZD", "MXN", "BRL", "CZK",
     "PLN", "HUF", "RON", "BGN", "HRK", "TRY",
-    # EUR-pegged stablecoins (treated as cash, not investment securities)
-    "EURC",   # Euro Coin (Circle) — 1 EURC = 1 EUR
+    # EUR-pegged stablecoins.
+    # EURC is intentionally NOT listed here so it can be held as an investment
+    # security (some users track EURC positions in their portfolio).
+    # EURT / EURS remain treated as cash equivalents.
     "EURT",   # Euro Tether
     "EURS",   # STASIS EURO
     # USD-pegged stablecoins (treated as cash for portfolio purposes)
@@ -1093,7 +1095,7 @@ def run_coinbase_import(
     (saved mapping → ticker → name → create new) for crypto assets.
     """
     from database.connection import get_connection as _gc
-    from database.crud       import update_holdings, update_accounts_balances
+    from database.crud       import update_holdings, update_accounts_balances, update_investment_balances
     from data.revolut_importer import _get_or_create_security, _inv_exists, _tx_exists
 
     conn   = _gc()
@@ -1130,16 +1132,19 @@ def run_coinbase_import(
                 if not replace_mode and _inv_exists(cur, account_id, desc):
                     counts["investments_skip"] += 1
                 else:
+                    # CashIn/CashOut are already in EUR (account currency); FX = 1.0
                     cur.execute(
                         """INSERT INTO Investments
                                (Accounts_Id, Date, Action,
                                 Quantity, Price_Per_Share, Commission,
-                                Total_Amount, Description)
+                                Total_Amount_AccCur, Total_Amount_SecCur, FX_Rate,
+                                Description)
                            VALUES (%s, %s, %s::investments_action,
-                                   %s, %s, %s, %s, %s)""",
+                                   %s, %s, %s, %s, %s, %s, %s)""",
                         (account_id, rec["date"], rec["action"],
                          rec["quantity"], rec["price"], rec.get("commission", 0.0),
-                         rec["total_eur"], desc),
+                         rec["total_eur"], rec["total_eur"], 1.0,
+                         desc),
                     )
                     counts["investments"] += 1
             else:
@@ -1152,14 +1157,18 @@ def run_coinbase_import(
                 if not replace_mode and _inv_exists(cur, account_id, desc):
                     counts["investments_skip"] += 1
                 else:
+                    # Coinbase native_amount is already in EUR; FX = 1.0
                     cur.execute(
                         """INSERT INTO Investments
                                (Accounts_Id, Securities_Id, Date, Action, Quantity,
-                                Price_Per_Share, Commission, Total_Amount, Description)
-                           VALUES (%s, %s, %s, %s::investments_action, %s, %s, %s, %s, %s)""",
+                                Price_Per_Share, Commission,
+                                Total_Amount_AccCur, Total_Amount_SecCur, FX_Rate,
+                                Description)
+                           VALUES (%s, %s, %s, %s::investments_action, %s, %s, %s, %s, %s, %s, %s)""",
                         (account_id, sec_id, rec["date"], rec["action"],
                          rec["quantity"], rec["price"], rec.get("commission", 0.0),
-                         rec["total_eur"], desc),
+                         rec["total_eur"], rec["total_eur"], 1.0,
+                         desc),
                     )
                     counts["investments"] += 1
 
@@ -1186,11 +1195,21 @@ def run_coinbase_import(
         conn.commit()
         update_holdings()
         update_accounts_balances()
+        update_investment_balances()
 
     except Exception:
         conn.rollback()
         raise
     finally:
         cur.close()
+
+    # Auto-create linked cash transactions when the investment account has a
+    # configured linked cash account.
+    from database.crud import create_linked_cash_transactions_for_unlinked, get_linked_account_id
+    _cb_linked = get_linked_account_id(account_id)
+    if _cb_linked:
+        create_linked_cash_transactions_for_unlinked(account_id, _cb_linked)
+        update_accounts_balances(_cb_linked)
+        update_investment_balances()
 
     return counts

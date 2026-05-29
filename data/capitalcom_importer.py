@@ -8,7 +8,10 @@ import csv
 import pandas as pd
 import streamlit as st
 from database.connection import get_connection
-from database.crud import update_investment_balances, update_holdings, update_accounts_balances
+from database.crud import (
+    update_investment_balances, update_holdings, update_accounts_balances,
+    resolve_investment_fx,
+)
 
 # ── Instrument → Securities_Type classification ───────────────────────────────
 
@@ -427,6 +430,11 @@ def run_import(
         total = len(inv_records) + len(tx_records)
         done  = 0
 
+        # Look up the account's currency once
+        cur.execute("SELECT Currencies_Id FROM Accounts WHERE Accounts_Id = %s", (account_id,))
+        _acc_cur_row = cur.fetchone()
+        _acc_cur_id  = int(_acc_cur_row[0]) if _acc_cur_row else None
+
         # Load user-defined security mappings once to avoid a DB call per record
         from database.queries import get_security_mappings as _get_sec_map
         _cap_mappings = _get_sec_map("Capital.com")
@@ -440,13 +448,31 @@ def run_import(
             if not replace_mode and _investment_exists(cur, account_id, rec['desc']):
                 counts['investments_skip'] += 1
             else:
+                # Resolve security currency and FX (no explicit FX in Capital.com records)
+                cur.execute(
+                    "SELECT Currencies_Id FROM Securities WHERE Securities_Id = %s",
+                    (sec_id,),
+                )
+                _scr = cur.fetchone()
+                _sec_cur_id = int(_scr[0]) if _scr and _scr[0] else None
+                _cap_total  = rec['total_eur']
+                if _cap_total is not None and _cap_total != 0:
+                    _cap_sec, _cap_fx = resolve_investment_fx(
+                        cur, _cap_total, _acc_cur_id, _sec_cur_id, rec['date'],
+                    )
+                else:
+                    _cap_sec, _cap_fx = _cap_total, 1.0
                 cur.execute(
                     """INSERT INTO Investments
                            (Accounts_Id, Securities_Id, Date, Action, Quantity,
-                            Price_Per_Share, Total_Amount, Description)
-                       VALUES (%s, %s, %s, %s::investments_action, %s, %s, %s, %s)""",
+                            Price_Per_Share,
+                            Total_Amount_AccCur, Total_Amount_SecCur, FX_Rate,
+                            Description)
+                       VALUES (%s, %s, %s, %s::investments_action, %s, %s, %s, %s, %s, %s)""",
                     (account_id, sec_id, rec['date'], rec['action'],
-                     rec['quantity'], rec['price'], rec['total_eur'], rec['desc']),
+                     rec['quantity'], rec['price'],
+                     _cap_total, _cap_sec, _cap_fx,
+                     rec['desc']),
                 )
                 counts['investments'] += 1
             done += 1
@@ -482,6 +508,15 @@ def run_import(
     finally:
         cur.close()
         conn.close()
+
+    # Auto-create linked cash transactions when the investment account has a
+    # configured linked cash account.
+    from database.crud import create_linked_cash_transactions_for_unlinked, get_linked_account_id
+    _cap_linked = get_linked_account_id(account_id)
+    if _cap_linked:
+        create_linked_cash_transactions_for_unlinked(account_id, _cap_linked)
+        update_accounts_balances(_cap_linked)
+        update_investment_balances()
 
     return counts
 

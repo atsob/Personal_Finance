@@ -734,11 +734,22 @@ def _render_new_investment_form(acc_id, acc_type, df_accs, df_securities, get_db
     else:
         acc_linked_default = int(acc_linked_default)
 
-    # ── Securities filtered to account currency ───────────────────────────────
+    # ── All securities — show currency code alongside name ────────────────────
     INV_TYPES = {'Brokerage', 'Pension', 'Other Investment', 'Margin'}
-    df_sec_filtered = df_securities[df_securities['currencies_id'] == acc_currencies_id]
-    sec_options = {row['securities_id']: row['securities_name']
-                   for _, row in df_sec_filtered.iterrows()}
+    _cur_map = (df_securities.set_index('securities_id')['currencies_shortname'].to_dict()
+                if 'currencies_shortname' in df_securities.columns else {})
+    _acc_cur_name = _cur_map.get(acc_currencies_id, '')  # best-effort from sec table
+
+    sec_options = {
+        int(row['securities_id']): (
+            f"{row['securities_name']} ({row['currencies_shortname']})"
+            if row.get('currencies_shortname') else row['securities_name']
+        )
+        for _, row in df_securities.iterrows()
+    }
+    # Plain-name variant (used for payee creation and linked account descriptions)
+    sec_names_plain = {int(row['securities_id']): row['securities_name']
+                       for _, row in df_securities.iterrows()}
 
     # ── Cash/bank accounts eligible as transfer targets ───────────────────────
     cash_acc_options = {
@@ -809,7 +820,7 @@ def _render_new_investment_form(acc_id, acc_type, df_accs, df_securities, get_db
             options=sec_ids,
             format_func=lambda x: sec_options.get(x, "— none —"),
             key=f"inv_sec_{rc}",
-            help="Only securities in the account currency are shown.",
+            help="All securities shown. Currency code is displayed in brackets.",
         )
 
         _INSTRUMENT_TYPES = [
@@ -834,20 +845,125 @@ def _render_new_investment_form(acc_id, acc_type, df_accs, df_securities, get_db
             key=f"inv_qty_{rc}",
         )
         inv_price = st.number_input(
-            "Price Per Share", min_value=0.0, value=0.0, step=0.0001, format="%.4f",
+            "Price Per Share", min_value=0.0, value=0.0, step=0.0001, format="%.8f",
             key=f"inv_price_{rc}",
         )
         inv_comm = st.number_input(
-            "Commission", min_value=0.0, value=0.0, step=0.01, format="%.4f",
+            "Commission (0 = auto-derive)",
+            min_value=0.0, value=0.0, step=0.01, format="%.8f",
             key=f"inv_comm_{rc}",
-        )
-        inv_total_override = st.number_input(
-            "Total Amount (leave 0 to auto-calculate)",
-            value=0.0, step=0.01, format="%.4f",
-            key=f"inv_total_{rc}",
-            help="Buy = qty×price + commission | Sell = qty×price − commission | others = qty×price",
+            help=(
+                "Leave 0 to auto-derive from Qty × Price vs Total (Sec Currency): "
+                "Buy → Total(Sec) − Qty×Price; Sell → Qty×Price − Total(Sec)."
+            ),
         )
         inv_memo = st.text_input("Memo / Description", key=f"inv_memo_{rc}")
+
+    # ── Amounts (always shown: Total Sec · FX Rate · Total Acc) ───────────────
+    st.divider()
+    st.markdown("**Amounts**")
+
+    _sec_currencies_id_new = None
+    _sec_cur_name_new = ""
+    if inv_security:
+        _sr = df_securities[df_securities['securities_id'] == inv_security]
+        if not _sr.empty:
+            _sec_currencies_id_new = int(_sr.iloc[0]['currencies_id'])
+            _sec_cur_name_new = str(_sr.iloc[0].get('currencies_shortname', ''))
+    _is_xc_new = (_sec_currencies_id_new is not None and _sec_currencies_id_new != acc_currencies_id)
+
+    # Account currency display name
+    _acc_cur_name_new = ""
+    try:
+        with get_db_fn() as _cn_an:
+            _can = _cn_an.cursor()
+            _can.execute("SELECT Currencies_ShortName FROM Currencies WHERE Currencies_Id = %s",
+                         (acc_currencies_id,))
+            _rn = _can.fetchone()
+            if _rn:
+                _acc_cur_name_new = _rn[0]
+    except Exception:
+        pass
+
+    # FX rate default: Historical_FX for cross-currency, 1.0 for same currency
+    _def_fx_new = 1.0
+    if _is_xc_new and _sec_currencies_id_new:
+        try:
+            with get_db_fn() as _conn_xfx_n:
+                _def_fx_new = float(
+                    get_latest_fx_rate(_conn_xfx_n.cursor(), _sec_currencies_id_new,
+                                       acc_currencies_id, inv_date) or 1.0
+                )
+        except Exception:
+            _def_fx_new = 1.0
+
+    _sec_lbl_n = f"Total ({_sec_cur_name_new})" if _sec_cur_name_new else "Total (Sec Currency)"
+    _acc_lbl_n = f"Total ({_acc_cur_name_new})" if _acc_cur_name_new else "Total (Acc Currency)"
+
+    _na1, _na2, _na3 = st.columns(3)
+    with _na1:
+        inv_total_sec_cur = st.number_input(
+            _sec_lbl_n,
+            value=0.0, step=0.01, format="%.8f",
+            key=f"inv_total_sec_{rc}",
+            help="Total in the security's native currency. Leave 0 to auto-calculate from Qty × Price ± Commission.",
+        )
+    with _na2:
+        inv_fx_rate = st.number_input(
+            "FX Rate (1 Sec → Acc)",
+            value=_def_fx_new,
+            min_value=0.000001, step=0.000001, format="%.6f",
+            key=f"inv_fx_{rc}",
+            help=(
+                "1 unit of security currency = this many account-currency units. "
+                + ("Rate from Historical_FX for the transaction date."
+                   if _is_xc_new else
+                   "Same currency as account — defaults to 1.0.")
+            ),
+        )
+    with _na3:
+        inv_total_acc_cur = st.number_input(
+            _acc_lbl_n,
+            value=0.0, step=0.01, format="%.8f",
+            key=f"inv_total_acc_{rc}",
+            help="Total in the account's currency. Leave 0 to auto-calculate from Total(Sec) × FX Rate.",
+        )
+
+    # ── Live auto-calc hint ────────────────────────────────────────────────
+    _qxp_n = inv_qty * inv_price if inv_qty > 0 and inv_price > 0 else 0.0
+    _hint_parts_n: list[str] = []
+    _h_sec_n = inv_total_sec_cur
+    if inv_comm == 0 and inv_total_sec_cur > 0 and _qxp_n > 0:
+        if inv_action == 'Buy':
+            _h_comm_n = max(0.0, inv_total_sec_cur - _qxp_n)
+        elif inv_action == 'Sell':
+            _h_comm_n = max(0.0, _qxp_n - inv_total_sec_cur)
+        else:
+            _h_comm_n = 0.0
+        if _h_comm_n > 0:
+            _hint_parts_n.append(f"Commission → **{_h_comm_n:,.8f}**")
+    if inv_total_sec_cur == 0 and _qxp_n > 0:
+        _c_for_hint = inv_comm if inv_comm > 0 else 0.0
+        if inv_action == 'Buy':
+            _h_sec_n = _qxp_n + _c_for_hint
+        elif inv_action == 'Sell':
+            _h_sec_n = max(0.0, _qxp_n - _c_for_hint)
+        else:
+            _h_sec_n = _qxp_n
+        if _h_sec_n > 0:
+            _hint_parts_n.append(f"{_sec_lbl_n} → **{_h_sec_n:,.8f}**")
+    if inv_total_acc_cur == 0 and _h_sec_n > 0 and _is_xc_new:
+        _h_acc_n = _h_sec_n * float(inv_fx_rate)
+        _hint_parts_n.append(f"{_acc_lbl_n} → **{_h_acc_n:,.8f}**")
+    if not _is_xc_new:
+        st.caption(
+            f"Security and account share the same currency ({_acc_cur_name_new or '?'}) — "
+            "FX Rate is 1.0; Total(Sec) = Total(Acc)."
+        )
+    elif _hint_parts_n:
+        st.caption("💡 On save: " + " · ".join(_hint_parts_n))
+    else:
+        st.caption(f"FX rate as of **{inv_date}** from Historical_FX — edit if the booked rate differs.")
 
     # ── Linked account cross-currency target amount ────────────────────────
     linked_target_amount = None
@@ -886,31 +1002,59 @@ def _render_new_investment_form(acc_id, acc_type, df_accs, df_securities, get_db
             for e in errors:
                 st.error(e)
         else:
-            # ── Auto-calculate total amount ────────────────────────────────────
-            if inv_total_override != 0:
-                calc_total = inv_total_override
-            elif inv_qty > 0 and inv_price > 0:
+            # ── Resolve amounts: commission → total_sec → fx → total_acc ─────────
+            _qxp_save = inv_qty * inv_price if inv_qty > 0 and inv_price > 0 else 0.0
+
+            # Commission: user value OR derived from Total(Sec) and Qty×Price
+            if inv_comm > 0:
+                calc_commission = inv_comm
+            elif inv_total_sec_cur > 0 and _qxp_save > 0:
                 if inv_action == 'Buy':
-                    calc_total = inv_qty * inv_price + inv_comm
+                    calc_commission = max(0.0, inv_total_sec_cur - _qxp_save)
                 elif inv_action == 'Sell':
-                    calc_total = inv_qty * inv_price - inv_comm
+                    calc_commission = max(0.0, _qxp_save - inv_total_sec_cur)
                 else:
-                    calc_total = inv_qty * inv_price
+                    calc_commission = 0.0
             else:
-                calc_total = inv_total_override  # may be zero (e.g. ShrIn at no cost)
+                calc_commission = 0.0
+
+            # Total (Security Currency): user value OR derived from Qty×Price ± Commission
+            if inv_total_sec_cur != 0:
+                calc_total_sec = inv_total_sec_cur
+            elif _qxp_save > 0:
+                if inv_action == 'Buy':
+                    calc_total_sec = _qxp_save + calc_commission
+                elif inv_action == 'Sell':
+                    calc_total_sec = max(0.0, _qxp_save - calc_commission)
+                else:
+                    calc_total_sec = _qxp_save
+            else:
+                # Fallback: derive from account-currency total when no price data
+                calc_total_sec = abs(inv_total_acc_cur) if inv_total_acc_cur != 0 else 0.0
+
+            # FX Rate (always stored; 1.0 for same-currency)
+            calc_fx = float(inv_fx_rate) if inv_fx_rate and float(inv_fx_rate) > 0 else 1.0
+
+            # Total (Account Currency): user value OR Total(Sec) × FX Rate
+            if inv_total_acc_cur != 0:
+                calc_total_acc = inv_total_acc_cur
+            elif calc_total_sec != 0:
+                calc_total_acc = round(calc_total_sec * calc_fx, 8)
+            else:
+                calc_total_acc = 0.0
 
             try:
                 with get_db_fn() as conn:
                     cur = conn.cursor()
 
-                    # 1. Insert the Investments row (Transactions_Id filled below)
                     cur.execute(
                         """
                         INSERT INTO Investments
                             (Accounts_Id, Securities_Id, Date, Action,
-                             Quantity, Price_Per_Share, Commission, Total_Amount,
+                             Quantity, Price_Per_Share, Commission,
+                             Total_Amount_AccCur, Total_Amount_SecCur, FX_Rate,
                              Description, Instrument_Type)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         RETURNING Investments_Id
                         """,
                         (
@@ -918,10 +1062,12 @@ def _render_new_investment_form(acc_id, acc_type, df_accs, df_securities, get_db
                             inv_security,
                             inv_date,
                             inv_action,
-                            inv_qty   if inv_qty   > 0 else None,
-                            inv_price if inv_price > 0 else None,
-                            inv_comm  if inv_comm  > 0 else None,
-                            calc_total if calc_total != 0 else None,
+                            inv_qty          if inv_qty   > 0 else None,
+                            inv_price        if inv_price > 0 else None,
+                            calc_commission  if calc_commission > 0 else None,
+                            calc_total_acc   if calc_total_acc != 0 else None,
+                            calc_total_sec   if calc_total_sec != 0 else None,
+                            calc_fx,
                             inv_memo or None,
                             inv_instrument_type or None,
                         ),
@@ -930,28 +1076,23 @@ def _render_new_investment_form(acc_id, acc_type, df_accs, df_securities, get_db
 
                     # 2. Linked cash account transfer (mirrors qif_importer X-type logic)
                     if enable_linked and linked_acc_id and inv_action in LINKED_CAPABLE:
-                        if inv_action in CASH_OUT_ACTIONS:
-                            cash_tx_amount = -abs(calc_total)
-                        else:
-                            cash_tx_amount = abs(calc_total)
+                        cash_tx_amount = (-abs(calc_total_acc) if inv_action in CASH_OUT_ACTIONS
+                                         else abs(calc_total_acc))
 
                         # Security name becomes the payee and description on the cash side
-                        sec_name = sec_options.get(inv_security) if inv_security else None
+                        sec_name = sec_names_plain.get(inv_security) if inv_security else None
                         payee_id = get_or_create_payee_id(cur, sec_name) if sec_name else None
                         cash_description = sec_name or inv_memo or inv_action
 
                         # Determine target amount when currencies differ
                         if linked_acc_curr and linked_acc_curr != acc_currencies_id:
-                            # Use user-entered override or fx-converted amount
                             if linked_target_amount and linked_target_amount != 0:
                                 target_amt = abs(linked_target_amount)
                             else:
-                                target_amt = abs(calc_total) * fx_rate
-                            # Re-fetch FX rate for the actual transaction date
-                            actual_fx = get_latest_fx_rate(cur, acc_currencies_id, linked_acc_curr, inv_date)
-                            if linked_target_amount == 0:
-                                target_amt = abs(calc_total) * actual_fx
-                            cash_tx_amount_linked = -abs(target_amt) if inv_action in CASH_OUT_ACTIONS else abs(target_amt)
+                                actual_fx = get_latest_fx_rate(cur, acc_currencies_id, linked_acc_curr, inv_date)
+                                target_amt = abs(calc_total_acc) * (actual_fx or fx_rate)
+                            cash_tx_amount_linked = (-abs(target_amt) if inv_action in CASH_OUT_ACTIONS
+                                                     else abs(target_amt))
                         else:
                             cash_tx_amount_linked = cash_tx_amount
                             target_amt = None
@@ -972,9 +1113,9 @@ def _render_new_investment_form(acc_id, acc_type, df_accs, df_securities, get_db
                                 cash_description,
                                 cash_tx_amount_linked,
                                 True,
-                                acc_id,          # investment account (informational — no mirror Transactions row)
-                                abs(calc_total), # investment amount in investment account currency
-                                None,            # no Transfers_Id — Investments table is the authoritative record
+                                acc_id,               # investment account (informational)
+                                abs(calc_total_acc),  # investment amount in account currency
+                                None,                 # no Transfers_Id — Investments is authoritative
                             ),
                         )
                         linked_tx_id = cur.fetchone()[0]
@@ -1069,6 +1210,7 @@ def _render_edit_investment_form(acc_id, acc_type, df_accs, df_securities, get_d
     _fc1, _fc2 = st.columns(2)
     with _fc1:
         _edit_from = st.date_input("From", value=date.today() - timedelta(days=90),
+                                   min_value=date(1990, 1, 1), max_value=date.today(),
                                     key=f"inv_edit_from_{acc_id}")
     with _fc2:
         _edit_to = st.date_input("To", value=date.today(),
@@ -1077,7 +1219,8 @@ def _render_edit_investment_form(acc_id, acc_type, df_accs, df_securities, get_d
     with get_db_fn() as _conn_load:
         df_inv = pd.read_sql(
             """SELECT i.investments_id, i.date, i.action, i.quantity,
-                      i.price_per_share, i.commission, i.total_amount,
+                      i.price_per_share, i.commission,
+                      i.total_amount_acccur, i.total_amount_seccur, i.fx_rate,
                       i.description, i.transactions_id, i.securities_id,
                       i.instrument_type,
                       s.securities_name
@@ -1097,8 +1240,8 @@ def _render_edit_investment_form(acc_id, acc_type, df_accs, df_securities, get_d
     _inv_opts: dict = {}
     for _, _r in df_inv.iterrows():
         _lbl = f"{_r['date']}  |  {_r['action']}  |  {_r.get('securities_name') or '—'}"
-        if _r['total_amount'] is not None:
-            _lbl += f"  |  {float(_r['total_amount']):,.4f}"
+        if _r.get('total_amount_acccur') is not None:
+            _lbl += f"  |  {float(_r['total_amount_acccur']):,.4f}"
         _inv_opts[int(_r['investments_id'])] = _lbl
 
     sel_inv_id = st.selectbox(
@@ -1150,15 +1293,23 @@ def _render_edit_investment_form(acc_id, acc_type, df_accs, df_securities, get_d
             v = sel_row.get(col)
             return float(v) if (v is not None and pd.notna(v)) else 0.0
 
-        st.session_state[f"inv_edit_date_{acc_id}"]       = _dv
-        st.session_state[f"inv_edit_action_{acc_id}"]     = _act
-        st.session_state[f"inv_edit_sec_{acc_id}"]        = _sec_id
-        st.session_state[f"inv_edit_qty_{acc_id}"]        = _f('quantity')
-        st.session_state[f"inv_edit_price_{acc_id}"]      = _f('price_per_share')
-        st.session_state[f"inv_edit_comm_{acc_id}"]       = _f('commission')
-        st.session_state[f"inv_edit_total_{acc_id}"]      = _f('total_amount')
-        st.session_state[f"inv_edit_memo_{acc_id}"]       = sel_row.get('description') or ""
-        st.session_state[f"inv_edit_instr_{acc_id}"]      = sel_row.get('instrument_type') or ""
+        # Load raw FX rate from the stored row; fall back to 1.0 if absent
+        _raw_fx_e = sel_row.get('fx_rate')
+        _fx_pref  = (float(_raw_fx_e)
+                     if (_raw_fx_e is not None and not pd.isna(_raw_fx_e) and float(_raw_fx_e) > 0)
+                     else 1.0)
+
+        st.session_state[f"inv_edit_date_{acc_id}"]      = _dv
+        st.session_state[f"inv_edit_action_{acc_id}"]    = _act
+        st.session_state[f"inv_edit_sec_{acc_id}"]       = _sec_id
+        st.session_state[f"inv_edit_qty_{acc_id}"]       = _f('quantity')
+        st.session_state[f"inv_edit_price_{acc_id}"]     = _f('price_per_share')
+        st.session_state[f"inv_edit_comm_{acc_id}"]      = _f('commission')
+        st.session_state[f"inv_edit_total_sec_{acc_id}"] = _f('total_amount_seccur')
+        st.session_state[f"inv_edit_fx_{acc_id}"]        = _fx_pref
+        st.session_state[f"inv_edit_total_acc_{acc_id}"] = _f('total_amount_acccur')
+        st.session_state[f"inv_edit_memo_{acc_id}"]      = sel_row.get('description') or ""
+        st.session_state[f"inv_edit_instr_{acc_id}"]     = sel_row.get('instrument_type') or ""
         st.session_state[f"inv_edit_linked_chk_{acc_id}"] = (
             existing_linked_tx is not None or acc_linked_default is not None)
         _def_linked = (existing_linked_acc_id if existing_linked_acc_id in cash_acc_ids
@@ -1166,6 +1317,8 @@ def _render_edit_investment_form(acc_id, acc_type, df_accs, df_securities, get_d
         if _def_linked is not None:
             st.session_state[f"inv_edit_linked_acc_{acc_id}"] = _def_linked
         st.session_state.pop(f"inv_edit_linked_target_{acc_id}", None)
+        # Remove old key so it doesn't shadow the new total_acc key
+        st.session_state.pop(f"inv_edit_total_{acc_id}", None)
         st.session_state[_last_sel_key] = sel_inv_id
 
     # ── Linked-account selectbox (outside form for FX pre-calc) ───────────────
@@ -1220,18 +1373,22 @@ def _render_edit_investment_form(acc_id, acc_type, df_accs, df_securities, get_d
     # ── Edit fields ───────────────────────────────────────────────────────────
     st.divider()
 
-    # Include the existing security even if it doesn't match the account currency filter
-    df_sec_filtered = df_securities[df_securities['currencies_id'] == acc_currencies_id].copy()
+    # All securities — show currency code, no account-currency filter
     existing_sec_id: int | None = None
     _raw_sec = sel_row.get('securities_id')
     if _raw_sec is not None and not pd.isna(_raw_sec):
         existing_sec_id = int(_raw_sec)
-    sec_options = {int(r['securities_id']): r['securities_name']
-                   for _, r in df_sec_filtered.iterrows()}
-    if existing_sec_id and existing_sec_id not in sec_options:
-        _extra = df_securities[df_securities['securities_id'] == existing_sec_id]
-        if not _extra.empty:
-            sec_options[existing_sec_id] = _extra.iloc[0]['securities_name']
+    _cur_map_e = (df_securities.set_index('securities_id')['currencies_shortname'].to_dict()
+                  if 'currencies_shortname' in df_securities.columns else {})
+    sec_options = {
+        int(r['securities_id']): (
+            f"{r['securities_name']} ({r['currencies_shortname']})"
+            if r.get('currencies_shortname') else r['securities_name']
+        )
+        for _, r in df_securities.iterrows()
+    }
+    sec_names_plain = {int(r['securities_id']): r['securities_name']
+                       for _, r in df_securities.iterrows()}
 
     col1, col2 = st.columns(2)
 
@@ -1279,27 +1436,123 @@ def _render_edit_investment_form(acc_id, acc_type, df_accs, df_securities, get_d
         inv_price = st.number_input(
             "Price Per Share", min_value=0.0,
             value=float(sel_row['price_per_share']) if sel_row.get('price_per_share') is not None else 0.0,
-            step=0.0001, format="%.4f",
+            step=0.0001, format="%.8f",
             key=f"inv_edit_price_{acc_id}",
         )
         inv_comm = st.number_input(
-            "Commission", min_value=0.0,
+            "Commission (0 = auto-derive)",
+            min_value=0.0,
             value=float(sel_row['commission']) if sel_row.get('commission') is not None else 0.0,
-            step=0.01, format="%.4f",
+            step=0.01, format="%.8f",
             key=f"inv_edit_comm_{acc_id}",
-        )
-        inv_total_override = st.number_input(
-            "Total Amount (0 to auto-calculate)",
-            value=float(sel_row['total_amount']) if sel_row.get('total_amount') is not None else 0.0,
-            step=0.01, format="%.4f",
-            key=f"inv_edit_total_{acc_id}",
-            help="Buy = qty×price + commission | Sell = qty×price − commission | others = qty×price",
+            help=(
+                "Leave 0 to auto-derive from Qty × Price vs Total (Sec Currency): "
+                "Buy → Total(Sec) − Qty×Price; Sell → Qty×Price − Total(Sec)."
+            ),
         )
         inv_memo = st.text_input(
             "Memo / Description",
             value=sel_row.get('description') or "",
             key=f"inv_edit_memo_{acc_id}",
         )
+
+    # ── Amounts (always shown: Total Sec · FX Rate · Total Acc) ───────────────
+    st.divider()
+    st.markdown("**Amounts**")
+
+    _sec_currencies_id_ed = None
+    _sec_cur_name_ed = ""
+    if inv_security:
+        _sr_ed = df_securities[df_securities['securities_id'] == inv_security]
+        if not _sr_ed.empty:
+            _sec_currencies_id_ed = int(_sr_ed.iloc[0]['currencies_id'])
+            _sec_cur_name_ed = str(_sr_ed.iloc[0].get('currencies_shortname', ''))
+    _is_xc_ed = (_sec_currencies_id_ed is not None and _sec_currencies_id_ed != acc_currencies_id)
+
+    # Account currency display name
+    _acc_cur_name_ed = ""
+    try:
+        with get_db_fn() as _cn_ae:
+            _cae = _cn_ae.cursor()
+            _cae.execute("SELECT Currencies_ShortName FROM Currencies WHERE Currencies_Id = %s",
+                         (acc_currencies_id,))
+            _re = _cae.fetchone()
+            if _re:
+                _acc_cur_name_ed = _re[0]
+    except Exception:
+        pass
+
+    _sec_lbl_e = f"Total ({_sec_cur_name_ed})" if _sec_cur_name_ed else "Total (Sec Currency)"
+    _acc_lbl_e = f"Total ({_acc_cur_name_ed})" if _acc_cur_name_ed else "Total (Acc Currency)"
+
+    # Values are pre-loaded into session state when selection changes (see above).
+    # For cross-currency: FX is loaded from the stored row.
+    # For same-currency:  FX session state is set to 1.0.
+    _ea1, _ea2, _ea3 = st.columns(3)
+    with _ea1:
+        inv_total_sec_cur = st.number_input(
+            _sec_lbl_e,
+            value=float(sel_row['total_amount_seccur']) if sel_row.get('total_amount_seccur') is not None else 0.0,
+            step=0.01, format="%.8f",
+            key=f"inv_edit_total_sec_{acc_id}",
+            help="Total in the security's native currency. Leave 0 to auto-calculate from Qty × Price ± Commission.",
+        )
+    with _ea2:
+        inv_fx_rate = st.number_input(
+            "FX Rate (1 Sec → Acc)",
+            value=st.session_state.get(f"inv_edit_fx_{acc_id}", 1.0),
+            min_value=0.000001, step=0.000001, format="%.6f",
+            key=f"inv_edit_fx_{acc_id}",
+            help=(
+                "Stored FX rate for this transaction. "
+                "1 unit of security currency = this many account-currency units."
+                + (" Same currency — defaults to 1.0." if not _is_xc_ed else "")
+            ),
+        )
+    with _ea3:
+        inv_total_acc_cur = st.number_input(
+            _acc_lbl_e,
+            value=float(sel_row['total_amount_acccur']) if sel_row.get('total_amount_acccur') is not None else 0.0,
+            step=0.01, format="%.8f",
+            key=f"inv_edit_total_acc_{acc_id}",
+            help="Total in the account's currency. Leave 0 to auto-calculate from Total(Sec) × FX Rate.",
+        )
+
+    # ── Live auto-calc hint ────────────────────────────────────────────────────
+    _qxp_e = inv_qty * inv_price if inv_qty > 0 and inv_price > 0 else 0.0
+    _hint_parts_e: list[str] = []
+    _h_sec_e = inv_total_sec_cur
+    if inv_comm == 0 and inv_total_sec_cur > 0 and _qxp_e > 0:
+        if inv_action == 'Buy':
+            _h_comm_e = max(0.0, inv_total_sec_cur - _qxp_e)
+        elif inv_action == 'Sell':
+            _h_comm_e = max(0.0, _qxp_e - inv_total_sec_cur)
+        else:
+            _h_comm_e = 0.0
+        if _h_comm_e > 0:
+            _hint_parts_e.append(f"Commission → **{_h_comm_e:,.8f}**")
+    if inv_total_sec_cur == 0 and _qxp_e > 0:
+        _c_hint_e = inv_comm if inv_comm > 0 else 0.0
+        if inv_action == 'Buy':
+            _h_sec_e = _qxp_e + _c_hint_e
+        elif inv_action == 'Sell':
+            _h_sec_e = max(0.0, _qxp_e - _c_hint_e)
+        else:
+            _h_sec_e = _qxp_e
+        if _h_sec_e > 0:
+            _hint_parts_e.append(f"{_sec_lbl_e} → **{_h_sec_e:,.8f}**")
+    if inv_total_acc_cur == 0 and _h_sec_e > 0 and _is_xc_ed:
+        _h_acc_e = _h_sec_e * float(inv_fx_rate)
+        _hint_parts_e.append(f"{_acc_lbl_e} → **{_h_acc_e:,.8f}**")
+    if not _is_xc_ed:
+        st.caption(
+            f"Security and account share the same currency ({_acc_cur_name_ed or '?'}) — "
+            "FX Rate is 1.0; Total(Sec) = Total(Acc)."
+        )
+    elif _hint_parts_e:
+        st.caption("💡 On save: " + " · ".join(_hint_parts_e))
+    else:
+        st.caption(f"Loaded stored FX rate — edit if needed.")
 
     # ── Cross-currency target amount ───────────────────────────────────────────
     linked_target_amount = None
@@ -1334,18 +1587,45 @@ def _render_edit_investment_form(acc_id, acc_type, df_accs, df_securities, get_d
             for e in errors:
                 st.error(e)
         else:
-            # Auto-calculate total
-            if inv_total_override != 0:
-                calc_total = inv_total_override
-            elif inv_qty > 0 and inv_price > 0:
+            # ── Resolve amounts: commission → total_sec → fx → total_acc ─────────
+            _qxp_save_e = inv_qty * inv_price if inv_qty > 0 and inv_price > 0 else 0.0
+
+            # Commission: user value OR derived from Total(Sec) and Qty×Price
+            if inv_comm > 0:
+                calc_commission = inv_comm
+            elif inv_total_sec_cur > 0 and _qxp_save_e > 0:
                 if inv_action == 'Buy':
-                    calc_total = inv_qty * inv_price + inv_comm
+                    calc_commission = max(0.0, inv_total_sec_cur - _qxp_save_e)
                 elif inv_action == 'Sell':
-                    calc_total = inv_qty * inv_price - inv_comm
+                    calc_commission = max(0.0, _qxp_save_e - inv_total_sec_cur)
                 else:
-                    calc_total = inv_qty * inv_price
+                    calc_commission = 0.0
             else:
-                calc_total = inv_total_override
+                calc_commission = 0.0
+
+            # Total (Security Currency)
+            if inv_total_sec_cur != 0:
+                calc_total_sec = inv_total_sec_cur
+            elif _qxp_save_e > 0:
+                if inv_action == 'Buy':
+                    calc_total_sec = _qxp_save_e + calc_commission
+                elif inv_action == 'Sell':
+                    calc_total_sec = max(0.0, _qxp_save_e - calc_commission)
+                else:
+                    calc_total_sec = _qxp_save_e
+            else:
+                calc_total_sec = abs(inv_total_acc_cur) if inv_total_acc_cur != 0 else 0.0
+
+            # FX Rate
+            calc_fx = float(inv_fx_rate) if inv_fx_rate and float(inv_fx_rate) > 0 else 1.0
+
+            # Total (Account Currency)
+            if inv_total_acc_cur != 0:
+                calc_total_acc = inv_total_acc_cur
+            elif calc_total_sec != 0:
+                calc_total_acc = round(calc_total_sec * calc_fx, 8)
+            else:
+                calc_total_acc = 0.0
 
             try:
                 with get_db_fn() as conn:
@@ -1354,24 +1634,28 @@ def _render_edit_investment_form(acc_id, acc_type, df_accs, df_securities, get_d
                     # 1. UPDATE Investments row
                     cur.execute(
                         """UPDATE Investments SET
-                               Securities_Id   = %s,
-                               Date            = %s,
-                               Action          = %s::investments_action,
-                               Quantity        = %s,
-                               Price_Per_Share = %s,
-                               Commission      = %s,
-                               Total_Amount    = %s,
-                               Description     = %s,
-                               Instrument_Type = %s
+                               Securities_Id       = %s,
+                               Date                = %s,
+                               Action              = %s::investments_action,
+                               Quantity            = %s,
+                               Price_Per_Share     = %s,
+                               Commission          = %s,
+                               Total_Amount_AccCur = %s,
+                               Total_Amount_SecCur = %s,
+                               FX_Rate             = %s,
+                               Description         = %s,
+                               Instrument_Type     = %s
                            WHERE Investments_Id = %s""",
                         (
                             inv_security,
                             inv_date,
                             inv_action,
-                            inv_qty   if inv_qty   > 0 else None,
-                            inv_price if inv_price > 0 else None,
-                            inv_comm  if inv_comm  > 0 else None,
-                            calc_total if calc_total != 0 else None,
+                            inv_qty          if inv_qty   > 0 else None,
+                            inv_price        if inv_price > 0 else None,
+                            calc_commission  if calc_commission > 0 else None,
+                            calc_total_acc   if calc_total_acc != 0 else None,
+                            calc_total_sec   if calc_total_sec != 0 else None,
+                            calc_fx,
                             inv_memo or None,
                             inv_instrument_type or None,
                             sel_inv_id,
@@ -1383,17 +1667,16 @@ def _render_edit_investment_form(acc_id, acc_type, df_accs, df_securities, get_d
                     has_link   = existing_linked_tx is not None
 
                     if has_link and not wants_link:
-                        # Remove link: delete cash transaction, clear FK
-                        cur.execute("DELETE FROM Transactions WHERE Transactions_Id = %s",
-                                    (existing_linked_tx['transactions_id'],))
+                        # Remove link: NULL FK first, then delete cash transaction
                         cur.execute("UPDATE Investments SET Transactions_Id = NULL "
                                     "WHERE Investments_Id = %s", (sel_inv_id,))
+                        cur.execute("DELETE FROM Transactions WHERE Transactions_Id = %s",
+                                    (existing_linked_tx['transactions_id'],))
 
                     elif wants_link:
-                        # Build cash-side amounts
-                        cash_tx_amount = (-abs(calc_total) if inv_action in CASH_OUT_ACTIONS
-                                         else abs(calc_total))
-                        sec_name = sec_options.get(inv_security) if inv_security else None
+                        cash_tx_amount = (-abs(calc_total_acc) if inv_action in CASH_OUT_ACTIONS
+                                         else abs(calc_total_acc))
+                        sec_name = sec_names_plain.get(inv_security) if inv_security else None
                         payee_id = get_or_create_payee_id(cur, sec_name) if sec_name else None
                         cash_description = sec_name or inv_memo or inv_action
 
@@ -1403,7 +1686,7 @@ def _render_edit_investment_form(acc_id, acc_type, df_accs, df_securities, get_d
                             else:
                                 actual_fx = get_latest_fx_rate(
                                     cur, acc_currencies_id, linked_acc_curr, inv_date)
-                                target_amt = abs(calc_total) * actual_fx
+                                target_amt = abs(calc_total_acc) * (actual_fx or fx_rate)
                             cash_tx_amount_linked = (-abs(target_amt) if inv_action in CASH_OUT_ACTIONS
                                                      else abs(target_amt))
                         else:
@@ -1415,23 +1698,25 @@ def _render_edit_investment_form(acc_id, acc_type, df_accs, df_securities, get_d
                             # Same cash account → UPDATE existing transaction
                             cur.execute(
                                 """UPDATE Transactions SET
-                                       Date               = %s,
-                                       Payees_Id          = %s,
-                                       Description        = %s,
-                                       Total_Amount       = %s,
-                                       Accounts_Id_Target = %s,
+                                       Date                = %s,
+                                       Payees_Id           = %s,
+                                       Description         = %s,
+                                       Total_Amount        = %s,
+                                       Accounts_Id_Target  = %s,
                                        Total_Amount_Target = %s
                                    WHERE Transactions_Id = %s""",
                                 (
                                     inv_date, payee_id, cash_description,
                                     cash_tx_amount_linked,
-                                    acc_id, abs(calc_total),
+                                    acc_id, abs(calc_total_acc),
                                     existing_linked_tx['transactions_id'],
                                 ),
                             )
                         else:
-                            # Different / new cash account → delete old (if any), create new
+                            # Different / new cash account → NULL FK + delete old, then create new
                             if has_link:
+                                cur.execute("UPDATE Investments SET Transactions_Id = NULL "
+                                            "WHERE Investments_Id = %s", (sel_inv_id,))
                                 cur.execute("DELETE FROM Transactions WHERE Transactions_Id = %s",
                                             (existing_linked_tx['transactions_id'],))
                             cur.execute(
@@ -1444,7 +1729,7 @@ def _render_edit_investment_form(acc_id, acc_type, df_accs, df_securities, get_d
                                 (
                                     _linked_acc_id_int, inv_date, payee_id, cash_description,
                                     cash_tx_amount_linked,
-                                    acc_id, abs(calc_total),
+                                    acc_id, abs(calc_total_acc),
                                 ),
                             )
                             _new_tx_id = cur.fetchone()[0]
@@ -1521,7 +1806,8 @@ def _render_security_transactions(acc_id: int, sec_options: dict, key_suffix: st
 
     with get_db() as conn:
         df_inv = pd.read_sql(
-            f"""SELECT date, action, quantity, price_per_share, total_amount, description
+            f"""SELECT date, action, quantity, price_per_share,
+                       total_amount_acccur, total_amount_seccur, fx_rate, description
                 FROM investments
                 WHERE accounts_id = {acc_id} AND securities_id = {selected}
                 ORDER BY date ASC, investments_id ASC""",
@@ -1532,17 +1818,17 @@ def _render_security_transactions(acc_id: int, sec_options: dict, key_suffix: st
         st.info("No investment records found for this security.")
         return
 
-    # ── Summary metrics ──────────────────────────────────────────────────────
+    # ── Summary metrics (all in account currency) ────────────────────────────
     buy_mask      = df_inv['action'].isin(['Buy', 'ShrIn', 'Reinvest', 'Vest'])
     sell_mask     = df_inv['action'].isin(['Sell', 'ShrOut', 'Expire'])
     misc_exp_mask = df_inv['action'] == 'MiscExp'
     misc_inc_mask = df_inv['action'] == 'MiscInc'
 
     net_qty      = df_inv.loc[buy_mask,      'quantity'].sum() - df_inv.loc[sell_mask, 'quantity'].sum()
-    buy_amt      = df_inv.loc[buy_mask,      'total_amount'].sum()
-    sell_amt     = df_inv.loc[sell_mask,     'total_amount'].sum()
-    misc_exp_amt = df_inv.loc[misc_exp_mask, 'total_amount'].sum()
-    misc_inc_amt = df_inv.loc[misc_inc_mask, 'total_amount'].sum()
+    buy_amt      = df_inv.loc[buy_mask,      'total_amount_acccur'].sum()
+    sell_amt     = df_inv.loc[sell_mask,     'total_amount_acccur'].sum()
+    misc_exp_amt = df_inv.loc[misc_exp_mask, 'total_amount_acccur'].sum()
+    misc_inc_amt = df_inv.loc[misc_inc_mask, 'total_amount_acccur'].sum()
     net_pnl      = sell_amt + misc_inc_amt - buy_amt - misc_exp_amt
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
@@ -1572,12 +1858,14 @@ def _render_security_transactions(acc_id: int, sec_options: dict, key_suffix: st
         hide_index=True,
         width="stretch",
         column_config={
-            'date':            st.column_config.DateColumn('Date', format='DD/MM/YYYY'),
-            'action':          st.column_config.TextColumn('Action'),
-            'quantity':        st.column_config.NumberColumn('Quantity',     format='%,.8f'),
-            'price_per_share': st.column_config.NumberColumn('Price',        format='%,.5f'),
-            'total_amount':    st.column_config.NumberColumn('Total Amount', format='%,.4f'),
-            'description':     st.column_config.TextColumn('Description',    width='large'),
+            'date':                 st.column_config.DateColumn('Date',          format='DD/MM/YYYY'),
+            'action':               st.column_config.TextColumn('Action'),
+            'quantity':             st.column_config.NumberColumn('Quantity',    format='%,.8f'),
+            'price_per_share':      st.column_config.NumberColumn('Price',       format='%,.8f'),
+            'total_amount_acccur': st.column_config.NumberColumn('Total (Acc)', format='%,.8f'),
+            'total_amount_seccur': st.column_config.NumberColumn('Total (Sec)', format='%,.8f'),
+            'fx_rate':              st.column_config.NumberColumn('FX Rate',     format='%,.6f'),
+            'description':          st.column_config.TextColumn('Description',   width='large'),
         },
     )
     copy_df_button(df_inv, key=f"dl_reg_sec_txns_{acc_id}_{key_suffix}")
@@ -1637,7 +1925,11 @@ def render_register():
 
             if 'df_securities' not in st.session_state:
                 st.session_state.df_securities = pd.read_sql(
-                    "SELECT Securities_Id, Securities_Name, Currencies_Id FROM Securities", conn)
+                    """SELECT s.Securities_Id, s.Securities_Name, s.Currencies_Id,
+                              c.Currencies_ShortName
+                         FROM Securities s
+                         JOIN Currencies c ON c.Currencies_Id = s.Currencies_Id
+                        ORDER BY s.Securities_Name""", conn)
 
             if 'df_cat_list' not in st.session_state:
                 query_cat_hierarchy = """
@@ -1669,6 +1961,12 @@ def render_register():
     payee_names = df_payee_list['payees_name'].tolist()
     cat_options = df_cat_list.set_index('categories_id')['full_path'].to_dict()
     sec_options = df_securities.set_index('securities_id')['securities_name'].to_dict()
+    # Extended options dict that includes currency code for display in forms
+    _sec_cur_map = df_securities.set_index('securities_id')['currencies_shortname'].to_dict() if 'currencies_shortname' in df_securities.columns else {}
+    sec_options_with_cur = {
+        sid: f"{name} ({_sec_cur_map.get(sid, '')})" if _sec_cur_map.get(sid) else name
+        for sid, name in sec_options.items()
+    }
     
     # Account selection
     if 'account_id_internal' not in st.session_state or st.session_state.account_id_internal is None:
@@ -2323,8 +2621,8 @@ def render_register():
                 _column_order = [
                     "investments_id", "accounts_id", "date", "securities_id",
                     "action", "instrument_type", "quantity", "price_per_share",
-                    "commission", "total_amount", "description",
-                    "transactions_id", "embedding",
+                    "commission", "total_amount_acccur", "total_amount_seccur", "fx_rate",
+                    "description", "transactions_id", "embedding",
                 ]
                 with get_db() as conn:
                     _df_fresh = pd.read_sql(
@@ -2337,19 +2635,75 @@ def render_register():
                     _df_fresh["_sk"] = _df_fresh["securities_id"].map(_full_sec_options).fillna("")
                     _df_fresh = _df_fresh.sort_values("_sk", ascending=_inv_sort_asc, kind="stable").drop(columns=["_sk"]).reset_index(drop=True)
                 elif _inv_sort_col == "Total Amount":
-                    _df_fresh = _df_fresh.sort_values("total_amount", ascending=_inv_sort_asc, kind="stable").reset_index(drop=True)
+                    _df_fresh = _df_fresh.sort_values("total_amount_acccur", ascending=_inv_sort_asc, kind="stable").reset_index(drop=True)
                 else:  # Date
                     _df_fresh = _df_fresh.sort_values("date", ascending=_inv_sort_asc, kind="stable").reset_index(drop=True)
                 st.session_state[_inv_orig_key] = _df_fresh
 
             df_inv_orig = st.session_state[_inv_orig_key]
 
-            edited_df = st.data_editor(
-                df_inv_orig,           # always render from cached original so edits persist across reruns
+            # ── Display-only link columns ──────────────────────────────────────
+            # These are NOT stored in df_inv_orig / session state and are stripped
+            # from edited_df before change-detection and save.
+            _df_for_editor = df_inv_orig.copy()
+            _df_for_editor.insert(0, "linked", _df_for_editor["transactions_id"].notna())
+
+            # Batch-fetch the linked cash account name for every row that has a
+            # transactions_id, using a single indexed query.
+            _linked_tx_ids = [
+                int(x) for x in _df_for_editor["transactions_id"].dropna()
+                if pd.notna(x)
+            ]
+            if _linked_tx_ids:
+                with get_db() as _conn_lkup:
+                    _df_lkup = pd.read_sql(
+                        """SELECT t.transactions_id,
+                                  a.accounts_name
+                           FROM   Transactions t
+                           JOIN   Accounts a ON a.accounts_id = t.accounts_id
+                           WHERE  t.transactions_id = ANY(%s)""",
+                        _conn_lkup,
+                        params=(_linked_tx_ids,),
+                    )
+                _lkup_acc = _df_lkup.set_index("transactions_id")["accounts_name"].to_dict()
+            else:
+                _lkup_acc = {}
+
+            _df_for_editor["cash_account"] = (
+                _df_for_editor["transactions_id"]
+                .apply(lambda x: _lkup_acc.get(int(x), "") if pd.notna(x) else "")
+            )
+            _df_for_editor["cash_tx_id"] = (
+                _df_for_editor["transactions_id"]
+                .apply(lambda x: int(x) if pd.notna(x) else None)
+            )
+
+            _edited_with_linked = st.data_editor(
+                _df_for_editor,
                 num_rows="dynamic",
                 key=f"inv_reg_{acc_id}_{_inv_sort_col}_{_inv_sort_dir}",  # reset editor when sort changes
                 width="stretch",
                 column_config={
+                    "linked": st.column_config.CheckboxColumn(
+                        "🔗",
+                        disabled=True,
+                        pinned=True,
+                        help="Checked = entry is linked to a cash-account transaction; "
+                             "unchecked = no cash-side entry exists yet.",
+                    ),
+                    "cash_account": st.column_config.TextColumn(
+                        "Linked Account",
+                        disabled=True,
+                        width="medium",
+                        help="Cash account that holds the linked transaction.",
+                    ),
+                    "cash_tx_id": st.column_config.NumberColumn(
+                        "Cash TX ID",
+                        disabled=True,
+                        format="%d",
+                        width="small",
+                        help="Transaction ID of the linked cash-account entry.",
+                    ),
                     "investments_id": st.column_config.NumberColumn(
                         "Transaction ID",
                         disabled=True
@@ -2391,15 +2745,26 @@ def render_register():
                     ),
                     "price_per_share": st.column_config.NumberColumn(
                         "Price",
-                        format="%,.4f",
+                        format="%,.8f",
                     ),
                     "commission": st.column_config.NumberColumn(
                         "Commission",
-                        format="%,.4f"
+                        format="%,.8f",
                     ),
-                    "total_amount": st.column_config.NumberColumn(
-                        "Total Amount",
-                        format="%,.4f"
+                    "total_amount_acccur": st.column_config.NumberColumn(
+                        "Total (Acc)",
+                        format="%,.8f",
+                        help="Total amount in the investment account's currency.",
+                    ),
+                    "total_amount_seccur": st.column_config.NumberColumn(
+                        "Total (Sec)",
+                        format="%,.8f",
+                        help="Total amount in the security's native currency.",
+                    ),
+                    "fx_rate": st.column_config.NumberColumn(
+                        "FX Rate",
+                        format="%,.6f",
+                        help="Rate used at booking: 1 security-currency unit = this many account-currency units.",
                     ),
                     "description": st.column_config.TextColumn(
                         "Memo",
@@ -2409,9 +2774,23 @@ def render_register():
                     "embedding": None,
                 },
             )
-            _copy_inv = df_inv_orig.drop(columns=["investments_id", "accounts_id", "transactions_id", "embedding"], errors="ignore").copy()
+
+            # Strip all display-only columns — they are not DB columns and must
+            # not reach execute_db_save or the change-detection logic.
+            edited_df = _edited_with_linked.drop(
+                columns=["linked", "cash_account", "cash_tx_id"], errors="ignore"
+            )
+            _copy_inv = _df_for_editor.drop(
+                columns=["investments_id", "accounts_id", "transactions_id", "embedding"],
+                errors="ignore",
+            ).copy()
             _copy_inv["securities_id"] = _copy_inv["securities_id"].map(_full_sec_options).fillna("")
-            _copy_inv = _copy_inv.rename(columns={"securities_id": "Security"})
+            _copy_inv = _copy_inv.rename(columns={
+                "securities_id": "Security",
+                "linked":        "Linked",
+                "cash_account":  "Linked Account",
+                "cash_tx_id":    "Cash TX ID",
+            })
             copy_df_button(_copy_inv, key=f"dl_reg_inv_{acc_id}")
 
             # ── Change detection & Save ────────────────────────────────────────
@@ -2438,10 +2817,10 @@ def render_register():
                         return (qty * price) + comm
                     elif action == 'Sell':
                         return (qty * price) - comm
-                    return row.get('total_amount')
+                    return row.get('total_amount_acccur')
 
                 if new_rows_mask.any():
-                    edited_df.loc[new_rows_mask, 'total_amount'] = edited_df[new_rows_mask].apply(calculate_total, axis=1)
+                    edited_df.loc[new_rows_mask, 'total_amount_acccur'] = edited_df[new_rows_mask].apply(calculate_total, axis=1)
 
                 if st.button("💾 Save Investments", key=f"save_inv_reg_{acc_id}", type="primary"):
                     # Clear the cache before execute_db_save calls st.rerun(),
@@ -2458,7 +2837,7 @@ def render_register():
             # Allows creating a cash-account link for unlinked transactions, or
             # removing/inspecting an existing link.
             # Note: when an existing linked transaction is saved via the register above,
-            # execute_db_save already syncs its Date and Total_Amount automatically.
+            # execute_db_save already syncs its Date and Total_Amount_AccCur automatically.
             _LINK_CAPABLE_MGR = {'Buy', 'Sell', 'Dividend', 'IntInc', 'RtrnCap', 'MiscExp'}
             _CASH_OUT_MGR     = {'Buy', 'MiscExp'}
             _INV_TYPES_MGR    = {'Brokerage', 'Pension', 'Other Investment', 'Margin'}
@@ -2477,9 +2856,141 @@ def render_register():
                 if _df_linkable.empty:
                     st.caption("No linkable transactions (Buy / Sell / Dividend / IntInc / RtrnCap / MiscExp) in this account.")
                 else:
+                    # ── Bulk-create missing linked cash transactions ────────────────
+                    _df_unlinked   = _df_linkable[_df_linkable['transactions_id'].isna()].copy()
+                    _n_unlinked    = len(_df_unlinked)
+                    _n_linked      = len(_df_linkable) - _n_unlinked
+                    _bulk_key      = f"inv_bulk_create_pending_{acc_id}"
+
+                    if _n_unlinked > 0:
+                        with st.container(border=True):
+                            st.caption(
+                                f"**{_n_unlinked}** unlinked  ·  **{_n_linked}** already linked  "
+                                f"(of {len(_df_linkable)} total linkable transactions)"
+                            )
+                            if not _mgr_linked_default:
+                                st.warning(
+                                    "No default linked cash account configured for this investment "
+                                    "account.  Set one in Account Settings to enable bulk creation."
+                                )
+                            else:
+                                _bulk_cash_row  = df_accs[df_accs['accounts_id'] == _mgr_linked_default]
+                                _bulk_cash_name = _bulk_cash_row.iloc[0]['accounts_name'] if not _bulk_cash_row.empty else str(_mgr_linked_default)
+                                st.info(f"Target cash account: **{_bulk_cash_name}**  (account default)")
+                                if st.button(
+                                    f"📋 Create all {_n_unlinked} missing linked cash transactions",
+                                    key=f"inv_bulk_create_btn_{acc_id}",
+                                    type="primary",
+                                ):
+                                    st.session_state[_bulk_key] = {
+                                        "rows": [
+                                            {
+                                                "investments_id": int(r["investments_id"]),
+                                                "action":         str(r["action"]),
+                                                "total":          float(r.get("total_amount_acccur") or 0),
+                                                "date":           r["date"],
+                                                "sec_id":         r.get("securities_id"),
+                                            }
+                                            for _, r in _df_unlinked.iterrows()
+                                        ],
+                                        "cash_acc_id":   _mgr_linked_default,
+                                        "cash_acc_name": _bulk_cash_name,
+                                    }
+                                    st.rerun()
+
+                        # ── Bulk-create confirmation ───────────────────────────────
+                        _pending_bulk = st.session_state.get(_bulk_key)
+                        if _pending_bulk:
+                            _pb_rows  = _pending_bulk["rows"]
+                            _pb_count = len(_pb_rows)
+                            _pb_cash  = _pending_bulk["cash_acc_name"]
+                            st.warning(
+                                f"⚠️ Please confirm: create **{_pb_count}** cash transaction(s) "
+                                f"in **{_pb_cash}** and link them to the corresponding investment "
+                                "entries.\n\n**This action cannot be undone automatically.**"
+                            )
+                            _bc1, _bc2, _ = st.columns([1, 1, 4])
+                            with _bc1:
+                                _bulk_confirmed = st.button(
+                                    "✅ Yes, create all",
+                                    type="primary",
+                                    key=f"inv_bulk_create_yes_{acc_id}",
+                                    width="stretch",
+                                )
+                            with _bc2:
+                                if st.button("❌ Cancel", key=f"inv_bulk_create_no_{acc_id}", width="stretch"):
+                                    del st.session_state[_bulk_key]
+                                    st.rerun()
+
+                            if _bulk_confirmed:
+                                del st.session_state[_bulk_key]
+                                _bc_cash_id  = _pending_bulk["cash_acc_id"]
+                                _bc_created  = 0
+                                _bc_errors: list = []
+                                try:
+                                    with get_db() as _conn_bc:
+                                        _cur_bc = _conn_bc.cursor()
+                                        for _row in _pb_rows:
+                                            _bc_inv_id  = _row["investments_id"]
+                                            _bc_action  = _row["action"]
+                                            _bc_total   = _row["total"]
+                                            _bc_dt      = _row["date"]
+                                            _bc_sec_nm  = _full_sec_options.get(_row["sec_id"]) if _row["sec_id"] else None
+                                            _bc_sign    = -abs(_bc_total) if _bc_action in _CASH_OUT_MGR else abs(_bc_total)
+                                            try:
+                                                _bc_payee_id = (
+                                                    get_or_create_payee_id(_cur_bc, _bc_sec_nm)
+                                                    if _bc_sec_nm else None
+                                                )
+                                                _cur_bc.execute(
+                                                    """
+                                                    INSERT INTO Transactions
+                                                        (Accounts_Id, Date, Payees_Id, Description,
+                                                         Total_Amount, Cleared,
+                                                         Accounts_Id_Target, Total_Amount_Target,
+                                                         Transfers_Id)
+                                                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                                    RETURNING Transactions_Id
+                                                    """,
+                                                    (
+                                                        _bc_cash_id, _bc_dt, _bc_payee_id,
+                                                        _bc_sec_nm or _bc_action, _bc_sign, True,
+                                                        acc_id, abs(_bc_total), None,
+                                                    ),
+                                                )
+                                                _bc_tx_id = _cur_bc.fetchone()[0]
+                                                _cur_bc.execute(
+                                                    "UPDATE Investments SET Transactions_Id = %s "
+                                                    "WHERE Investments_Id = %s",
+                                                    (_bc_tx_id, _bc_inv_id),
+                                                )
+                                                _bc_created += 1
+                                            except Exception as _bc_row_err:
+                                                _bc_errors.append(f"Inv #{_bc_inv_id}: {_bc_row_err}")
+                                        _conn_bc.commit()
+                                    update_accounts_balances(_bc_cash_id)
+                                    update_investment_balances()
+                                    st.session_state.pop(_inv_orig_key, None)
+                                    st.session_state.pop("df_accs", None)
+                                    if _bc_errors:
+                                        st.warning(f"⚠️ {len(_bc_errors)} error(s):")
+                                        for _e in _bc_errors:
+                                            st.caption(_e)
+                                    if _bc_created:
+                                        st.success(
+                                            f"✅ Created {_bc_created} cash transaction(s) "
+                                            f"in {_pb_cash} and linked."
+                                        )
+                                    st.rerun()
+                                except Exception as _bc_outer_err:
+                                    st.error(f"❌ Bulk create failed: {_bc_outer_err}")
+
+                    st.divider()
+
+                    # ── Individual transaction management ──────────────────────────
                     def _fmt_inv_row(r):
                         sec   = _full_sec_options.get(r['securities_id'], '—')
-                        total = f"{r['total_amount']:,.2f}" if pd.notna(r.get('total_amount')) else '—'
+                        total = f"{r['total_amount_acccur']:,.2f}" if pd.notna(r.get('total_amount_acccur')) else '—'
                         icon  = "🔗" if pd.notna(r.get('transactions_id')) else "⚪"
                         d     = r['date'].date() if hasattr(r['date'], 'date') else r['date']
                         return f"{d} | {r['action']} | {sec} | {total} {icon}"
@@ -2529,16 +3040,19 @@ def render_register():
                             ):
                                 with get_db() as _conn_ul:
                                     _cur_ul = _conn_ul.cursor()
-                                    _cur_ul.execute(
-                                        "DELETE FROM Transactions WHERE transactions_id = %s",
-                                        (_existing_tx_id,)
-                                    )
+                                    # NULL the FK first — required before deleting the
+                                    # referenced Transaction row (FK constraint).
                                     _cur_ul.execute(
                                         "UPDATE Investments SET transactions_id = NULL "
                                         "WHERE investments_id = %s",
                                         (_sel_inv_id,)
                                     )
+                                    _cur_ul.execute(
+                                        "DELETE FROM Transactions WHERE transactions_id = %s",
+                                        (_existing_tx_id,)
+                                    )
                                     _conn_ul.commit()
+                                update_investment_balances()
                                 st.session_state.pop(_inv_orig_key, None)
                                 st.session_state.pop("df_accs", None)
                                 st.success("Link removed.")
@@ -2561,7 +3075,9 @@ def render_register():
                                         (_sel_inv_id,)
                                     )
                                     _conn_cs.commit()
+                                update_investment_balances()
                                 st.session_state.pop(_inv_orig_key, None)
+                                st.session_state.pop("df_accs", None)
                                 st.rerun()
 
                     else:
@@ -2598,7 +3114,7 @@ def render_register():
                                 type="primary",
                             ):
                                 _action  = str(_sel_row['action'])
-                                _total   = float(_sel_row.get('total_amount') or 0)
+                                _total   = float(_sel_row.get('total_amount_acccur') or 0)
                                 _dt      = _sel_row['date']
                                 _sec_id  = _sel_row.get('securities_id')
                                 _sec_nm  = _full_sec_options.get(_sec_id) if _sec_id else None
@@ -2633,6 +3149,8 @@ def render_register():
                                             (_new_tx_id, int(_sel_inv_id))
                                         )
                                         _conn_cl.commit()
+                                    update_accounts_balances(_link_target_id)
+                                    update_investment_balances()
                                     st.session_state.pop(_inv_orig_key, None)
                                     st.session_state.pop("df_accs", None)
                                     st.success(

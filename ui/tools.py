@@ -4,7 +4,7 @@ import pandas as pd
 from database.backup import render_backup_restore
 from database.connection import get_connection
 from database.queries import get_price_anomalies, get_missing_tx_prices, get_investments_with_dummy_prices
-from database.crud import delete_historical_prices, insert_prices_from_transactions, normalize_investment_prices
+from database.crud import delete_historical_prices, insert_prices_from_transactions, normalize_investment_prices, update_accounts_balances, update_investment_balances
 from ui.components import copy_df_button
 
 
@@ -830,11 +830,654 @@ def _render_normalize_investments():
         st.caption("Recalculates the Holdings table from Investments data. Run this after normalization to update portfolio quantities and P&L.")
 
 
+def _render_fix_missing_transfer_mirrors():
+    st.subheader("🔄 Fix Missing Transfer Mirrors")
+    st.caption(
+        "Detects transactions that point to a target account "
+        "(**Accounts_Id_Target** is set) but have no corresponding mirror "
+        "transaction recorded on that target account. This happens when cash "
+        "accounts are created after the original transfers were imported, or "
+        "when only one leg of a transfer was saved. "
+        "Transfers involving investment accounts that are linked to a cash account "
+        "(BuyX / SellX / DivX pattern) are excluded automatically. "
+        "The tool creates the missing mirror row and a matching Split, then "
+        "recalculates affected account balances."
+    )
+
+    conn = get_connection()
+
+    # ── Account filter ─────────────────────────────────────────────────────────
+    # Exclude investment accounts that have a linked cash account — they use the
+    # BuyX/SellX pattern and should never appear as mirror targets.
+    df_accs = pd.read_sql(
+        """
+        SELECT accounts_id, accounts_name, accounts_type, accounts_id_linked
+        FROM   Accounts
+        WHERE  is_active = TRUE
+          AND  NOT (
+                   accounts_type IN ('Brokerage', 'Pension', 'Other Investment', 'Margin')
+                   AND accounts_id_linked IS NOT NULL
+               )
+        ORDER BY accounts_name
+        """,
+        conn,
+    )
+    conn.close()
+
+    acc_lookup: dict = dict(zip(df_accs["accounts_id"], df_accs["accounts_name"]))
+
+    filter_acc = st.selectbox(
+        "Filter by target account (account where mirrors are missing):",
+        options=[None] + df_accs["accounts_id"].tolist(),
+        format_func=lambda x: "All accounts" if x is None else acc_lookup.get(x, str(x)),
+        key="fix_mirror_target_filter",
+    )
+
+    # ── Detection SQL ──────────────────────────────────────────────────────────
+    # Two cases:
+    #   1. Transfers_Id is set but the target account has no row with that same ID.
+    #   2. Accounts_Id_Target is set but Transfers_Id is NULL (half-entry).
+    # Investment accounts linked to a cash account are excluded on both sides.
+    target_clause = "AND t.accounts_id_target = %(filter_acc)s" if filter_acc is not None else ""
+    query_params  = {"filter_acc": filter_acc} if filter_acc is not None else {}
+
+    DETECTION_SQL = f"""
+        SELECT
+            t.transactions_id,
+            a_src.accounts_name              AS source_account,
+            t.accounts_id                    AS src_acc_id,
+            t.date,
+            COALESCE(p.payees_name, '')      AS payee,
+            t.description,
+            t.total_amount                   AS source_amount,
+            t.total_amount_target,
+            a_tgt.accounts_name              AS target_account,
+            t.accounts_id_target             AS tgt_acc_id,
+            t.payees_id,
+            t.cleared,
+            t.transfers_id,
+            CASE
+                WHEN t.transfers_id IS NULL THEN 'No Transfers_Id'
+                ELSE 'Mirror missing'
+            END AS issue_type
+        FROM  Transactions t
+        JOIN  Accounts a_src ON a_src.accounts_id = t.accounts_id
+        JOIN  Accounts a_tgt ON a_tgt.accounts_id = t.accounts_id_target
+        LEFT  JOIN Payees p  ON p.payees_id        = t.payees_id
+        LEFT  JOIN Transactions mirror
+               ON  mirror.transfers_id    = t.transfers_id
+               AND mirror.accounts_id     = t.accounts_id_target
+               AND mirror.transactions_id != t.transactions_id
+        WHERE t.accounts_id_target IS NOT NULL
+          AND (
+              (t.transfers_id IS NOT NULL AND mirror.transactions_id IS NULL)
+              OR t.transfers_id IS NULL
+          )
+          -- Exclude investment accounts that have a linked cash account (both sides)
+          AND NOT (
+              a_src.accounts_type IN ('Brokerage', 'Pension', 'Other Investment', 'Margin')
+              AND a_src.accounts_id_linked IS NOT NULL
+          )
+          AND NOT (
+              a_tgt.accounts_type IN ('Brokerage', 'Pension', 'Other Investment', 'Margin')
+              AND a_tgt.accounts_id_linked IS NOT NULL
+          )
+          {target_clause}
+        ORDER BY t.date DESC, t.transactions_id DESC
+    """
+
+    conn = get_connection()
+    df   = pd.read_sql(DETECTION_SQL, conn, params=query_params if query_params else None)
+    conn.close()
+
+    if df.empty:
+        st.success("✅ No missing transfer mirrors found.")
+        return
+
+    all_count = len(df)
+    st.warning(f"⚠️ {all_count:,} transaction(s) are missing their mirror leg.")
+
+    # ── Preview / selection table ──────────────────────────────────────────────
+    df_display = df.copy()
+    df_display["date"] = pd.to_datetime(df_display["date"]).dt.date
+    df_display.insert(0, "Fix", False)
+
+    edited = st.data_editor(
+        df_display[[
+            "Fix", "transactions_id", "issue_type",
+            "date", "source_account", "payee", "description",
+            "source_amount", "total_amount_target", "target_account", "transfers_id",
+        ]],
+        column_config={
+            "Fix":                 st.column_config.CheckboxColumn("Fix", default=False, pinned=True),
+            "transactions_id":     st.column_config.NumberColumn("TX ID", format="%d"),
+            "issue_type":          st.column_config.TextColumn("Issue"),
+            "date":                st.column_config.DateColumn("Date"),
+            "source_account":      st.column_config.TextColumn("Source Account"),
+            "payee":               st.column_config.TextColumn("Payee"),
+            "description":         st.column_config.TextColumn("Description"),
+            "source_amount":       st.column_config.NumberColumn("Source Amount", format="%,.2f"),
+            "total_amount_target": st.column_config.NumberColumn("Target Amount", format="%,.2f"),
+            "target_account":      st.column_config.TextColumn("Target Account (mirror missing)"),
+            "transfers_id":        st.column_config.NumberColumn("Transfers_Id"),
+        },
+        disabled=[
+            "transactions_id", "issue_type", "date", "source_account", "payee",
+            "description", "source_amount", "total_amount_target",
+            "target_account", "transfers_id",
+        ],
+        hide_index=True,
+        width="stretch",
+        key="fix_mirror_editor",
+    )
+
+    to_fix    = edited[edited["Fix"]]
+    sel_count = len(to_fix)
+
+    copy_df_button(df_display.drop(columns=["Fix"]), key="dl_fix_mirror")
+
+    st.divider()
+
+    # ── Action buttons ─────────────────────────────────────────────────────────
+    # "Fix All" is only shown when a specific account is selected.
+    if filter_acc is not None:
+        btn_c1, btn_c2, _ = st.columns([2, 2, 3])
+    else:
+        btn_c1, _ = st.columns([2, 5])
+        btn_c2    = None
+
+    with btn_c1:
+        fix_sel_btn = st.button(
+            f"🔄 Fix {sel_count:,} Selected" if sel_count else "🔄 Fix Selected",
+            type="secondary" if filter_acc is not None else "primary",
+            disabled=(sel_count == 0),
+            key="fix_mirror_sel_btn",
+            width="stretch",
+        )
+
+    fix_all_btn = False
+    if btn_c2 is not None:
+        with btn_c2:
+            fix_all_btn = st.button(
+                f"🔄 Fix All {all_count:,} for this Account",
+                type="primary",
+                key="fix_mirror_all_btn",
+                width="stretch",
+            )
+
+    # ── Stage pending work on button click (shows confirmation next render) ────
+    if fix_sel_btn and sel_count > 0:
+        st.session_state["fix_mirror_pending"] = {
+            "ids":   to_fix["transactions_id"].tolist(),
+            "label": (
+                f"create **{sel_count:,}** mirror transaction(s) "
+                "for the **selected** rows"
+            ),
+        }
+        st.rerun()
+
+    if fix_all_btn:
+        acc_name = acc_lookup.get(filter_acc, str(filter_acc))
+        st.session_state["fix_mirror_pending"] = {
+            "ids":   df["transactions_id"].tolist(),
+            "label": (
+                f"create **{all_count:,}** mirror transaction(s) "
+                f"for **all** listed rows on account **{acc_name}**"
+            ),
+        }
+        st.rerun()
+
+    # ── Confirmation panel ─────────────────────────────────────────────────────
+    pending = st.session_state.get("fix_mirror_pending")
+    if not pending:
+        return
+
+    n_pending = len(pending["ids"])
+    st.warning(
+        f"⚠️ Please confirm: {pending['label']}.\n\n"
+        f"This will INSERT **{n_pending:,}** new Transactions row(s), "
+        "add matching Splits, and recalculate affected account balances. "
+        "**This action cannot be undone automatically.**"
+    )
+
+    conf_yes, conf_no, _ = st.columns([1, 1, 4])
+    with conf_yes:
+        confirmed = st.button(
+            "✅ Yes, create",
+            type="primary",
+            key="fix_mirror_confirm_yes",
+            width="stretch",
+        )
+    with conf_no:
+        if st.button("❌ Cancel", key="fix_mirror_confirm_no", width="stretch"):
+            del st.session_state["fix_mirror_pending"]
+            st.rerun()
+
+    if not confirmed:
+        return
+
+    # ── Execute ────────────────────────────────────────────────────────────────
+    del st.session_state["fix_mirror_pending"]
+
+    sel_rows          = df[df["transactions_id"].isin(pending["ids"])]
+    created           = 0
+    errors: list[str] = []
+    affected_accounts: set[int] = set()
+
+    conn = get_connection()
+    cur  = conn.cursor()
+    try:
+        for _, row in sel_rows.iterrows():
+            src_tx_id    = int(row["transactions_id"])
+            src_acc_id   = int(row["src_acc_id"])
+            tgt_acc_id   = int(row["tgt_acc_id"])
+            tx_date      = row["date"]
+            payees_id    = int(row["payees_id"]) if pd.notna(row["payees_id"]) else None
+            description  = row["description"]
+            src_amount   = float(row["source_amount"]) if pd.notna(row["source_amount"]) else 0.0
+            tgt_raw      = row["total_amount_target"]
+            cleared      = bool(row["cleared"])
+            transfers_id = int(row["transfers_id"]) if pd.notna(row["transfers_id"]) else None
+
+            # Mirror amount: use Total_Amount_Target from source when available
+            # (covers cross-currency transfers); fall back to negating source.
+            # total_amount_target is stored as an absolute value, so we give the
+            # mirror the sign opposite to the source (outgoing → incoming and vice versa).
+            if pd.notna(tgt_raw) and float(tgt_raw) != 0:
+                raw           = float(tgt_raw)
+                mirror_amount = raw if src_amount <= 0 else -raw
+            else:
+                mirror_amount = -src_amount
+
+            # Mirror's Total_Amount_Target = absolute value of the source leg
+            mirror_tgt_amount = abs(src_amount)
+
+            # Ensure Transfers_Id exists — create one when missing and stamp
+            # it on the source leg too so both legs are properly linked.
+            if transfers_id is None:
+                cur.execute("SELECT nextval('transfers_id_seq')")
+                transfers_id = cur.fetchone()[0]
+                cur.execute(
+                    "UPDATE Transactions SET transfers_id = %s WHERE transactions_id = %s",
+                    (transfers_id, src_tx_id),
+                )
+
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO Transactions
+                        (Accounts_Id, Date, Payees_Id, Description,
+                         Total_Amount, Cleared,
+                         Accounts_Id_Target, Total_Amount_Target, Transfers_Id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING Transactions_Id
+                    """,
+                    (
+                        tgt_acc_id, tx_date, payees_id, description,
+                        mirror_amount, cleared,
+                        src_acc_id, mirror_tgt_amount, transfers_id,
+                    ),
+                )
+                mirror_tx_id = cur.fetchone()[0]
+
+                cur.execute(
+                    "INSERT INTO Splits (Transactions_Id, Categories_Id, Amount, Memo) "
+                    "VALUES (%s, NULL, %s, 'Transfer')",
+                    (mirror_tx_id, mirror_amount),
+                )
+
+                affected_accounts.add(src_acc_id)
+                affected_accounts.add(tgt_acc_id)
+                created += 1
+
+            except Exception as row_err:
+                errors.append(f"TX #{src_tx_id}: {row_err}")
+
+        conn.commit()
+
+    except Exception as outer_err:
+        conn.rollback()
+        st.error(f"❌ Commit failed: {outer_err}")
+        return
+    finally:
+        cur.close()
+        conn.close()
+
+    # Recalculate balances from scratch (SUM of Total_Amount per account),
+    # which corrects any double-counting the INSERT trigger may have introduced.
+    for acc_id in affected_accounts:
+        update_accounts_balances(acc_id)
+
+    if errors:
+        st.warning(f"⚠️ {len(errors)} row(s) could not be processed:")
+        for err in errors:
+            st.caption(err)
+
+    if created:
+        st.success(
+            f"✅ Created {created:,} mirror transaction(s). "
+            f"Balances recalculated for {len(affected_accounts)} account(s)."
+        )
+        st.rerun()
+
+
+def _render_fix_missing_investment_cash_links():
+    st.subheader("🔗 Fix Missing Investment Cash Links")
+    st.caption(
+        "Detects investment entries with no linked cash transaction "
+        "(**Transactions_Id IS NULL**) but where a matching transaction already exists "
+        "on the account's linked cash account (matched on date + absolute amount). "
+        "Useful after account reorganisation when both sides exist but were never "
+        "cross-referenced.  Only updates **Investments.Transactions_Id** — no new rows "
+        "are created.  To create brand-new cash transactions instead, use "
+        "**Investment Register → Manage Linked Cash Account**."
+    )
+
+    conn = get_connection()
+
+    # ── Account filter ────────────────────────────────────────────────────────
+    df_inv_accs = pd.read_sql(
+        """
+        SELECT a.accounts_id, a.accounts_name, al.accounts_name AS linked_name
+        FROM   Accounts a
+        JOIN   Accounts al ON al.accounts_id = a.accounts_id_linked
+        WHERE  a.is_active = TRUE
+          AND  a.accounts_id_linked IS NOT NULL
+          AND  a.accounts_type IN ('Brokerage', 'Pension', 'Other Investment', 'Margin')
+        ORDER BY a.accounts_name
+        """,
+        conn,
+    )
+    conn.close()
+
+    if df_inv_accs.empty:
+        st.info("No investment accounts with a linked cash account found.")
+        return
+
+    acc_lookup_inv = {
+        r["accounts_id"]: f"{r['accounts_name']}  →  {r['linked_name']}"
+        for _, r in df_inv_accs.iterrows()
+    }
+
+    filter_acc = st.selectbox(
+        "Filter by investment account:",
+        options=[None] + df_inv_accs["accounts_id"].tolist(),
+        format_func=lambda x: "All accounts" if x is None else acc_lookup_inv.get(x, str(x)),
+        key="fix_inv_link_filter",
+    )
+
+    # ── Detection SQL ─────────────────────────────────────────────────────────
+    # Finds unlinked investment entries where a cash transaction on the linked
+    # account matches on (date, ABS(amount), not already linked elsewhere).
+    acc_clause   = "AND i.accounts_id = %(filter_acc)s" if filter_acc is not None else ""
+    query_params = {"filter_acc": filter_acc} if filter_acc is not None else {}
+
+    DETECTION_SQL = f"""
+        SELECT
+            i.investments_id,
+            a_inv.accounts_name                AS investment_account,
+            i.accounts_id                      AS inv_acc_id,
+            a_cash.accounts_id                 AS cash_acc_id,
+            a_cash.accounts_name               AS cash_account,
+            i.date,
+            i.action,
+            COALESCE(s.securities_name, '—')   AS security,
+            ABS(i.total_amount_acccur)         AS inv_amount,
+            t.transactions_id                  AS candidate_tx_id,
+            t.total_amount                     AS candidate_amount,
+            COALESCE(p.payees_name, '')        AS candidate_payee,
+            t.description                      AS candidate_description
+        FROM  Investments i
+        JOIN  Accounts a_inv  ON a_inv.accounts_id  = i.accounts_id
+        JOIN  Accounts a_cash ON a_cash.accounts_id = a_inv.accounts_id_linked
+        LEFT  JOIN Securities s ON s.securities_id  = i.securities_id
+        JOIN  Transactions t
+              ON  t.accounts_id = a_inv.accounts_id_linked
+              AND t.date        = i.date
+              AND ROUND(ABS(t.total_amount)::numeric, 2)
+                  = ROUND(ABS(i.total_amount_acccur)::numeric, 2)
+              -- Exclude transactions already linked to another investment entry
+              AND NOT EXISTS (
+                  SELECT 1 FROM Investments i2
+                  WHERE  i2.transactions_id = t.transactions_id
+              )
+              -- Exclude transactions that are already part of a complete
+              -- cash-to-cash transfer pair (transfers_id set + mirror exists)
+              AND NOT (
+                  t.transfers_id IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1 FROM Transactions mirror
+                      WHERE  mirror.transfers_id    = t.transfers_id
+                        AND  mirror.transactions_id != t.transactions_id
+                  )
+              )
+        LEFT  JOIN Payees p ON p.payees_id = t.payees_id
+        WHERE i.transactions_id IS NULL
+          AND i.action IN ('Buy', 'Sell', 'Dividend', 'IntInc', 'RtrnCap', 'MiscExp')
+          {acc_clause}
+        ORDER BY i.date DESC, i.investments_id, t.transactions_id
+    """
+
+    conn = get_connection()
+    df   = pd.read_sql(DETECTION_SQL, conn, params=query_params if query_params else None)
+    conn.close()
+
+    if df.empty:
+        st.success(
+            "✅ No linkable pairs found. Either all investment entries are already linked, "
+            "or no matching cash transactions exist on the linked cash account. "
+            "For the latter, use **Investment Register → Manage Linked Cash Account** "
+            "to create new cash transactions."
+        )
+        return
+
+    all_count  = len(df)
+    unique_inv = df["investments_id"].nunique()
+    multi_note = (
+        f"  ({unique_inv} investment entries — some have multiple candidates.)"
+        if unique_inv < all_count else ""
+    )
+    st.warning(f"⚠️ {all_count:,} potential link(s) found.{multi_note}")
+
+    # ── Preview table ─────────────────────────────────────────────────────────
+    df_display = df.copy()
+    df_display["date"] = pd.to_datetime(df_display["date"]).dt.date
+    df_display.insert(0, "Link", False)
+
+    edited = st.data_editor(
+        df_display[[
+            "Link", "investments_id",
+            "investment_account", "date", "action", "security", "inv_amount",
+            "candidate_tx_id", "cash_account",
+            "candidate_amount", "candidate_payee", "candidate_description",
+        ]],
+        column_config={
+            "Link":                  st.column_config.CheckboxColumn("Link", default=False, pinned=True),
+            "investments_id":        st.column_config.NumberColumn("Inv ID",       format="%d"),
+            "investment_account":    st.column_config.TextColumn("Inv Account"),
+            "date":                  st.column_config.DateColumn("Date"),
+            "action":                st.column_config.TextColumn("Action"),
+            "security":              st.column_config.TextColumn("Security"),
+            "inv_amount":            st.column_config.NumberColumn("Inv Amount",   format="%,.2f"),
+            "candidate_tx_id":       st.column_config.NumberColumn("Cash TX ID",   format="%d"),
+            "cash_account":          st.column_config.TextColumn("Cash Account"),
+            "candidate_amount":      st.column_config.NumberColumn("Cash Amount",  format="%,.2f"),
+            "candidate_payee":       st.column_config.TextColumn("Payee"),
+            "candidate_description": st.column_config.TextColumn("Cash Description"),
+        },
+        disabled=[
+            "investments_id", "investment_account", "date", "action", "security",
+            "inv_amount", "candidate_tx_id", "cash_account",
+            "candidate_amount", "candidate_payee", "candidate_description",
+        ],
+        hide_index=True,
+        width="stretch",
+        key="fix_inv_link_editor",
+    )
+
+    to_link   = edited[edited["Link"]]
+    sel_count = len(to_link)
+
+    copy_df_button(df_display.drop(columns=["Link"]), key="dl_fix_inv_link")
+
+    st.divider()
+
+    # ── Action buttons ────────────────────────────────────────────────────────
+    if filter_acc is not None:
+        btn_c1, btn_c2, _ = st.columns([2, 2, 3])
+    else:
+        btn_c1, _ = st.columns([2, 5])
+        btn_c2    = None
+
+    with btn_c1:
+        link_sel_btn = st.button(
+            f"🔗 Link {sel_count:,} Selected" if sel_count else "🔗 Link Selected",
+            type="secondary" if filter_acc is not None else "primary",
+            disabled=(sel_count == 0),
+            key="fix_inv_link_sel_btn",
+            width="stretch",
+        )
+
+    link_all_btn = False
+    if btn_c2 is not None:
+        with btn_c2:
+            link_all_btn = st.button(
+                f"🔗 Link All {unique_inv:,} for this Account",
+                type="primary",
+                key="fix_inv_link_all_btn",
+                width="stretch",
+            )
+
+    # ── Stage pending ─────────────────────────────────────────────────────────
+    if link_sel_btn and sel_count > 0:
+        dupes = to_link[to_link.duplicated("investments_id", keep=False)]
+        if not dupes.empty:
+            st.error(
+                f"⚠️ {dupes['investments_id'].nunique()} investment entr(y/ies) selected "
+                "more than once (ambiguous). Uncheck all but one candidate per investment entry."
+            )
+        else:
+            st.session_state["fix_inv_link_pending"] = {
+                "pairs": list(zip(
+                    to_link["investments_id"].astype(int).tolist(),
+                    to_link["candidate_tx_id"].astype(int).tolist(),
+                )),
+                "label": f"link **{sel_count:,}** investment entr(y/ies) to existing cash transactions",
+            }
+            st.rerun()
+
+    if link_all_btn:
+        # Auto-resolve: for each investment entry take the lowest TX ID (oldest / first candidate)
+        df_first = (
+            df.sort_values("candidate_tx_id")
+              .drop_duplicates("investments_id", keep="first")
+        )
+        pairs    = list(zip(
+            df_first["investments_id"].astype(int).tolist(),
+            df_first["candidate_tx_id"].astype(int).tolist(),
+        ))
+        acc_name = acc_lookup_inv.get(filter_acc, str(filter_acc))
+        st.session_state["fix_inv_link_pending"] = {
+            "pairs": pairs,
+            "label": f"link **{len(pairs):,}** investment entries for **{acc_name}**",
+        }
+        st.rerun()
+
+    # ── Confirmation panel ────────────────────────────────────────────────────
+    pending = st.session_state.get("fix_inv_link_pending")
+    if not pending:
+        return
+
+    n_pending = len(pending["pairs"])
+    st.warning(
+        f"⚠️ Please confirm: {pending['label']}.\n\n"
+        f"This will **UPDATE {n_pending:,}** `Investments.Transactions_Id` value(s) to point "
+        "to the matched cash transaction. No new rows will be created. "
+        "**This action cannot be undone automatically.**"
+    )
+
+    conf_yes, conf_no, _ = st.columns([1, 1, 4])
+    with conf_yes:
+        confirmed = st.button(
+            "✅ Yes, link",
+            type="primary",
+            key="fix_inv_link_confirm_yes",
+            width="stretch",
+        )
+    with conf_no:
+        if st.button("❌ Cancel", key="fix_inv_link_confirm_no", width="stretch"):
+            del st.session_state["fix_inv_link_pending"]
+            st.rerun()
+
+    if not confirmed:
+        return
+
+    # ── Execute ───────────────────────────────────────────────────────────────
+    del st.session_state["fix_inv_link_pending"]
+
+    linked            = 0
+    errors: list[str] = []
+
+    conn = get_connection()
+    cur  = conn.cursor()
+    try:
+        for inv_id, tx_id in pending["pairs"]:
+            try:
+                cur.execute(
+                    "UPDATE Investments SET Transactions_Id = %s "
+                    "WHERE Investments_Id = %s",
+                    (tx_id, inv_id),
+                )
+                linked += 1
+            except Exception as row_err:
+                errors.append(f"Inv #{inv_id} → TX #{tx_id}: {row_err}")
+
+        conn.commit()
+
+    except Exception as outer_err:
+        conn.rollback()
+        st.error(f"❌ Commit failed: {outer_err}")
+        return
+    finally:
+        cur.close()
+        conn.close()
+
+    if errors:
+        st.warning(f"⚠️ {len(errors)} row(s) could not be processed:")
+        for err in errors:
+            st.caption(err)
+
+    if linked:
+        # Refresh investment-account balances (linking changes which entries are
+        # "unlinked" in the balance formula) and the affected cash accounts.
+        update_investment_balances()
+        _linked_tx_ids = [tx_id for _, tx_id in pending["pairs"]]
+        if _linked_tx_ids:
+            _ph = ", ".join(["%s"] * len(_linked_tx_ids))
+            _conn_b = get_connection()
+            try:
+                _cur_b = _conn_b.cursor()
+                _cur_b.execute(
+                    f"SELECT DISTINCT accounts_id FROM Transactions "
+                    f"WHERE transactions_id IN ({_ph})",
+                    _linked_tx_ids,
+                )
+                for (_cash_acc_id,) in _cur_b.fetchall():
+                    update_accounts_balances(_cash_acc_id)
+            finally:
+                _cur_b.close()
+                _conn_b.close()
+        st.success(f"✅ Linked {linked:,} investment entr(y/ies) to existing cash transactions.")
+        st.rerun()
+
+
 _CATEGORIES = {
     "💾 Database": [
         "💾 Backup & Restore",
         "🔧 DB Maintenance",
         "🛢 SQL Interface",
+        "🔄 Fix Missing Transfer Mirrors",
+        "🔗 Fix Missing Investment Cash Links",
     ],
     "📊 Market Data & Prices": [
         "📥 Fill Missing Prices",
@@ -844,12 +1487,14 @@ _CATEGORIES = {
 }
 
 _TOOL_RENDERERS = {
-    "💾 Backup & Restore":       render_backup_restore,
-    "🛢 SQL Interface":          _render_sql_interface,
-    "🔧 DB Maintenance":         _render_db_maintenance,
-    "📥 Fill Missing Prices":    _render_fill_missing_prices,
-    "🔍 Price Quality":          _render_price_quality,
-    "⚖ Normalize Investments":  _render_normalize_investments,
+    "💾 Backup & Restore":              render_backup_restore,
+    "🛢 SQL Interface":                 _render_sql_interface,
+    "🔧 DB Maintenance":                _render_db_maintenance,
+    "🔄 Fix Missing Transfer Mirrors":  _render_fix_missing_transfer_mirrors,
+    "🔗 Fix Missing Investment Cash Links": _render_fix_missing_investment_cash_links,
+    "📥 Fill Missing Prices":           _render_fill_missing_prices,
+    "🔍 Price Quality":                 _render_price_quality,
+    "⚖ Normalize Investments":         _render_normalize_investments,
 }
 
 

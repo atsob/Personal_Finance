@@ -328,8 +328,10 @@ CREATE TABLE Investments (
     Action           Investments_Action NOT NULL,
     Quantity         NUMERIC(28, 18),
     Price_Per_Share  NUMERIC(20, 8),
-    Commission       NUMERIC(20, 8) DEFAULT 0,
-    Total_Amount     NUMERIC(28, 18),
+    Commission          NUMERIC(20, 8) DEFAULT 0,
+    Total_Amount_AccCur NUMERIC(28, 18),             -- total in the investment account currency
+    Total_Amount_SecCur NUMERIC(28, 18),             -- total in the security's native currency
+    FX_Rate             NUMERIC(20, 8) DEFAULT 1.0,  -- rate used at booking: sec_cur → acc_cur
     Description      TEXT,
     Transactions_Id  INTEGER REFERENCES Transactions(Transactions_Id),  -- linked cash-side row (BuyX/SellX/DivX)
     Instrument_Type  Investments_Instrument_Type,  -- optional: actual traded instrument (e.g. CFDOnETF, CFDOnStock)
@@ -344,7 +346,7 @@ CREATE        INDEX IF NOT EXISTS idx_investments_date        ON Investments(Dat
 -- Covering index for P&L reconstruction — eliminates heap fetches for common columns
 CREATE        INDEX IF NOT EXISTS idx_investments_accsec_covering
     ON Investments(Accounts_Id, Securities_Id, Date DESC)
-    INCLUDE (Action, Quantity, Total_Amount, Price_Per_Share);
+    INCLUDE (Action, Quantity, Total_Amount_AccCur, Total_Amount_SecCur, FX_Rate, Price_Per_Share);
 
 
 -- =============================================================================

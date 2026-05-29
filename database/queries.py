@@ -111,8 +111,8 @@ def get_hist_net_worth_data(start_date):
             a.Currencies_Id,
             a.Accounts_Balance - COALESCE((
                 SELECT  
-                    SUM(CASE WHEN Action IN ('CashIn', 'IntInc') THEN Total_Amount 
-                             WHEN Action IN ('CashOut') THEN -Total_Amount 
+                    SUM(CASE WHEN Action IN ('CashIn', 'IntInc') THEN Total_Amount_AccCur
+                             WHEN Action IN ('CashOut') THEN -Total_Amount_AccCur
                              ELSE 0 END)
                 FROM Investments
                 WHERE Accounts_Id = a.Accounts_Id
@@ -386,8 +386,8 @@ def get_net_worth_report_data(start_date: str, interval: str = 'Year', account_i
             a.Accounts_Type,
             GREATEST(0, a.Accounts_Balance - COALESCE((
                 SELECT SUM(CASE
-                    WHEN Action IN ('CashIn', 'IntInc') THEN  Total_Amount
-                    WHEN Action IN ('CashOut')          THEN -Total_Amount
+                    WHEN Action IN ('CashIn', 'IntInc') THEN  Total_Amount_AccCur
+                    WHEN Action IN ('CashOut')          THEN -Total_Amount_AccCur
                     ELSE 0 END)
                 FROM Investments
                 WHERE Accounts_Id = a.Accounts_Id AND Date > p.period_end
@@ -521,7 +521,7 @@ def get_price_anomalies(threshold_pct: float = 100.0, securities_ids: tuple = No
             SELECT
                 i.Date  AS tx_date,
                 i.Action AS tx_action,
-                ROUND((i.Total_Amount / NULLIF(i.Quantity, 0))::numeric, 4) AS tx_price,
+                ROUND((i.Total_Amount_AccCur / NULLIF(i.Quantity, 0))::numeric, 4) AS tx_price,
                 ABS(pn.Date - i.Date) AS days_diff
             FROM Investments i
             WHERE i.Securities_Id = pn.Securities_Id
@@ -607,11 +607,11 @@ def get_investments_with_dummy_prices() -> pd.DataFrame:
     (sell side).
 
     Preview columns:
-      • Buys  — new_qty = Total_Amount / hist_price  (phase-1 formula)
+      • Buys  — new_qty = Total_Amount_SecCur / hist_price  (phase-1 formula)
       • Sells — new_qty = total_buy_qty × (sell_total / all_sell_total)  (phase-2 formula,
                 so positions close correctly)
 
-    Total_Amount is never touched.
+    Total_Amount_AccCur is never touched.
     """
     conn = get_connection()
     df = pd.read_sql("""
@@ -620,11 +620,11 @@ def get_investments_with_dummy_prices() -> pd.DataFrame:
         candidates AS (
             SELECT i.Investments_Id, i.Accounts_Id, i.Securities_Id,
                    i.Date, i.Action::text AS action,
-                   i.Total_Amount, i.Quantity, i.Price_Per_Share
+                   i.Total_Amount_AccCur, i.Quantity, i.Price_Per_Share
             FROM Investments i
             WHERE i.Action IN ('Buy','Sell','Reinvest','ShrIn','ShrOut')
               AND i.Price_Per_Share > 0
-              AND i.Total_Amount    > 0
+              AND i.Total_Amount_AccCur    > 0
               AND (
                   i.Price_Per_Share = FLOOR(i.Price_Per_Share)
                   OR
@@ -640,7 +640,7 @@ def get_investments_with_dummy_prices() -> pd.DataFrame:
         -- Normalised buy totals per (account, security) — used to pin sell quantities
         buy_totals AS (
             SELECT c.Accounts_Id, c.Securities_Id,
-                   SUM(ROUND((c.Total_Amount / NULLIF(hp.Close, 0))::numeric, 6)) AS total_buy_qty
+                   SUM(ROUND((c.Total_Amount_AccCur / NULLIF(hp.Close, 0))::numeric, 6)) AS total_buy_qty
             FROM candidates c
             JOIN Historical_Prices hp
                  ON hp.Securities_Id = c.Securities_Id AND hp.Date = c.Date
@@ -650,7 +650,7 @@ def get_investments_with_dummy_prices() -> pd.DataFrame:
         -- Use ABS so losing trades (negative Total_Amount) don't invert weights
         sell_totals AS (
             SELECT Accounts_Id, Securities_Id,
-                   SUM(ABS(Total_Amount)) AS total_sell_amt_abs
+                   SUM(ABS(Total_Amount_AccCur)) AS total_sell_amt_abs
             FROM candidates
             WHERE action IN ('Sell','ShrOut')
             GROUP BY Accounts_Id, Securities_Id
@@ -663,25 +663,25 @@ def get_investments_with_dummy_prices() -> pd.DataFrame:
             s.Securities_Name                       AS security_name,
             c.Date                                  AS date,
             c.action,
-            c.Total_Amount                          AS total_amount,
+            c.Total_Amount_AccCur                          AS total_amount,
             c.Quantity                              AS current_qty,
             c.Price_Per_Share                       AS current_price,
             hp.Close                                AS hist_price,
             CASE
                 WHEN c.action IN ('Buy','Reinvest','ShrIn') THEN
-                    ROUND((c.Total_Amount / NULLIF(hp.Close, 0))::numeric, 6)
+                    ROUND((c.Total_Amount_AccCur / NULLIF(hp.Close, 0))::numeric, 6)
                 ELSE
                     -- sell: proportional share of total normalised buy qty;
                     -- ABS(Total_Amount) so losing trades (negative) stay positive
                     ROUND((bt.total_buy_qty
-                           * (ABS(c.Total_Amount) / NULLIF(st.total_sell_amt_abs, 0)))::numeric, 6)
+                           * (ABS(c.Total_Amount_AccCur) / NULLIF(st.total_sell_amt_abs, 0)))::numeric, 6)
             END                                     AS new_qty,
             CASE
                 WHEN c.action IN ('Buy','Reinvest','ShrIn') THEN hp.Close
                 ELSE
-                    ROUND((ABS(c.Total_Amount)
+                    ROUND((ABS(c.Total_Amount_AccCur)
                            / NULLIF(bt.total_buy_qty
-                                    * (ABS(c.Total_Amount) / NULLIF(st.total_sell_amt_abs, 0)), 0))::numeric, 4)
+                                    * (ABS(c.Total_Amount_AccCur) / NULLIF(st.total_sell_amt_abs, 0)), 0))::numeric, 4)
             END                                     AS new_price
         FROM candidates c
         JOIN Securities s ON s.Securities_Id = c.Securities_Id
@@ -1279,81 +1279,81 @@ def get_pnl_report_data(start_date: str = '1900-01-01', end_date: str = None):
                 i.Accounts_Id, i.Securities_Id,
                 -- DTD CF
                 SUM(CASE WHEN i.Date > (SELECT dtd_start FROM periods) THEN
-                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share)
-                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share)
+                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share)
+                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share)
                           ELSE 0 END) ELSE 0 END) AS cf_dtd,
                 -- DTD CF EUR
                 SUM(CASE WHEN i.Date > (SELECT dtd_start FROM periods) THEN
-                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
-                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
+                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
+                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
                           ELSE 0 END) ELSE 0 END) AS cf_dtd_eur,
                 -- WTD CF
                 SUM(CASE WHEN i.Date > (SELECT wtd_start FROM periods) THEN
-                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share)
-                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share)
+                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share)
+                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share)
                           ELSE 0 END) ELSE 0 END) AS cf_wtd,
                 -- WTD CF EUR
                 SUM(CASE WHEN i.Date > (SELECT wtd_start FROM periods) THEN
-                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
-                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
+                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
+                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
                           ELSE 0 END) ELSE 0 END) AS cf_wtd_eur,                      
                 -- MTD CF
                 SUM(CASE WHEN i.Date > (SELECT mtd_start FROM periods) THEN
-                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share)
-                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share)
+                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share)
+                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share)
                           ELSE 0 END) ELSE 0 END) AS cf_mtd,
                 -- MTD CF EUR
                 SUM(CASE WHEN i.Date > (SELECT mtd_start FROM periods) THEN
-                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
-                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
+                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
+                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
                           ELSE 0 END) ELSE 0 END) AS cf_mtd_eur,
                 -- QTD CF
                 SUM(CASE WHEN i.Date > (SELECT qtd_start FROM periods) THEN
-                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share)
-                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share)
+                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share)
+                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share)
                           ELSE 0 END) ELSE 0 END) AS cf_qtd,
                 -- QTD CF EUR
                 SUM(CASE WHEN i.Date > (SELECT qtd_start FROM periods) THEN
-                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
-                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
+                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
+                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
                           ELSE 0 END) ELSE 0 END) AS cf_qtd_eur,
                 -- YTD CF
                 SUM(CASE WHEN i.Date > (SELECT ytd_start FROM periods) THEN
-                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share)
-                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share)
+                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share)
+                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share)
                           ELSE 0 END) ELSE 0 END) AS cf_ytd,
                     -- YTD CF EUR
                 SUM(CASE WHEN i.Date > (SELECT ytd_start FROM periods) THEN
-                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
-                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
+                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
+                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
                           ELSE 0 END) ELSE 0 END) AS cf_ytd_eur,
                 -- net_invested_ytd_eur: JOIN replaces per-row correlated subqueries
                 SUM(CASE WHEN i.Date > (SELECT ytd_start FROM periods) THEN
                     CASE WHEN i.Action IN ('Buy', 'CashOut', 'MiscExp')
-                            THEN i.Total_Amount * COALESCE(hfx.FX_Rate, 1)
+                            THEN i.Total_Amount_AccCur * COALESCE(hfx.FX_Rate, 1)
                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'CashIn', 'RtrnCap')
-                            THEN -i.Total_Amount * COALESCE(hfx.FX_Rate, 1)
+                            THEN -i.Total_Amount_AccCur * COALESCE(hfx.FX_Rate, 1)
                          ELSE 0 END
                 ELSE 0 END) AS net_invested_ytd_eur,
                 -- Συνολικό CF (για Realized P&L)
-                SUM(CASE WHEN i.Action IN ('Buy', 'MiscExp', 'Reinvest', 'Exercise', 'ShrIn') THEN COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share)
-                         WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'RtrnCap', 'ShrOut') THEN -COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share)
+                SUM(CASE WHEN i.Action IN ('Buy', 'MiscExp', 'Reinvest', 'Exercise', 'ShrIn') THEN COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share)
+                         WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'RtrnCap', 'ShrOut') THEN -COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share)
                          ELSE 0 END) AS cf_all_time,
                 -- Συνολικό CF (για Realized P&L)
-                SUM(CASE WHEN i.Action IN ('Buy', 'MiscExp', 'Reinvest', 'Exercise', 'ShrIn') THEN COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
-                         WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'RtrnCap', 'ShrOut') THEN -COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
+                SUM(CASE WHEN i.Action IN ('Buy', 'MiscExp', 'Reinvest', 'Exercise', 'ShrIn') THEN COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
+                         WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'RtrnCap', 'ShrOut') THEN -COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
                          ELSE 0 END) AS cf_all_time_eur,
                 -- net_invested_all_time_eur: JOIN replaces per-row correlated subqueries
                 SUM(CASE WHEN i.Action IN ('Buy', 'CashOut', 'MiscExp')
-                            THEN i.Total_Amount * COALESCE(hfx.FX_Rate, 1)
+                            THEN i.Total_Amount_AccCur * COALESCE(hfx.FX_Rate, 1)
                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'CashIn', 'RtrnCap')
-                            THEN -i.Total_Amount * COALESCE(hfx.FX_Rate, 1)
+                            THEN -i.Total_Amount_AccCur * COALESCE(hfx.FX_Rate, 1)
                          ELSE 0 END) AS net_invested_all_time_eur,
                 -- gross_invested_all_time_eur: total cost of all buys (correct denominator for % return)
                 -- Using net_invested as denominator is wrong for closed/profitable positions because
                 -- proceeds from sells make it negative, flipping the sign of the percentage.
                 SUM(CASE WHEN i.Action IN ('Buy', 'CashOut', 'MiscExp')
-                            THEN i.Total_Amount * COALESCE(hfx.FX_Rate, 1)
+                            THEN i.Total_Amount_AccCur * COALESCE(hfx.FX_Rate, 1)
                          ELSE 0 END) AS gross_invested_all_time_eur
             FROM Investments i
             JOIN Accounts a ON i.Accounts_Id = a.Accounts_Id
@@ -1367,7 +1367,7 @@ def get_pnl_report_data(start_date: str = '1900-01-01', end_date: str = None):
                 i.Securities_Id, i.Accounts_Id,
                 SUM(
                     CASE
-                        WHEN i.Action = 'Dividend' THEN i.Total_Amount
+                        WHEN i.Action = 'Dividend' THEN i.Total_Amount_AccCur
                         WHEN i.Action IN ('Reinvest', 'ShrIn') THEN
                             i.Quantity * COALESCE(
                                 NULLIF(i.Price_Per_Share, 0),
@@ -1392,7 +1392,7 @@ def get_pnl_report_data(start_date: str = '1900-01-01', end_date: str = None):
             SELECT
                 i.Accounts_Id,
                 SUM(CASE WHEN i.Action = 'CashIn'
-                         THEN i.Total_Amount * COALESCE(hfx.FX_Rate, 1) ELSE 0 END) AS direct_cashin_eur
+                         THEN i.Total_Amount_AccCur * COALESCE(hfx.FX_Rate, 1) ELSE 0 END) AS direct_cashin_eur
             FROM Investments i
             JOIN Accounts a ON i.Accounts_Id = a.Accounts_Id
             LEFT JOIN Historical_FX hfx
@@ -1629,7 +1629,7 @@ def get_income_expense_data(start_date, end_date, category_id=None, cash_account
             t.Action,
             t.Quantity,
             t.Price_Per_Share,
-            t.Total_Amount,
+            t.Total_Amount_AccCur,
             t.Commission,
             -- Running total of shares bought
             SUM(CASE WHEN t.Action IN ('Buy', 'Reinvest', 'ShrIn') THEN t.Quantity ELSE 0 END) 
@@ -1661,7 +1661,7 @@ def get_income_expense_data(start_date, end_date, category_id=None, cash_account
             f.Investments_Id as sale_id,
             f.Quantity as sold_quantity,
             f.Price_Per_Share as sale_price,
-            f.Total_Amount as sale_amount,
+            f.Total_Amount_AccCur as sale_amount,
             f.Commission as sale_commission,
             f.security_currency_id,
             f.security_currency,
@@ -2230,8 +2230,8 @@ def get_dividend_tracker_data(start_date: str, end_date: str):
                 a.Currencies_Id,
                 SUM(
                     CASE WHEN i.Action = 'MiscExp'
-                    THEN -i.Total_Amount * COALESCE(fx.FX_Rate, 1)
-                    ELSE  i.Total_Amount * COALESCE(fx.FX_Rate, 1)
+                    THEN -i.Total_Amount_AccCur * COALESCE(fx.FX_Rate, 1)
+                    ELSE  i.Total_Amount_AccCur * COALESCE(fx.FX_Rate, 1)
                     END
                 )                                                          AS income_eur,
                 i.Action
@@ -2266,7 +2266,7 @@ def get_dividend_tracker_data(start_date: str, end_date: str):
                 SELECT
                     b.Date                                                                       AS buy_date,
                     b.Quantity                                                                   AS buy_qty,
-                    ABS(b.Total_Amount) * COALESCE(fx2.FX_Rate, 1) / NULLIF(b.Quantity, 0)     AS cost_per_unit_eur,
+                    ABS(b.Total_Amount_AccCur) * COALESCE(fx2.FX_Rate, 1) / NULLIF(b.Quantity, 0)     AS cost_per_unit_eur,
                     SUM(b.Quantity) OVER (ORDER BY b.Date, b.Investments_Id)                    AS running_buy_qty
                 FROM Investments b
                 JOIN  Accounts a2 ON b.Accounts_Id      = a2.Accounts_Id
@@ -3165,8 +3165,8 @@ def get_investment_income_report(tax_year: int):
                 --    THEN ABS(t_cash.Total_Amount)
                     THEN t_cash.Total_Amount 
                 WHEN c.Currencies_ShortName != 'EUR'
-                --    THEN ABS(i.Total_Amount) * COALESCE(
-                    THEN i.Total_Amount * COALESCE(
+                --    THEN ABS(i.Total_Amount_AccCur) * COALESCE(
+                    THEN i.Total_Amount_AccCur * COALESCE(
                         (SELECT fx.FX_Rate FROM Historical_FX fx
                          WHERE fx.Currencies_Id_1 = c.Currencies_Id
                            AND fx.Date <= i.Date
@@ -3175,8 +3175,8 @@ def get_investment_income_report(tax_year: int):
                          WHERE fx.Currencies_Id_1 = c.Currencies_Id
                          ORDER BY fx.Date ASC LIMIT 1),
                         1.0)
-            --    ELSE ABS(i.Total_Amount)
-                ELSE i.Total_Amount
+            --    ELSE ABS(i.Total_Amount_AccCur)
+                ELSE i.Total_Amount_AccCur
             END                                                             AS amount_eur
         FROM Investments i
         JOIN Securities   s      ON s.Securities_Id      = i.Securities_Id
@@ -3185,8 +3185,8 @@ def get_investment_income_report(tax_year: int):
         LEFT JOIN Transactions t_cash ON t_cash.Transactions_Id = i.Transactions_Id
         WHERE i.Action IN ('Dividend', 'IntInc', 'Reinvest', 'RtrnCap')
           AND EXTRACT(year FROM i.Date) = %(tax_year)s
-    --      AND i.Total_Amount > 0
-          AND i.Total_Amount <> 0
+    --      AND i.Total_Amount_AccCur > 0
+          AND i.Total_Amount_AccCur <> 0
         ORDER BY i.Date DESC, s.Securities_Name
     """, conn, params={"tax_year": tax_year})
     conn.close()
@@ -3271,7 +3271,7 @@ def get_capital_gains_report(tax_year: int):
                 i.Date,
                 i.Action,
                 i.Quantity,
-                i.Total_Amount,
+                i.Total_Amount_AccCur,
                 i.Price_Per_Share,
                 i.Transactions_Id,
                 CASE
@@ -3281,7 +3281,7 @@ def get_capital_gains_report(tax_year: int):
                     THEN ABS(t_cash.Total_Amount)
                     -- No link: convert native amount at the closest historical FX rate.
                     WHEN c.Currencies_ShortName != 'EUR'
-                    THEN ABS(i.Total_Amount) * COALESCE(
+                    THEN ABS(i.Total_Amount_AccCur) * COALESCE(
                         (SELECT fx.FX_Rate
                          FROM Historical_FX fx
                          WHERE fx.Currencies_Id_1 = c.Currencies_Id
@@ -3294,7 +3294,7 @@ def get_capital_gains_report(tax_year: int):
                         1.0
                     )
                     -- Already EUR.
-                    ELSE ABS(i.Total_Amount)
+                    ELSE ABS(i.Total_Amount_AccCur)
                 END AS amount_eur,
                 -- Store whether the linked cash tx was used (for transparency).
                 (i.Transactions_Id IS NOT NULL AND t_cash.Total_Amount IS NOT NULL) AS has_linked_tx
@@ -3385,13 +3385,13 @@ def get_capital_gains_report(tax_year: int):
             -- Cost basis in EUR: WAC from buys (each already EUR via linked tx or FX)
             ABS(i.Quantity) * COALESCE(
                 bb.wac_per_share_eur,
-                i.Price_Per_Share * (itf.amount_eur / NULLIF(ABS(i.Total_Amount), 0))
+                i.Price_Per_Share * (itf.amount_eur / NULLIF(ABS(i.Total_Amount_AccCur), 0))
             )                                                               AS cost_basis_eur,
             -- Gain/Loss = EUR proceeds − EUR cost basis
             itf.amount_eur
                 - ABS(i.Quantity) * COALESCE(
                     bb.wac_per_share_eur,
-                    i.Price_Per_Share * (itf.amount_eur / NULLIF(ABS(i.Total_Amount), 0))
+                    i.Price_Per_Share * (itf.amount_eur / NULLIF(ABS(i.Total_Amount_AccCur), 0))
                 )                                                           AS gain_loss_eur,
             CASE
                 WHEN lb.last_buy_date IS NULL
@@ -4122,19 +4122,19 @@ def get_all_inv_txns_for_gains():
                     WHEN i.Transactions_Id IS NOT NULL AND t_cash.Total_Amount IS NOT NULL
                         THEN ABS(t_cash.Total_Amount)
                     WHEN c.Currencies_ShortName != 'EUR'
-                        THEN ABS(i.Total_Amount) * COALESCE(
+                        THEN ABS(i.Total_Amount_AccCur) * COALESCE(
                             (SELECT fx.FX_Rate FROM Historical_FX fx
                              WHERE fx.Currencies_Id_1 = c.Currencies_Id
                                AND fx.Date <= i.Date
                              ORDER BY fx.Date DESC LIMIT 1), 1.0)
-                    ELSE ABS(i.Total_Amount)
+                    ELSE ABS(i.Total_Amount_AccCur)
                 END AS amount_eur
             FROM Investments i
             JOIN Securities s   ON s.Securities_Id = i.Securities_Id
             JOIN Currencies c   ON c.Currencies_Id = s.Currencies_Id
             LEFT JOIN Transactions t_cash ON t_cash.Transactions_Id = i.Transactions_Id
             WHERE i.Action IN ('Buy','Sell','Reinvest','ShrIn','ShrOut','Expire','CashIn','CashOut')
-              AND i.Total_Amount IS NOT NULL
+              AND i.Total_Amount_AccCur IS NOT NULL
         )
         SELECT
             te.*,
@@ -4180,19 +4180,19 @@ def get_investment_cashflows(account_ids: tuple = None):
                 WHEN i.Transactions_Id IS NOT NULL AND t_cash.Total_Amount IS NOT NULL
                     THEN ABS(t_cash.Total_Amount)
                 WHEN c.Currencies_ShortName != 'EUR'
-                    THEN ABS(i.Total_Amount) * COALESCE(
+                    THEN ABS(i.Total_Amount_AccCur) * COALESCE(
                         (SELECT fx.FX_Rate FROM Historical_FX fx
                          WHERE fx.Currencies_Id_1 = c.Currencies_Id
                            AND fx.Date <= i.Date
                          ORDER BY fx.Date DESC LIMIT 1), 1.0)
-                ELSE ABS(i.Total_Amount)
+                ELSE ABS(i.Total_Amount_AccCur)
             END AS cashflow_eur
         FROM Investments i
         JOIN Securities s ON s.Securities_Id = i.Securities_Id
         JOIN Currencies c ON c.Currencies_Id = s.Currencies_Id
         LEFT JOIN Transactions t_cash ON t_cash.Transactions_Id = i.Transactions_Id
         WHERE i.Action IN ('Buy','Sell','Dividend','IntInc','RtrnCap','CashIn','CashOut','MiscExp')
-          AND i.Total_Amount IS NOT NULL
+          AND i.Total_Amount_AccCur IS NOT NULL
           {acct_filter}
         ORDER BY i.Date
     """, conn)

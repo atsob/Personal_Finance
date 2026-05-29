@@ -398,25 +398,54 @@ def parse_saxo_transactions_pdf(
 
                     instr_name = " ".join(parts).strip().rstrip("-").strip()
 
-                # ── Amount ────────────────────────────────────────────────────
-                # Scan right-to-left through the amount columns.
-                # Skip exact zeros — they indicate a non-amount column was hit
-                # (e.g. Quantity = 0.000 or an empty cell).
-                amount_toks = _col(row, _X_TYPE_MAX, 9999)
-                amount: float | None = None
-                for tok in reversed(amount_toks):
-                    v = _to_float(tok)
+                # ── Amount columns ────────────────────────────────────────────
+                # The PDF can have up to three numeric columns right of the Type
+                # column (x0 >= _X_TYPE_MAX), left-to-right:
+                #   [1] Amount in instrument currency  (only present for FX entries)
+                #   [2] Conversion Rate                (only present for FX entries)
+                #   [3] Amount in account currency (EUR) — always the rightmost
+                #
+                # Collect all non-zero floats with their x-positions, sorted L→R.
+                amt_words = sorted(
+                    [w for w in row if w["x0"] >= _X_TYPE_MAX],
+                    key=lambda w: w["x0"],
+                )
+                amt_vals: list[tuple[float, float]] = []   # (x0, value)
+                for w in amt_words:
+                    v = _to_float(w["text"])
                     if v is not None and v != 0.0:
-                        amount = v
-                        break
+                        amt_vals.append((w["x0"], v))
 
-                if amount is None:
+                if not amt_vals:
                     log.debug(
                         "saxo_pdf_parser: no non-zero amount on row %d; tokens=%s",
-                        row_idx, amount_toks,
+                        row_idx, [w["text"] for w in amt_words],
                     )
                     prev_name = ""
                     continue
+
+                # Rightmost value = account-currency (EUR) total
+                amount = amt_vals[-1][1]
+
+                # Derive security-currency amount and FX rate from column count
+                # by computing the ratio: our FX_Rate = |EUR amount| / |sec amount|
+                # (acc/sec direction, e.g. EUR per USD).
+                _pdf_sec_amt: float | None = None
+                _pdf_fx_rate: float | None = None
+
+                if len(amt_vals) == 3:
+                    # [sec_amount, conv_rate_token, eur_amount]
+                    # Use the actual amounts (left and right) rather than the PDF's
+                    # rate token, as that avoids any direction ambiguity.
+                    _pdf_sec_amt = abs(amt_vals[0][1])
+                    if _pdf_sec_amt:
+                        _pdf_fx_rate = round(abs(amount) / _pdf_sec_amt, 8)
+                elif len(amt_vals) == 2:
+                    # [sec_amount, eur_amount] — no explicit rate column
+                    _pdf_sec_amt = abs(amt_vals[0][1])
+                    if _pdf_sec_amt:
+                        _pdf_fx_rate = round(abs(amount) / _pdf_sec_amt, 8)
+                # Single value → EUR-only entry; sec_amt and fx_rate stay None
 
                 # ── Currency ──────────────────────────────────────────────────
                 ccy_toks = _col(row, _X_INSTR_MAX, _X_CCY_MAX)
@@ -456,6 +485,9 @@ def parse_saxo_transactions_pdf(
                     "price":           0.0,
                     "commission":      0.0,
                     "total_eur":       round(abs(amount), 2),
+                    # Multi-currency fields — populated when Conversion Rate is present
+                    "total_sec_cur":   round(_pdf_sec_amt, 8) if _pdf_sec_amt else None,
+                    "fx_rate_db":      _pdf_fx_rate,
                     "exchange":        "",
                     "account_id_str":  account_id,
                     "charge_type":     charge_type,

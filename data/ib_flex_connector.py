@@ -735,7 +735,7 @@ def run_import(
 ) -> dict:
     """Insert parsed IB records into the database."""
     from database.connection import get_connection
-    from database.crud import update_holdings, update_accounts_balances
+    from database.crud import update_holdings, update_accounts_balances, update_investment_balances
 
     conn = get_connection()
     cur  = conn.cursor()
@@ -774,15 +774,22 @@ def run_import(
             if not replace_mode and _inv_exists(cur, account_id, rec["desc"]):
                 counts["investments_skip"] += 1
             else:
+                # IB supplies fxRateToBase (sec_cur → acc_cur) directly in the record.
+                _ib_fx       = float(rec.get("fx_rate") or 1.0)
+                _ib_sec_amt  = (round(rec["total_eur"] / _ib_fx, 18)
+                                if _ib_fx else rec["total_eur"])
                 cur.execute(
                     """INSERT INTO Investments
                            (Accounts_Id, Securities_Id, Date, Action, Quantity,
-                            Price_Per_Share, Commission, Total_Amount, Description)
-                       VALUES (%s, %s, %s, %s::investments_action, %s, %s, %s, %s, %s)""",
+                            Price_Per_Share, Commission,
+                            Total_Amount_AccCur, Total_Amount_SecCur, FX_Rate,
+                            Description)
+                       VALUES (%s, %s, %s, %s::investments_action, %s, %s, %s, %s, %s, %s, %s)""",
                     (account_id, sec_id, rec["date"], rec["action"],
                      rec["quantity"], rec["price"],
                      rec.get("commission") or None,
-                     rec["total_eur"], rec["desc"]),
+                     rec["total_eur"], _ib_sec_amt, _ib_fx,
+                     rec["desc"]),
                 )
                 counts["investments"] += 1
             done += 1
@@ -807,11 +814,21 @@ def run_import(
         conn.commit()
         update_holdings()
         update_accounts_balances()
+        update_investment_balances()
 
     except Exception:
         conn.rollback()
         raise
     finally:
         cur.close()
+
+    # Auto-create linked cash transactions when the investment account has a
+    # configured linked cash account (look up from DB to be authoritative).
+    from database.crud import create_linked_cash_transactions_for_unlinked, get_linked_account_id
+    _ib_linked = get_linked_account_id(account_id)
+    if _ib_linked:
+        create_linked_cash_transactions_for_unlinked(account_id, _ib_linked)
+        update_accounts_balances(_ib_linked)
+        update_investment_balances()
 
     return counts

@@ -1103,13 +1103,18 @@ def run_import(
             if not replace_mode and _investment_exists(cur, account_id, rec['desc']):
                 counts['investments_skip'] += 1
             else:
+                # FxPro is EUR-based; all amounts already in EUR → FX_Rate = 1.0
                 cur.execute(
                     """INSERT INTO Investments
                            (Accounts_Id, Securities_Id, Date, Action, Quantity,
-                            Price_Per_Share, Total_Amount, Description)
-                       VALUES (%s, %s, %s, %s::investments_action, %s, %s, %s, %s)""",
+                            Price_Per_Share,
+                            Total_Amount_AccCur, Total_Amount_SecCur, FX_Rate,
+                            Description)
+                       VALUES (%s, %s, %s, %s::investments_action, %s, %s, %s, %s, %s, %s)""",
                     (account_id, sec_id, rec['date'], rec['action'],
-                     rec['quantity'], rec['price'], rec['total_eur'], rec['desc']),
+                     rec['quantity'], rec['price'],
+                     rec['total_eur'], rec['total_eur'], 1.0,
+                     rec['desc']),
                 )
                 counts['investments'] += 1
             done += 1
@@ -1142,6 +1147,15 @@ def run_import(
     finally:
         cur.close()
         conn.close()
+
+    # Auto-create linked cash transactions when the investment account has a
+    # configured linked cash account.
+    from database.crud import create_linked_cash_transactions_for_unlinked, get_linked_account_id
+    _fx_linked = get_linked_account_id(account_id)
+    if _fx_linked:
+        create_linked_cash_transactions_for_unlinked(account_id, _fx_linked)
+        update_accounts_balances(_fx_linked)
+        update_investment_balances()
 
     return counts
 

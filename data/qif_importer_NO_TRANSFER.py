@@ -404,11 +404,15 @@ class QIFImporter:
                         comm = tx.commission if hasattr(tx, 'commission') and tx.commission else 0
                         amt = tx.amount if hasattr(tx, 'amount') and tx.amount else 0
                         
+                        # QIF has no FX data; FX_Rate = 1.0, SecCur = AccCur
                         self.cur.execute("""
-                            INSERT INTO Investments 
-                            (Accounts_Id, Securities_Id, Date, Action, Quantity, Price_Per_Share, Commission, Total_Amount, Description)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        """, (c_acc_id, c_sec_id, tx.date, my_action, qnt, prc, comm, amt, 
+                            INSERT INTO Investments
+                            (Accounts_Id, Securities_Id, Date, Action, Quantity, Price_Per_Share, Commission,
+                             Total_Amount_AccCur, Total_Amount_SecCur, FX_Rate,
+                             Description)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """, (c_acc_id, c_sec_id, tx.date, my_action, qnt, prc, comm,
+                              amt, amt, 1.0,
                               tx.memo if hasattr(tx, 'memo') else None))
                         
                         inv_tx_count += 1

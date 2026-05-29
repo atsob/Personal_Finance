@@ -1142,6 +1142,19 @@ def render_revolut_brokerage_import() -> None:
         "(stocks/ETF brokerage) account using the CSV export from the Revolut app."
     )
 
+    # ── Restore last-used account (first render only) ────────────────────────
+    from database.queries import get_app_setting, save_app_setting
+    if "revt_account" not in st.session_state:
+        _saved = get_app_setting("revt_account_id")
+        if _saved:
+            try:
+                _row = _load_accounts()
+                _row = _row[_row["accounts_id"] == int(_saved)]
+                if not _row.empty:
+                    st.session_state["revt_account"] = _row.iloc[0]["accounts_name"]
+            except Exception:
+                pass
+
     with st.expander("ℹ️ How to export from Revolut Trading (click to expand)", expanded=False):
         st.markdown("""
 1. Open the **Revolut app** → tap **Stocks** (or **Investing**).
@@ -1396,6 +1409,10 @@ def render_revolut_brokerage_import() -> None:
                     prog.empty()
                     st.success("✅ Import complete!")
                     _import_summary(counts)
+                    try:
+                        save_app_setting("revt_account_id", str(acc_id))
+                    except Exception:
+                        pass
                     for k in ("revt_parsed", "revt_inv_records", "revt_tx_records",
                               "revt_df_raw", "revt_existing_inv", "revt_existing_tx",
                               "revt_fuzzy_inv", "revt_fuzzy_tx", "revt_sec_matches",
@@ -1572,6 +1589,19 @@ def render_revolut_savings_import() -> None:
         "Import buys, daily interest and service fees from a **Revolut Savings** "
         "(Flexible Cash Funds / money-market) account using the savings statement CSV."
     )
+
+    # ── Restore last-used account (first render only) ────────────────────────
+    from database.queries import get_app_setting, save_app_setting
+    if "revs_account" not in st.session_state:
+        _saved = get_app_setting("revs_account_id")
+        if _saved:
+            try:
+                _row = _load_accounts()
+                _row = _row[_row["accounts_id"] == int(_saved)]
+                if not _row.empty:
+                    st.session_state["revs_account"] = _row.iloc[0]["accounts_name"]
+            except Exception:
+                pass
 
     with st.expander("ℹ️ How to export from Revolut Savings (click to expand)", expanded=False):
         st.markdown("""
@@ -1922,6 +1952,10 @@ def render_revolut_savings_import() -> None:
                     prog.empty()
                     st.success("✅ Import complete!")
                     _import_summary(counts)
+                    try:
+                        save_app_setting("revs_account_id", str(acc_id))
+                    except Exception:
+                        pass
                     for k in ("revs_parsed", "revs_parsed_mode",
                               "revs_inv_records", "revs_tx_records",
                               "revs_df_raw", "revs_existing_inv", "revs_existing_tx",
@@ -2162,6 +2196,18 @@ detects the format automatically.
         st.session_state["cb_api_secret"] = get_app_setting("cb_api_secret") or ""
         if st.session_state["cb_api_key"]:
             st.session_state.setdefault("cb_remember", True)
+
+    # ── Restore last-used account (first render only) ────────────────────────
+    if "cb_account" not in st.session_state:
+        _saved_cb = get_app_setting("cb_account_id")
+        if _saved_cb:
+            try:
+                _cb_row = _load_accounts()
+                _cb_row = _cb_row[_cb_row["accounts_id"] == int(_saved_cb)]
+                if not _cb_row.empty:
+                    st.session_state["cb_account"] = _cb_row.iloc[0]["accounts_name"]
+            except Exception:
+                pass
 
     col1, col2 = st.columns(2)
     with col1:
@@ -2501,6 +2547,10 @@ detects the format automatically.
                     prog.empty()
                     st.success("✅ Import complete!")
                     _import_summary(counts)
+                    try:
+                        save_app_setting("cb_account_id", str(acc_id))
+                    except Exception:
+                        pass
                     for k in ("cb_parsed", "cb_inv_records", "cb_tx_records",
                               "cb_raw_txn_count", "cb_existing_inv", "cb_existing_tx",
                               "cb_fuzzy_inv", "cb_fuzzy_tx", "cb_sec_matches",
@@ -3862,6 +3912,19 @@ def render_revolut_import() -> None:
         "CSV statement export from the Revolut app."
     )
 
+    # ── Restore last-used account (first render only) ────────────────────────
+    from database.queries import get_app_setting, save_app_setting
+    if "rev_account" not in st.session_state:
+        _saved = get_app_setting("rev_account_id")
+        if _saved:
+            try:
+                _row = _load_accounts()
+                _row = _row[_row["accounts_id"] == int(_saved)]
+                if not _row.empty:
+                    st.session_state["rev_account"] = _row.iloc[0]["accounts_name"]
+            except Exception:
+                pass
+
     with st.expander("ℹ️ How to export from Revolut (click to expand)", expanded=False):
         st.markdown("""
 1. Open the **Revolut app** → tap your account.
@@ -4003,6 +4066,10 @@ def render_revolut_import() -> None:
                 prog.empty()
                 st.success("✅ Import complete!")
                 _import_summary(counts)
+                try:
+                    save_app_setting("rev_account_id", str(acc_id))
+                except Exception:
+                    pass
                 for k in ("rev_parsed", "rev_inv_records", "rev_tx_records", "rev_df_raw"):
                     st.session_state.pop(k, None)
                 _load_accounts.clear()

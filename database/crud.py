@@ -85,10 +85,10 @@ def execute_db_save(df_original, df_edited, table_name, id_col, current_acc_id=N
                 # UPDATE by PK is cheap and safe.
                 #
                 # Convention (mirrors the investment creation logic):
-                #   Investments.total_amount        → in investment-account currency
-                #   Transactions.total_amount       → in cash-account currency
-                #                                     (= inv total when same currency,
-                #                                      = inv total × FX rate otherwise)
+                #   Investments.total_amount_acccur → in investment-account currency
+                #   Transactions.total_amount        → in cash-account currency
+                #                                      (= inv total when same currency,
+                #                                       = inv total × FX rate otherwise)
                 #   Transactions.total_amount_target → abs(inv total) in investment
                 #                                      account currency (always)
                 _inv_acc_ids_to_refresh = set()
@@ -98,7 +98,7 @@ def execute_db_save(df_original, df_edited, table_name, id_col, current_acc_id=N
                         continue
                     inv_acc_id = _safe_val(row.get('accounts_id'))
                     new_date   = _safe_val(row.get('date'))
-                    new_total  = _safe_val(row.get('total_amount'))
+                    new_total  = _safe_val(row.get('total_amount_acccur'))
                     action     = str(row.get('action', '') or '')
                     cash_out   = action in {'Buy', 'MiscExp'}
 
@@ -275,19 +275,29 @@ def execute_db_save(df_original, df_edited, table_name, id_col, current_acc_id=N
         if table_name == "Transactions" and current_acc_id:
             update_accounts_balances(current_acc_id)
             st.session_state.balance_update_counter = st.session_state.get('balance_update_counter', 0) + 1
+            # Invalidate the account list cache so the selectbox reflects new balances.
+            st.session_state.pop("df_accs", None)
 
-        if table_name == "Investments" and _inv_acc_ids_to_refresh:
-            # Recalculate balances for all cash accounts whose linked transactions
-            # were just updated so the account summary stays in sync.
-            for _aid in _inv_acc_ids_to_refresh:
-                update_accounts_balances(_aid)
-            # Clear the transaction-register session-state cache for every affected
-            # cash account so the next render re-fetches fresh data from the DB.
-            # Cache keys follow the pattern: set_reg_{acc_id}_{tab_key}_{hash}_orig
-            _cash_prefix_set = {f"set_reg_{_aid}_" for _aid in _inv_acc_ids_to_refresh}
-            for _k in list(st.session_state.keys()):
-                if any(_k.startswith(pfx) for pfx in _cash_prefix_set) and _k.endswith("_orig"):
-                    st.session_state.pop(_k, None)
+        if table_name == "Investments":
+            # Always recalculate investment-account balances after any Investments save.
+            update_investment_balances()
+            # Increment counter so the account selectbox widget key changes and
+            # Streamlit re-reads the freshly fetched df_accs on the next render.
+            st.session_state.balance_update_counter = st.session_state.get('balance_update_counter', 0) + 1
+            # Invalidate the account list cache so balances in the selectbox are fresh.
+            st.session_state.pop("df_accs", None)
+            if _inv_acc_ids_to_refresh:
+                # Recalculate balances for all cash accounts whose linked transactions
+                # were just updated so the account summary stays in sync.
+                for _aid in _inv_acc_ids_to_refresh:
+                    update_accounts_balances(_aid)
+                # Clear the transaction-register session-state cache for every affected
+                # cash account so the next render re-fetches fresh data from the DB.
+                # Cache keys follow the pattern: set_reg_{acc_id}_{tab_key}_{hash}_orig
+                _cash_prefix_set = {f"set_reg_{_aid}_" for _aid in _inv_acc_ids_to_refresh}
+                for _k in list(st.session_state.keys()):
+                    if any(_k.startswith(pfx) for pfx in _cash_prefix_set) and _k.endswith("_orig"):
+                        st.session_state.pop(_k, None)
 
         st.success(f"Saved: {len(df_updates)} updates, {len(df_new)} new, {len(ids_to_delete)} deletions")
         st.rerun()
@@ -432,11 +442,11 @@ def update_pension_balances():
         cur.execute("""
             UPDATE Accounts a
             SET Accounts_Balance = COALESCE((
-                SELECT  
-                    SUM(CASE WHEN Action IN ('CashIn', 'IntInc') THEN Total_Amount 
-                             WHEN Action IN ('CashOut') THEN -Total_Amount 
+                SELECT
+                    SUM(CASE WHEN Action IN ('CashIn', 'IntInc') THEN Total_Amount_AccCur
+                             WHEN Action IN ('CashOut') THEN -Total_Amount_AccCur
                              ELSE 0 END)
-                FROM Investments t 
+                FROM Investments t
                 WHERE t.Accounts_Id = a.Accounts_Id
             ), 0)
             WHERE a.Accounts_Type IN ('Pension');
@@ -457,11 +467,12 @@ def update_investment_balances():
             UPDATE Accounts a
             SET Accounts_Balance = COALESCE((
                 SELECT
-                    SUM(CASE WHEN Action IN ('Dividend', 'CashIn', 'IntInc', 'MiscInc', 'Sell') THEN Total_Amount
-                             WHEN Action IN ('CashOut', 'MiscExp', 'Buy') THEN -Total_Amount
+                    SUM(CASE WHEN Action IN ('Dividend', 'CashIn', 'IntInc', 'MiscInc', 'Sell') THEN Total_Amount_AccCur
+                             WHEN Action IN ('CashOut', 'MiscExp', 'Buy') THEN -Total_Amount_AccCur
                              ELSE 0 END)
                 FROM Investments t
                 WHERE t.Accounts_Id = a.Accounts_Id
+				AND (t.Transactions_Id IS NULL OR t.Transactions_Id NOT IN (SELECT Transactions_Id FROM Transactions))                 
             ), 0) +  COALESCE((
                     SELECT SUM(Total_Amount) 
                     FROM Transactions t 
@@ -475,6 +486,127 @@ def update_investment_balances():
     finally:
         cur.close()
         conn.close()
+
+_LINKED_TX_VIABLE_ACTIONS = frozenset({'Buy', 'Sell', 'Dividend', 'IntInc', 'RtrnCap', 'MiscExp'})
+_LINKED_TX_CASH_OUT      = frozenset({'Buy', 'MiscExp'})
+
+
+def _get_or_create_payee_in_cur(cur, name: str) -> "int | None":
+    """Look up or insert a Payees row.  Commit is the caller's responsibility."""
+    if not name:
+        return None
+    name = name.strip()
+    if not name:
+        return None
+    cur.execute("SELECT Payees_Id FROM Payees WHERE Payees_Name = %s LIMIT 1", (name,))
+    row = cur.fetchone()
+    if row:
+        return row[0]
+    cur.execute(
+        "INSERT INTO Payees (Payees_Name) VALUES (%s) RETURNING Payees_Id", (name,)
+    )
+    return cur.fetchone()[0]
+
+
+def create_linked_cash_transactions_for_unlinked(
+    acc_id: int,
+    linked_acc_id: int,
+) -> "tuple[int, list[str]]":
+    """Create cash transactions on *linked_acc_id* for every unlinked investment
+    entry in *acc_id* that has a viable action (Buy / Sell / Dividend / IntInc /
+    RtrnCap / MiscExp) and then sets ``Investments.Transactions_Id`` to point to
+    the newly created row.
+
+    Designed to be called after an import commit so that investment accounts with
+    a configured linked cash account automatically get their cash-side entries.
+
+    Returns ``(created_count, error_list)``.  Callers should invoke
+    ``update_investment_balances()`` and ``update_accounts_balances(linked_acc_id)``
+    after this function returns.
+    """
+    conn = get_connection()
+    cur  = conn.cursor()
+    created = 0
+    errors: list[str] = []
+
+    try:
+        cur.execute(
+            """
+            SELECT i.investments_id,
+                   i.date,
+                   i.action,
+                   i.total_amount_acccur,
+                   i.description,
+                   s.securities_name
+            FROM   Investments i
+            LEFT   JOIN Securities s ON s.securities_id = i.securities_id
+            WHERE  i.accounts_id     = %s
+              AND  i.transactions_id IS NULL
+              AND  i.action IN ('Buy', 'Sell', 'Dividend', 'IntInc', 'RtrnCap', 'MiscExp')
+            ORDER  BY i.date, i.investments_id
+            """,
+            (acc_id,),
+        )
+        rows = cur.fetchall()
+
+        for inv_id, inv_date, action, total_acc, description, sec_name in rows:
+            cur.execute("SAVEPOINT cltx_sp")
+            try:
+                label     = sec_name or description or action or ""
+                total_f   = float(total_acc or 0)
+                cash_sign = -abs(total_f) if action in _LINKED_TX_CASH_OUT else abs(total_f)
+                payee_id  = _get_or_create_payee_in_cur(cur, label)
+
+                cur.execute(
+                    """
+                    INSERT INTO Transactions
+                        (Accounts_Id, Date, Payees_Id, Description,
+                         Total_Amount, Cleared,
+                         Accounts_Id_Target, Total_Amount_Target, Transfers_Id)
+                    VALUES (%s, %s, %s, %s, %s, TRUE, %s, %s, NULL)
+                    RETURNING Transactions_Id
+                    """,
+                    (linked_acc_id, inv_date, payee_id, label or action,
+                     cash_sign, acc_id, abs(total_f)),
+                )
+                tx_id = cur.fetchone()[0]
+
+                cur.execute(
+                    "UPDATE Investments SET Transactions_Id = %s WHERE Investments_Id = %s",
+                    (tx_id, inv_id),
+                )
+                cur.execute("RELEASE SAVEPOINT cltx_sp")
+                created += 1
+            except Exception as row_err:
+                cur.execute("ROLLBACK TO SAVEPOINT cltx_sp")
+                errors.append(f"Inv #{inv_id}: {row_err}")
+
+        conn.commit()
+    except Exception as outer_err:
+        conn.rollback()
+        errors.append(f"Outer error: {outer_err}")
+    finally:
+        cur.close()
+        conn.close()
+
+    return created, errors
+
+
+def get_linked_account_id(acc_id: int) -> "int | None":
+    """Return ``Accounts_Id_Linked`` for *acc_id*, or ``None`` if not set."""
+    conn = get_connection()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT Accounts_Id_Linked FROM Accounts WHERE Accounts_Id = %s",
+            (acc_id,),
+        )
+        row = cur.fetchone()
+        return int(row[0]) if row and row[0] is not None else None
+    finally:
+        cur.close()
+        conn.close()
+
 
 def update_holdings():
     """Update holdings based on investment transactions."""
@@ -686,6 +818,64 @@ def insert_prices_from_transactions(rows: list) -> int:
         conn.close()
 
 
+def resolve_investment_fx(cur, total_acc_cur, acc_currencies_id, sec_currencies_id,
+                          trade_date, explicit_fx_rate=None):
+    """Return ``(total_sec_cur, fx_rate)`` for an Investments row.
+
+    FX_Rate convention: account-currency units per 1 security-currency unit.
+    Example: for a USD security in a EUR account, FX_Rate ≈ 0.92 (EUR per USD).
+    total_sec_cur = total_acc_cur / fx_rate.
+
+    Parameters
+    ----------
+    cur               : open DB cursor
+    total_acc_cur     : total amount already expressed in account currency
+    acc_currencies_id : Currencies_Id of the investment account
+    sec_currencies_id : Currencies_Id of the security (may be None)
+    trade_date        : date of the trade (datetime.date or ISO string)
+    explicit_fx_rate  : caller-supplied rate (e.g. from a broker CSV); when
+                        provided and not trivially 1.0, it is used directly.
+    """
+    # Trivial case — same currency or unknown security currency
+    if sec_currencies_id is None or sec_currencies_id == acc_currencies_id:
+        return total_acc_cur, 1.0
+
+    # Caller already knows the rate
+    if explicit_fx_rate and float(explicit_fx_rate) not in (0.0, 1.0):
+        fx = float(explicit_fx_rate)
+        total_sec = round(total_acc_cur / fx, 18) if fx else total_acc_cur
+        return total_sec, fx
+
+    # Look up Historical_FX: sec → acc direction first
+    cur.execute(
+        """SELECT fx_rate FROM Historical_FX
+           WHERE currencies_id_1 = %s AND currencies_id_2 = %s
+             AND date <= COALESCE(%s::date, CURRENT_DATE)
+           ORDER BY date DESC LIMIT 1""",
+        (sec_currencies_id, acc_currencies_id, trade_date),
+    )
+    row = cur.fetchone()
+    if row:
+        fx = float(row[0])
+        return round(total_acc_cur / fx, 18) if fx else total_acc_cur, fx
+
+    # Try the inverse direction
+    cur.execute(
+        """SELECT fx_rate FROM Historical_FX
+           WHERE currencies_id_1 = %s AND currencies_id_2 = %s
+             AND date <= COALESCE(%s::date, CURRENT_DATE)
+           ORDER BY date DESC LIMIT 1""",
+        (acc_currencies_id, sec_currencies_id, trade_date),
+    )
+    row = cur.fetchone()
+    if row and float(row[0]):
+        fx = 1.0 / float(row[0])
+        return round(total_acc_cur / fx, 18), fx
+
+    # No FX data available — treat as 1:1
+    return total_acc_cur, 1.0
+
+
 def normalize_investment_prices(investments_ids: list) -> int:
     """Normalize Quantity and Price_Per_Share for investment transactions using Historical_Prices.
 
@@ -693,15 +883,15 @@ def normalize_investment_prices(investments_ids: list) -> int:
 
     Phase 1 — Buy / Reinvest / ShrIn:
         Price_Per_Share = Historical_Prices.Close on that date
-        Quantity        = Total_Amount / Close
+        Quantity        = Total_Amount_SecCur / Close  (falls back to Total_Amount_AccCur when NULL)
 
     Phase 2 — Sell / ShrOut:
         Quantity is distributed proportionally from the total normalised buy quantity
         for the same (account, security), so sum(sell_qty) = sum(buy_qty) and the
-        position closes.  Price_Per_Share is back-computed as Total_Amount / Quantity
+        position closes.  Price_Per_Share is back-computed as Total_Amount_SecCur / Quantity
         (effective realised price, which may differ from the hist close).
 
-    Total_Amount is never modified, so P&L and account balances are preserved.
+    Total_Amount_AccCur is never modified, so account balances are preserved.
     Returns the total number of rows updated (buys + sells).
     """
     if not investments_ids:
@@ -714,7 +904,9 @@ def normalize_investment_prices(investments_ids: list) -> int:
             """
             UPDATE Investments i
                SET Price_Per_Share = hp.Close,
-                   Quantity        = ROUND((i.Total_Amount / NULLIF(hp.Close, 0))::numeric, 6)
+                   Quantity        = ROUND(
+                       (COALESCE(i.Total_Amount_SecCur, i.Total_Amount_AccCur)
+                        / NULLIF(hp.Close, 0))::numeric, 6)
               FROM Historical_Prices hp
              WHERE hp.Securities_Id = i.Securities_Id
                AND hp.Date          = i.Date
@@ -753,10 +945,12 @@ def normalize_investment_prices(investments_ids: list) -> int:
                 GROUP BY i.Accounts_Id, i.Securities_Id
             ),
             sell_totals AS (
-                -- Use ABS so mixed-sign Total_Amounts (losing trades) don't cancel
+                -- Use ABS so mixed-sign amounts (losing trades) don't cancel
                 -- each other out or invert the proportional weight.
+                -- Prefer Total_Amount_SecCur (security-native) for accuracy; fall back
+                -- to Total_Amount_AccCur when not yet populated.
                 SELECT Accounts_Id, Securities_Id,
-                       SUM(ABS(Total_Amount)) AS total_sell_amt_abs
+                       SUM(ABS(COALESCE(Total_Amount_SecCur, Total_Amount_AccCur))) AS total_sell_amt_abs
                 FROM Investments
                 WHERE Action IN ('Sell', 'ShrOut')
                   AND Investments_Id = ANY(%s)
@@ -765,12 +959,14 @@ def normalize_investment_prices(investments_ids: list) -> int:
             UPDATE Investments i
                SET Quantity        = ROUND(
                        (bt.total_buy_qty
-                        * (ABS(i.Total_Amount) / NULLIF(st.total_sell_amt_abs, 0)))::numeric,
+                        * (ABS(COALESCE(i.Total_Amount_SecCur, i.Total_Amount_AccCur))
+                           / NULLIF(st.total_sell_amt_abs, 0)))::numeric,
                        6),
                    Price_Per_Share = ROUND(
-                       (ABS(i.Total_Amount)
+                       (ABS(COALESCE(i.Total_Amount_SecCur, i.Total_Amount_AccCur))
                         / NULLIF(bt.total_buy_qty
-                                 * (ABS(i.Total_Amount) / NULLIF(st.total_sell_amt_abs, 0)),
+                                 * (ABS(COALESCE(i.Total_Amount_SecCur, i.Total_Amount_AccCur))
+                                    / NULLIF(st.total_sell_amt_abs, 0)),
                                  0))::numeric,
                        4)
               FROM buy_totals bt

@@ -1144,6 +1144,7 @@ def run_import(
         update_holdings,
         update_accounts_balances,
         update_investment_balances,
+        resolve_investment_fx,
     )
 
     counts = {"investments": 0, "investments_skip": 0}
@@ -1152,6 +1153,8 @@ def run_import(
 
     with get_db() as conn:
         cur = conn.cursor()
+        # Cache: db_acc_id → Currencies_Id (fetched lazily)
+        _acc_cur_cache: dict[int, int] = {}
 
         # ── Optional: wipe existing SAXO records for re-import ────────────────
         if replace_mode:
@@ -1196,32 +1199,57 @@ def run_import(
                 # "ETF" gets Instrument_Type = "CFDOnETF", not the raw initial
                 # value that was derived from the SAXO asset type alone.
                 cur.execute(
-                    "SELECT Securities_Type FROM Securities WHERE Securities_Id = %s",
+                    "SELECT Securities_Type, Currencies_Id FROM Securities "
+                    "WHERE Securities_Id = %s",
                     (sec_id,),
                 )
                 _sec_row = cur.fetchone()
                 _db_sec_type = str(_sec_row[0]) if _sec_row else None
+                _sec_cur_id  = int(_sec_row[1]) if _sec_row and _sec_row[1] else None
                 _instr_type  = _refine_instrument_type(
                     rec.get("saxo_asset_type", ""),
                     rec.get("instrument_type", "Other"),
                     _db_sec_type,
                 )
 
+                # Resolve account currency (cached)
+                _db_acc_id_int = int(db_acc_id)
+                if _db_acc_id_int not in _acc_cur_cache:
+                    cur.execute(
+                        "SELECT Currencies_Id FROM Accounts WHERE Accounts_Id = %s",
+                        (_db_acc_id_int,),
+                    )
+                    _ar = cur.fetchone()
+                    _acc_cur_cache[_db_acc_id_int] = int(_ar[0]) if _ar else None
+                _acc_cur_id = _acc_cur_cache[_db_acc_id_int]
+
+                # Resolve FX and security-currency total (SAXO has no explicit FX)
+                _total_acc = rec["total_eur"] if rec["total_eur"] != 0 else None
+                if _total_acc is not None:
+                    _sec_amt, _fx = resolve_investment_fx(
+                        cur, _total_acc, _acc_cur_id, _sec_cur_id, rec["date"],
+                    )
+                else:
+                    _sec_amt, _fx = None, 1.0
+
                 cur.execute(
                     """INSERT INTO Investments
                            (Accounts_Id, Securities_Id, Date, Action, Quantity,
-                            Price_Per_Share, Commission, Total_Amount, Description,
-                            Instrument_Type)
-                       VALUES (%s, %s, %s, %s::investments_action, %s, %s, %s, %s, %s, %s)""",
+                            Price_Per_Share, Commission,
+                            Total_Amount_AccCur, Total_Amount_SecCur, FX_Rate,
+                            Description, Instrument_Type)
+                       VALUES (%s, %s, %s, %s::investments_action, %s, %s, %s, %s, %s, %s, %s, %s)""",
                     (
-                        int(db_acc_id),
+                        _db_acc_id_int,
                         sec_id,
                         rec["date"],
                         rec["action"],
                         rec["quantity"]   if rec["quantity"]   > 0 else None,
                         rec["price"]      if rec["price"]      > 0 else None,
                         rec["commission"] if rec["commission"] > 0 else None,
-                        rec["total_eur"]  if rec["total_eur"]  != 0 else None,
+                        _total_acc,
+                        _sec_amt,
+                        _fx,
                         rec["desc"],
                         _instr_type or None,
                     ),
@@ -1238,6 +1266,21 @@ def run_import(
     # Post-commit balance / holdings refresh
     update_holdings()
     update_investment_balances()
+
+    # Auto-create linked cash transactions for every imported account that has
+    # a linked cash account configured.
+    from database.crud import (
+        create_linked_cash_transactions_for_unlinked,
+        get_linked_account_id,
+    )
+    _seen_inv_accs: set[int] = set(int(v) for v in account_map.values())
+    for _inv_acc in _seen_inv_accs:
+        _linked = get_linked_account_id(_inv_acc)
+        if _linked:
+            create_linked_cash_transactions_for_unlinked(_inv_acc, _linked)
+            update_accounts_balances(_linked)
+    if _seen_inv_accs:
+        update_investment_balances()
 
     return counts
 
@@ -1485,7 +1528,7 @@ def run_charges_import(
     -------
     counts: {"imported": int, "skipped": int}
     """
-    from database.crud import update_holdings, update_investment_balances
+    from database.crud import update_holdings, update_investment_balances, resolve_investment_fx
 
     counts = {"imported": 0, "skipped": 0}
     total  = max(len(charge_records), 1)
@@ -1499,6 +1542,8 @@ def run_charges_import(
 
     with get_db() as conn:
         cur = conn.cursor()
+        # Cache: db_acc_id → Currencies_Id (fetched lazily)
+        _acc_cur_cache: dict[int, int] = {}
 
         if replace_mode:
             for db_acc_id in set(account_map.values()):
@@ -1599,19 +1644,63 @@ def run_charges_import(
                     # update_holdings() already filters out IS NULL rows.
                     sec_id = None
 
+                # Resolve account currency (cached) and FX for charges
+                _db_acc_id_int = int(db_acc_id)
+                if _db_acc_id_int not in _acc_cur_cache:
+                    cur.execute(
+                        "SELECT Currencies_Id FROM Accounts WHERE Accounts_Id = %s",
+                        (_db_acc_id_int,),
+                    )
+                    _ar = cur.fetchone()
+                    _acc_cur_cache[_db_acc_id_int] = int(_ar[0]) if _ar else None
+                _acc_cur_id = _acc_cur_cache[_db_acc_id_int]
+
+                _sec_cur_id_chg = None
+                if sec_id is not None:
+                    cur.execute(
+                        "SELECT Currencies_Id FROM Securities WHERE Securities_Id = %s",
+                        (sec_id,),
+                    )
+                    _scr = cur.fetchone()
+                    _sec_cur_id_chg = int(_scr[0]) if _scr and _scr[0] else None
+
+                _total_acc_chg = rec["total_eur"] if rec["total_eur"] != 0 else None
+
+                # Use amounts parsed directly from the PDF when available
+                # (saxo_pdf_parser sets total_sec_cur and fx_rate_db from the
+                # "Conversion Rate" column).  Fall back to Historical_FX lookup
+                # for API-sourced charge records that have no explicit rate.
+                _pdf_sec  = rec.get("total_sec_cur")   # None for API records
+                _pdf_fx   = rec.get("fx_rate_db")      # None for API records
+
+                if _total_acc_chg is not None:
+                    if _pdf_sec is not None and _pdf_fx is not None:
+                        # PDF-sourced: trust the on-page values directly
+                        _sec_amt_chg = _pdf_sec
+                        _fx_chg      = _pdf_fx
+                    else:
+                        _sec_amt_chg, _fx_chg = resolve_investment_fx(
+                            cur, _total_acc_chg, _acc_cur_id, _sec_cur_id_chg, rec["date"],
+                        )
+                else:
+                    _sec_amt_chg, _fx_chg = None, 1.0
+
                 cur.execute(
                     """INSERT INTO Investments
                            (Accounts_Id, Securities_Id, Date, Action,
                             Quantity, Price_Per_Share, Commission,
-                            Total_Amount, Description, Instrument_Type)
+                            Total_Amount_AccCur, Total_Amount_SecCur, FX_Rate,
+                            Description, Instrument_Type)
                        VALUES (%s, %s, %s, %s::investments_action,
-                               NULL, NULL, NULL, %s, %s, NULL)""",
+                               NULL, NULL, NULL, %s, %s, %s, %s, NULL)""",
                     (
-                        int(db_acc_id),
+                        _db_acc_id_int,
                         sec_id,
                         rec["date"],
                         rec["action"],
-                        rec["total_eur"] if rec["total_eur"] != 0 else None,
+                        _total_acc_chg,
+                        _sec_amt_chg,
+                        _fx_chg,
                         rec["desc"],
                     ),
                 )
@@ -1626,5 +1715,21 @@ def run_charges_import(
 
     update_holdings()
     update_investment_balances()
+
+    # Auto-create linked cash transactions for every imported account that has
+    # a linked cash account configured.
+    from database.crud import (
+        create_linked_cash_transactions_for_unlinked,
+        get_linked_account_id,
+        update_accounts_balances,
+    )
+    _seen_chg_accs: set[int] = set(int(v) for v in account_map.values())
+    for _inv_acc in _seen_chg_accs:
+        _linked = get_linked_account_id(_inv_acc)
+        if _linked:
+            create_linked_cash_transactions_for_unlinked(_inv_acc, _linked)
+            update_accounts_balances(_linked)
+    if _seen_chg_accs:
+        update_investment_balances()
 
     return counts
