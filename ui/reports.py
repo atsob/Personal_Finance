@@ -4009,6 +4009,16 @@ def render_net_worth_report():
     st.session_state.nwr_date_val = start_date
     interval  = st.sidebar.radio("Interval:", ["Year", "Quarter", "Month"], key="nwr_interval")
     show_zero = st.sidebar.checkbox("Show zero-balance accounts", value=False, key="nwr_show_zero")
+
+    st.sidebar.divider()
+    if st.sidebar.button("🔄 Refresh Data", key="nwr_refresh",
+                         help="Recalculates all account balances and clears the data cache."):
+        from database.crud import update_accounts_balances, update_investment_balances, update_pension_balances
+        update_accounts_balances()
+        update_investment_balances()
+        update_pension_balances()
+        get_net_worth_report_data.clear()
+        st.rerun()
     # ── Account selection (main area, full-width) ─────────────────────────
     df_accounts = get_all_accounts_for_nwr()
     all_ids     = df_accounts['accounts_id'].tolist()
@@ -4043,6 +4053,48 @@ def render_net_worth_report():
     account_ids_tuple = tuple(sorted(selected_ids)) if selected_ids else None
     with st.spinner("Loading net worth data…"):
         df = get_net_worth_report_data(start_date.isoformat(), interval, account_ids_tuple)
+
+    # ── Zero-balance diagnostic ────────────────────────────────────────────
+    # Show accounts that are selected but have zero balance at all periods
+    # (hidden by show_zero=False). Helps diagnose why an account is missing.
+    if not show_zero and not df.empty and selected_ids:
+        from database.connection import get_connection as _gc
+        _conn = _gc()
+        _df_bal = pd.read_sql(
+            """SELECT Accounts_Id AS accounts_id,
+                      Accounts_Name AS accounts_name,
+                      Accounts_Type AS accounts_type,
+                      Accounts_Balance AS accounts_balance
+               FROM Accounts
+               WHERE Accounts_Id = ANY(%s)
+               ORDER BY Accounts_Name""",
+            _conn,
+            params=(selected_ids,),
+        )
+        _conn.close()
+
+        _zero_accs = _df_bal[_df_bal["accounts_balance"].abs() < 0.005]
+        if not _zero_accs.empty:
+            with st.expander(
+                f"⚠️ {len(_zero_accs)} selected account(s) have zero balance and are hidden "
+                f"(enable 'Show zero-balance accounts' or click 🔄 Refresh Data)",
+                expanded=True,
+            ):
+                st.dataframe(
+                    _zero_accs,
+                    hide_index=True,
+                    column_config={
+                        "accounts_id":      None,
+                        "accounts_name":    st.column_config.TextColumn("Account"),
+                        "accounts_type":    st.column_config.TextColumn("Type"),
+                        "accounts_balance": st.column_config.NumberColumn("Stored Balance", format="%.4f"),
+                    },
+                )
+                st.caption(
+                    "These accounts have `Accounts_Balance = 0` in the database. "
+                    "Click **🔄 Refresh Data** in the sidebar to recalculate all balances, "
+                    "or enable **Show zero-balance accounts** to see them at 0."
+                )
 
     if df.empty:
         st.info("No data found for the selected period.")

@@ -349,7 +349,8 @@ def render_market_data():
             with st_prices:
                 with get_db() as conn:
                     df_hpr_tx = pd.read_sql(
-                        "SELECT Securities_Id, Date, Close, High, Low, Volume, embedding "
+                        "SELECT Securities_Id, Date, Close, High, Low, Volume, "
+                        "       Source, Downloaded_At, embedding "
                         "FROM Historical_Prices "
                         f"WHERE Securities_Id = {inv_sec_id} ORDER BY Date DESC",
                         conn,
@@ -360,13 +361,18 @@ def render_market_data():
                     key=f"mkt_hpr_editor_{inv_sec_id}",
                     width="stretch",
                     column_config={
-                        'securities_id': None,
-                        'date':   st.column_config.DateColumn('Date', format="DD/MM/YYYY"),
-                        'close':  st.column_config.NumberColumn('Close',  format="%,.8f"),
-                        'high':   st.column_config.NumberColumn('High',   format="%,.8f"),
-                        'low':    st.column_config.NumberColumn('Low',    format="%,.8f"),
-                        'volume': st.column_config.NumberColumn('Volume', format="%,.0f"),
-                        'embedding': None,
+                        'securities_id':  None,
+                        'date':           st.column_config.DateColumn('Date', format="DD/MM/YYYY"),
+                        'close':          st.column_config.NumberColumn('Close',  format="%,.8f"),
+                        'high':           st.column_config.NumberColumn('High',   format="%,.8f"),
+                        'low':            st.column_config.NumberColumn('Low',    format="%,.8f"),
+                        'volume':         st.column_config.NumberColumn('Volume', format="%,.0f"),
+                        'source':         st.column_config.TextColumn('Source'),
+                        'downloaded_at':  st.column_config.DatetimeColumn(
+                                              'Downloaded At',
+                                              format='YYYY-MM-DD HH:mm',
+                                          ),
+                        'embedding':      None,
                     },
                 )
                 save_changes_mid(
@@ -601,8 +607,8 @@ def render_market_data():
                                         if conflict_mode.startswith("Skip"):
                                             _cur.execute(
                                                 "INSERT INTO Historical_Prices"
-                                                " (Securities_Id, Date, Close, High, Low, Volume)"
-                                                " VALUES (%s,%s,%s,%s,%s,%s)"
+                                                " (Securities_Id, Date, Close, High, Low, Volume, Source, Downloaded_At)"
+                                                " VALUES (%s,%s,%s,%s,%s,%s,'Manual',NOW())"
                                                 " ON CONFLICT (Securities_Id, Date) DO NOTHING",
                                                 _vals)
                                             if _cur.rowcount == 1: _inserted += 1
@@ -610,11 +616,12 @@ def render_market_data():
                                         else:
                                             _cur.execute(
                                                 "INSERT INTO Historical_Prices"
-                                                " (Securities_Id, Date, Close, High, Low, Volume)"
-                                                " VALUES (%s,%s,%s,%s,%s,%s)"
+                                                " (Securities_Id, Date, Close, High, Low, Volume, Source, Downloaded_At)"
+                                                " VALUES (%s,%s,%s,%s,%s,%s,'Manual',NOW())"
                                                 " ON CONFLICT (Securities_Id, Date) DO UPDATE"
                                                 " SET Close=EXCLUDED.Close, High=EXCLUDED.High,"
-                                                "     Low=EXCLUDED.Low, Volume=EXCLUDED.Volume",
+                                                "     Low=EXCLUDED.Low, Volume=EXCLUDED.Volume,"
+                                                "     Source=EXCLUDED.Source, Downloaded_At=EXCLUDED.Downloaded_At",
                                                 _vals)
                                             _overwritten += 1
 

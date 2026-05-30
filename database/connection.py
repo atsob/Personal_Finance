@@ -113,6 +113,34 @@ def get_db():
                 pass
 
 
+def _run_startup_migrations():
+    """Run idempotent DDL migrations on startup (once per process)."""
+    _STMTS = [
+        # Historical_Prices: provenance columns
+        "ALTER TABLE Historical_Prices ADD COLUMN IF NOT EXISTS Source        VARCHAR(50)",
+        "ALTER TABLE Historical_Prices ADD COLUMN IF NOT EXISTS Downloaded_At TIMESTAMPTZ",
+        "CREATE INDEX IF NOT EXISTS idx_price_source ON Historical_Prices(Source)",
+    ]
+    try:
+        conn     = psycopg2.connect(**DB_CONFIG)
+        mig_cur  = conn.cursor()
+        for stmt in _STMTS:
+            try:
+                mig_cur.execute(stmt)
+                conn.commit()
+            except Exception as stmt_exc:
+                conn.rollback()
+                log.warning("Startup migration statement failed: %s — %s", stmt, stmt_exc)
+        mig_cur.close()
+        conn.close()
+        log.info("Startup migrations completed.")
+    except Exception as exc:
+        log.warning("Startup migration connection failed: %s", exc)
+
+
+_run_startup_migrations()
+
+
 def get_connection() -> extensions.connection:
     """Open and return a plain (non-pooled) connection with retry on transient failure.
 

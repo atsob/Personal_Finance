@@ -435,17 +435,26 @@ $$;
 -- =============================================================================
 
 CREATE TABLE Historical_Prices (
-    Securities_Id INTEGER REFERENCES Securities(Securities_Id) ON DELETE CASCADE,
-    Date          DATE NOT NULL,
-    Close         NUMERIC(20, 8) NOT NULL,
-    High          NUMERIC(20, 8),
-    Low           NUMERIC(20, 8),
-    Volume        BIGINT,
-    embedding     vector(768),
+    Securities_Id   INTEGER REFERENCES Securities(Securities_Id) ON DELETE CASCADE,
+    Date            DATE NOT NULL,
+    Close           NUMERIC(20, 8) NOT NULL,
+    High            NUMERIC(20, 8),
+    Low             NUMERIC(20, 8),
+    Volume          BIGINT,
+    Source          VARCHAR(50),
+    Downloaded_At   TIMESTAMPTZ,
+    embedding       vector(768),
     PRIMARY KEY (Securities_Id, Date)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_price_id       ON Historical_Prices(Securities_Id, Date);
 CREATE        INDEX IF NOT EXISTS idx_prices_sec_date ON Historical_Prices(Securities_Id, Date DESC);
+CREATE INDEX IF NOT EXISTS idx_price_source ON Historical_Prices(Source);
+
+-- Migration (run once on existing databases):
+-- ALTER TABLE Historical_Prices
+--     ADD COLUMN IF NOT EXISTS Source        VARCHAR(50),
+--     ADD COLUMN IF NOT EXISTS Downloaded_At TIMESTAMPTZ;
+-- CREATE INDEX IF NOT EXISTS idx_price_source ON Historical_Prices(Source);
 
 
 CREATE TABLE Historical_FX (

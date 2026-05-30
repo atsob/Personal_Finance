@@ -406,14 +406,20 @@ def update_accounts_balances(target_acc_id=None):
     cur = conn.cursor()
     try:
         if target_acc_id:
+            # Investment-type accounts (Brokerage, Other Investment, Margin, Pension)
+            # maintain their balance via update_investment_balances() /
+            # update_pension_balances() which also reads the Investments table.
+            # Overwriting with SUM(Transactions) alone would corrupt their balance.
             sql = """
                 UPDATE Accounts a
                 SET Accounts_Balance = COALESCE((
-                    SELECT SUM(Total_Amount) 
-                    FROM Transactions t 
+                    SELECT SUM(Total_Amount)
+                    FROM Transactions t
                     WHERE t.Accounts_Id = a.Accounts_Id
                 ), 0)
-                WHERE a.Accounts_Id = %s;
+                WHERE a.Accounts_Id = %s
+                  AND a.Accounts_Type NOT IN
+                      ('Brokerage', 'Other Investment', 'Margin', 'Pension');
             """
             cur.execute(sql, (int(target_acc_id),))
         else:
@@ -804,8 +810,8 @@ def insert_prices_from_transactions(rows: list) -> int:
     try:
         cur.executemany(
             """
-            INSERT INTO Historical_Prices (Securities_Id, Date, Close)
-            VALUES (%s, %s, %s)
+            INSERT INTO Historical_Prices (Securities_Id, Date, Close, Source, Downloaded_At)
+            VALUES (%s, %s, %s, 'Transactions', NOW())
             ON CONFLICT (Securities_Id, Date) DO NOTHING
             """,
             [(int(r['securities_id']), r['date'], float(r['price'])) for r in rows],

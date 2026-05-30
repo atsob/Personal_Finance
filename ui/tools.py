@@ -160,6 +160,76 @@ def _render_db_maintenance():
 
     st.divider()
 
+    # ── Schema migrations ──────────────────────────────────────────────────────
+    st.markdown("#### 🔧 Schema Migrations")
+    st.caption(
+        "Apply pending database schema changes (new columns, indexes, etc.). "
+        "Safe to run multiple times — all statements use `IF NOT EXISTS` / `ADD COLUMN IF NOT EXISTS`."
+    )
+
+    _MIGRATIONS: list[tuple[str, str]] = [
+        (
+            "Historical_Prices: add Source + Downloaded_At columns",
+            """
+            ALTER TABLE Historical_Prices
+                ADD COLUMN IF NOT EXISTS Source        VARCHAR(50),
+                ADD COLUMN IF NOT EXISTS Downloaded_At TIMESTAMPTZ;
+            CREATE INDEX IF NOT EXISTS idx_price_source ON Historical_Prices(Source);
+            """,
+        ),
+    ]
+
+    for mig_label, mig_sql in _MIGRATIONS:
+        mc1, mc2 = st.columns([4, 1])
+        mc1.markdown(f"**{mig_label}**")
+        with mc2:
+            if st.button("▶ Apply", key=f"mig_{hash(mig_label)}", width="stretch"):
+                try:
+                    _mig_conn = get_connection()
+                    _mig_cur  = _mig_conn.cursor()
+                    # Run each statement separately (psycopg2 doesn't support
+                    # multi-statement strings in a single execute call)
+                    for _stmt in [s.strip() for s in mig_sql.split(";") if s.strip()]:
+                        _mig_cur.execute(_stmt)
+                    _mig_conn.commit()
+                    _mig_cur.close()
+                    _mig_conn.close()
+                    st.success(f"✅ Applied: {mig_label}")
+                except Exception as _mig_exc:
+                    st.error(f"❌ Migration failed: {_mig_exc}")
+
+    st.divider()
+
+    # ── Balance recalculation ──────────────────────────────────────────────────
+    st.markdown("#### 💰 Recalculate Account Balances")
+    st.caption(
+        "Recomputes `Accounts_Balance` for all accounts from their transactions and investment entries. "
+        "Run this if any account balance looks incorrect — e.g. after importing data, running fix tools, "
+        "or if an 'Other Investment' or Pension account shows zero in the Net Worth Report."
+    )
+    rb_col1, rb_col2, rb_col3 = st.columns(3)
+    with rb_col1:
+        st.markdown("**Cash / Bank / Assets**")
+        st.caption("Updates all non-investment accounts from their Transactions.")
+        if st.button("▶ Recalculate Cash Balances", key="maint_recalc_cash", width="stretch"):
+            update_accounts_balances()
+            st.success("✅ Cash / Bank / Asset balances recalculated.")
+    with rb_col2:
+        st.markdown("**Brokerage / Other Investment**")
+        st.caption("Updates Brokerage, Other Investment, and Margin accounts from Investments + Transactions.")
+        if st.button("▶ Recalculate Investment Balances", key="maint_recalc_inv", width="stretch"):
+            update_investment_balances()
+            st.success("✅ Investment account balances recalculated.")
+    with rb_col3:
+        st.markdown("**Pension**")
+        st.caption("Updates Pension accounts from their CashIn / CashOut investment entries.")
+        if st.button("▶ Recalculate Pension Balances", key="maint_recalc_pen", width="stretch"):
+            from database.crud import update_pension_balances
+            update_pension_balances()
+            st.success("✅ Pension account balances recalculated.")
+
+    st.divider()
+
     # ── Per-table operations ───────────────────────────────────────────────────
     st.markdown("#### 🎯 Per-Table Operations")
 
@@ -422,7 +492,8 @@ def _render_price_quality():
     st.subheader("🔍 Price Data Quality")
     st.caption(
         "Flags prices that changed by more than the chosen threshold vs the previous or next "
-        "trading day for the same security. The nearest buy/sell transaction is shown for context."
+        "trading day for the same security. The nearest buy/sell transaction is shown for context. "
+        "**Source** and **Downloaded At** columns identify which downloader produced each price."
     )
 
     # ── Threshold ─────────────────────────────────────────────────────────
@@ -477,6 +548,8 @@ def _render_price_quality():
             'tx_price':      st.column_config.NumberColumn('Tx Price', format='%.4f'),
             'days_diff':     st.column_config.NumberColumn('Days to Tx', format='%d'),
             'pct_vs_tx':     st.column_config.NumberColumn('% vs Tx', format='%+.1f %%'),
+            'source':        st.column_config.TextColumn('Source'),
+            'downloaded_at': st.column_config.DatetimeColumn('Downloaded At', format='YYYY-MM-DD HH:mm'),
         },
         disabled=[c for c in df.columns if c != 'Delete'],
         hide_index=True,

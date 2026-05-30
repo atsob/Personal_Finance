@@ -306,7 +306,8 @@ def get_net_worth_report_data(start_date: str, interval: str = 'Year', account_i
         CROSS JOIN Currencies cur
         WHERE cur.Currencies_ShortName != 'EUR'
     ),
-    -- Cash, savings, credit cards, loans, assets, liabilities, other-investment
+    -- Cash, savings, credit cards, loans, assets, liabilities
+    -- (Other Investment excluded: handled by other_inv_like below)
     cash_like AS (
         SELECT
             p.period_end,
@@ -331,7 +332,35 @@ def get_net_worth_report_data(start_date: str, interval: str = 'Year', account_i
             ) AS balance_eur
         FROM period_dates p
         CROSS JOIN Accounts a
-        WHERE a.Accounts_Type NOT IN ('Brokerage', 'Margin', 'Pension')
+        WHERE a.Accounts_Type NOT IN ('Brokerage', 'Margin', 'Pension', 'Other Investment')
+          {acc_filter}
+    ),
+    -- Other Investment (e.g. Revolut Savings / Flexible Cash Funds):
+    -- Accounts_Balance is set by update_investment_balances() which sums both
+    -- Investments (CashIn/CashOut unlinked) and Transactions.
+    -- Historical reconstruction mirrors the Dashboard: subtract future Transactions
+    -- from current balance.  The net of unlinked Investments is baked into
+    -- Accounts_Balance, so only future Transactions need to be unwound.
+    other_inv_like AS (
+        SELECT
+            p.period_end,
+            a.Accounts_Id,
+            a.Accounts_Name,
+            a.Accounts_Type,
+            (
+                a.Accounts_Balance
+                - COALESCE((
+                    SELECT SUM(Total_Amount) FROM Transactions
+                    WHERE Accounts_Id = a.Accounts_Id AND Date > p.period_end
+                ), 0)
+            ) * COALESCE(
+                (SELECT fx_rate FROM daily_fx
+                 WHERE period_end = p.period_end AND Currencies_Id = a.Currencies_Id),
+                1
+            ) AS balance_eur
+        FROM period_dates p
+        CROSS JOIN Accounts a
+        WHERE a.Accounts_Type = 'Other Investment'
           {acc_filter}
     ),
     -- Brokerage / Margin: forward cumulative qty per security × price × fx
@@ -436,6 +465,8 @@ def get_net_worth_report_data(start_date: str, interval: str = 'Year', account_i
         SELECT period_end, Accounts_Id, Accounts_Name, Accounts_Type, balance_eur FROM investment_holdings
         UNION ALL
         SELECT period_end, Accounts_Id, Accounts_Name, Accounts_Type, balance_eur FROM pension_like
+        UNION ALL
+        SELECT period_end, Accounts_Id, Accounts_Name, Accounts_Type, balance_eur FROM other_inv_like
     ) all_accounts
     ORDER BY period_end, section DESC, group_name, Accounts_Name
     """
@@ -498,6 +529,8 @@ def get_price_anomalies(threshold_pct: float = 100.0, securities_ids: tuple = No
             s.Securities_Name AS security_name,
             hp.Date,
             hp.Close,
+            hp.Source,
+            hp.Downloaded_At,
             LAG(hp.Close)  OVER (PARTITION BY hp.Securities_Id ORDER BY hp.Date) AS prev_close,
             LEAD(hp.Close) OVER (PARTITION BY hp.Securities_Id ORDER BY hp.Date) AS next_close
         FROM Historical_Prices hp
@@ -547,7 +580,9 @@ def get_price_anomalies(threshold_pct: float = 100.0, securities_ids: tuple = No
         days_diff,
         CASE WHEN tx_price > 0
              THEN ROUND(((Close / tx_price) - 1) * 100, 1)
-        END AS pct_vs_tx
+        END AS pct_vs_tx,
+        Source        AS source,
+        Downloaded_At AS downloaded_at
     FROM enriched
     WHERE
         -- Signal 1: day-to-day spike

@@ -2144,6 +2144,638 @@ def _cb_preview_with_status(
 
 
 # ===========================================================================
+# Crypto.com — security mapping UI  (mirrors _cb_security_mapping_ui)
+# ===========================================================================
+
+def _cdc_security_mapping_ui(sec_matches: dict) -> None:
+    """Expander UI for mapping unmapped Crypto.com crypto tickers to DB securities."""
+    unmapped = {sym: info for sym, info in sec_matches.items() if info[1] == "new"}
+    if not unmapped:
+        return
+
+    with st.expander(
+        f"🗺️ Security Mappings — {len(unmapped)} unmapped asset(s) — click to configure",
+        expanded=True,
+    ):
+        st.caption(
+            "These crypto symbols were not found in your Securities database by ticker "
+            "or name. Select the matching security for each one, then click "
+            "**💾 Save Mappings**. Saved mappings apply to all future Crypto.com imports."
+        )
+
+        all_secs = _load_all_securities()
+        if all_secs.empty:
+            st.warning("No securities found in the database. Create them in Static Data first.")
+            return
+
+        sec_options     = ["(create new — will be added on import)"] + all_secs["name"].tolist()
+        pending_mappings: dict[str, int] = {}
+
+        for sym in sorted(unmapped):
+            c1, c2 = st.columns([1, 3])
+            with c1:
+                st.markdown(f"**{sym}**")
+            with c2:
+                chosen = st.selectbox(
+                    f"Map {sym} to",
+                    sec_options,
+                    key=f"cdc_map_{sym}",
+                    label_visibility="collapsed",
+                )
+                if not chosen.startswith("(create new"):
+                    sec_row = all_secs[all_secs["name"] == chosen]
+                    if not sec_row.empty:
+                        pending_mappings[sym] = int(sec_row.iloc[0]["securities_id"])
+
+        if pending_mappings:
+            if st.button("💾 Save Mappings", key="cdc_save_mappings", type="primary"):
+                from database.queries import save_security_mappings
+                try:
+                    save_security_mappings("Crypto.com", pending_mappings)
+                    _updated = dict(st.session_state.get("cdc_sec_matches", {}))
+                    for sym, sec_id in pending_mappings.items():
+                        sec_row  = all_secs[all_secs["securities_id"] == sec_id]
+                        sec_name = sec_row.iloc[0]["name"] if not sec_row.empty else sym
+                        _updated[sym] = (sec_id, f"mapped:{sec_name}")
+                    st.session_state["cdc_sec_matches"] = _updated
+                    _load_all_securities.clear()
+                    st.success(
+                        f"✅ Saved {len(pending_mappings)} mapping(s). "
+                        "Re-fetch to apply in the Security Match column."
+                    )
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Failed to save mappings: {exc}")
+        else:
+            st.info("Select at least one mapping above and click Save.")
+
+
+# ===========================================================================
+# Crypto.com — preview helper with reconciliation status
+# ===========================================================================
+
+def _cdc_preview_with_status(
+    inv_records:   list,
+    tx_records:    list,
+    existing_inv:  set,
+    existing_tx:   set,
+    fuzzy_inv:     set,
+    fuzzy_tx:      set,
+    sec_matches:   dict,
+    ignored_descs: set | None = None,
+) -> None:
+    """Preview table for Crypto.com records with 4-state Status + Security Match."""
+    ignored_descs = ignored_descs or set()
+    tab_inv, tab_tx = st.tabs([
+        f"📈 Investments ({len(inv_records)})",
+        f"💳 Cash Transactions ({len(tx_records)})",
+    ])
+
+    with tab_inv:
+        if inv_records:
+            rows = []
+            for r in inv_records:
+                if r["desc"] in existing_inv:
+                    status = "✅ Exists"
+                elif r["desc"] in fuzzy_inv:
+                    status = "⚠️ Likely duplicate"
+                elif r["desc"] in ignored_descs:
+                    status = "⏭️ Ignored"
+                else:
+                    status = "🆕 New"
+                sym        = (r.get("symbol") or "").strip()
+                match_info = sec_matches.get(sym, (None, "new"))
+                match_type = match_info[1]
+                if match_type.startswith("mapped:"):
+                    sec_label = f"🗺️ {match_type[7:]}"
+                elif match_type in ("ticker", "name"):
+                    sec_label = f"🔗 {match_type.capitalize()} match"
+                elif sym:
+                    sec_label = "🆕 New security"
+                else:
+                    sec_label = "—"
+                fx_note = r.get("_fx_note", "")
+                rows.append({**r, "status": status, "security_match": sec_label,
+                              "fx_note": fx_note})
+
+            df_inv = pd.DataFrame(rows)
+            cols   = ["status", "date", "action", "symbol", "name",
+                      "quantity", "price", "total_eur", "commission",
+                      "currency", "asset_category", "security_match", "fx_note", "desc"]
+            df_inv = df_inv[[c for c in cols if c in df_inv.columns]]
+            st.dataframe(
+                df_inv, hide_index=True, width="stretch",
+                column_config={
+                    "status":         "Status",
+                    "date":           "Date",
+                    "action":         "Action",
+                    "symbol":         "Symbol",
+                    "name":           "Name",
+                    "quantity":       st.column_config.NumberColumn("Qty",         format="%.8f"),
+                    "price":          st.column_config.NumberColumn("Price (€)",   format="%.4f"),
+                    "total_eur":      st.column_config.NumberColumn("Total (€)",   format="%.4f"),
+                    "commission":     st.column_config.NumberColumn("Commission",  format="%.4f"),
+                    "currency":       "Ccy",
+                    "asset_category": "Asset",
+                    "security_match": "Security Match",
+                    "fx_note":        "FX Note",
+                    "desc":           "Dedup Key",
+                },
+            )
+        else:
+            st.info("No investment records fetched.")
+
+    with tab_tx:
+        if tx_records:
+            rows = []
+            for r in tx_records:
+                if r["desc"] in existing_tx:
+                    status = "✅ Exists"
+                elif r["desc"] in fuzzy_tx:
+                    status = "⚠️ Likely duplicate"
+                elif r["desc"] in ignored_descs:
+                    status = "⏭️ Ignored"
+                else:
+                    status = "🆕 New"
+                rows.append({**r, "status": status})
+            df_tx = pd.DataFrame(rows)
+            cols  = ["status", "date", "description", "amount", "currency"]
+            df_tx = df_tx[[c for c in cols if c in df_tx.columns]]
+            st.dataframe(
+                df_tx, hide_index=True, width="stretch",
+                column_config={
+                    "status":      "Status",
+                    "date":        "Date",
+                    "description": "Description",
+                    "amount":      st.column_config.NumberColumn("Amount", format="%.4f"),
+                    "currency":    "Ccy",
+                },
+            )
+        else:
+            st.info("No cash transaction records fetched.")
+
+
+# ===========================================================================
+# Crypto.com — main render function
+# ===========================================================================
+
+def render_cryptocom_import() -> None:
+    """Crypto.com Exchange API importer — trades, deposits, withdrawals."""
+    from database.queries import get_app_setting, save_app_setting
+
+    st.markdown(
+        "Import filled trades, crypto deposits/withdrawals, and fiat deposits/withdrawals "
+        "from **Crypto.com Exchange** using the REST API v1."
+    )
+
+    with st.expander("ℹ️ How to create Crypto.com API keys (click to expand)", expanded=False):
+        st.markdown("""
+1. Log in to [crypto.com/exchange](https://crypto.com/exchange).
+2. Go to **Settings → API Management → Create New API Key**.
+3. Set a label, leave IP whitelist empty (or add your server IP).
+4. Under **Permissions**, enable **View** only — read-only is sufficient.
+5. Copy the **API Key** and **Secret Key** shown on creation.
+
+> The secret is shown **only once** — copy it immediately.
+> Store it safely; the app encrypts it in the database when you tick *Remember credentials*.
+
+**Note**: The Crypto.com *App* (earn, cashback, card rewards) does not have a public API.
+Only Exchange trades, deposits, and withdrawals are imported via API.
+For App transactions, export a CSV from the App and use a CSV importer.
+""")
+
+    st.divider()
+
+    # ── Credentials ───────────────────────────────────────────────────────────
+    st.markdown("### 🔑 API Credentials")
+
+    if "cdc_api_key" not in st.session_state:
+        st.session_state["cdc_api_key"]    = get_app_setting("cdc_api_key")    or ""
+        st.session_state["cdc_api_secret"] = get_app_setting("cdc_api_secret") or ""
+        if st.session_state["cdc_api_key"]:
+            st.session_state.setdefault("cdc_remember", True)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        api_key    = st.text_input("API Key",    key="cdc_api_key")
+    with col2:
+        api_secret = st.text_input("Secret Key", key="cdc_api_secret", type="password")
+
+    remember = st.checkbox(
+        "💾 Remember credentials (stored encrypted in app settings)",
+        key="cdc_remember",
+        help="Saves Key + Secret to the database so they are pre-filled next visit.",
+    )
+
+    st.divider()
+
+    # ── Date filter ───────────────────────────────────────────────────────────
+    st.markdown("### 📅 Date Filter")
+    st.caption(
+        "The Crypto.com API supports server-side date filtering via timestamps. "
+        "Set a range to limit how many pages are fetched."
+    )
+    _df_col1, _df_col2 = st.columns(2)
+    with _df_col1:
+        cdc_from = st.date_input("Fetch from", value=None, key="cdc_filter_from")
+    with _df_col2:
+        cdc_to   = st.date_input("Fetch to",   value=None, key="cdc_filter_to")
+
+    st.divider()
+
+    # ── Account mapping ───────────────────────────────────────────────────────
+    st.markdown("### 🏦 Account Mapping")
+
+    if "cdc_account" not in st.session_state:
+        _saved = get_app_setting("cdc_account_id")
+        if _saved:
+            try:
+                _row = _load_accounts()
+                _row = _row[_row["accounts_id"] == int(_saved)]
+                if not _row.empty:
+                    st.session_state["cdc_account"] = _row.iloc[0]["accounts_name"]
+            except Exception:
+                pass
+
+    if "cdc_cash_account" not in st.session_state:
+        _saved_cash = get_app_setting("cdc_cash_account_id")
+        if _saved_cash:
+            try:
+                _row = _load_accounts()
+                _row = _row[_row["accounts_id"] == int(_saved_cash)]
+                if not _row.empty:
+                    st.session_state["cdc_cash_account"] = _row.iloc[0]["accounts_name"]
+            except Exception:
+                pass
+
+    _am_col1, _am_col2 = st.columns(2)
+    with _am_col1:
+        st.caption("Investment account (trades, crypto deposits/withdrawals)")
+        acc_id, acc_name = _account_selectbox(
+            "Investment account",
+            key="cdc_account",
+            type_filter=["Brokerage", "Other Investment", "Pension", "Savings"],
+        )
+    with _am_col2:
+        st.caption(
+            "Cash account (fiat deposits/withdrawals) — optional. "
+            "When set, fiat movements go here as Transactions instead of "
+            "CashIn/CashOut entries in the brokerage account."
+        )
+        _df_accounts  = _load_accounts()
+        _cash_options = ["— None (use investment account) —"] + _df_accounts["accounts_name"].tolist()
+        _cash_sel     = st.selectbox("Cash account (optional)", _cash_options, key="cdc_cash_account")
+        if _cash_sel and _cash_sel != "— None (use investment account) —":
+            _cash_row     = _df_accounts[_df_accounts["accounts_name"] == _cash_sel]
+            cash_acc_id   = int(_cash_row.iloc[0]["accounts_id"]) if not _cash_row.empty else None
+            cash_acc_name = _cash_sel
+        else:
+            cash_acc_id   = None
+            cash_acc_name = None
+
+    st.divider()
+
+    # ── Options ───────────────────────────────────────────────────────────────
+    st.markdown("### ⚙️ Options")
+    replace_mode = st.checkbox(
+        "Replace mode — delete all existing Crypto.com records for this account before importing",
+        value=False, key="cdc_replace",
+        help="All Investment and Transaction rows whose Description starts with 'CDC|' "
+             "will be deleted first.",
+    )
+
+    st.divider()
+
+    # ── Test Connection / Fetch ───────────────────────────────────────────────
+    if not api_key.strip() or not api_secret.strip():
+        st.info("Enter your API Key and Secret Key above to continue.")
+        return
+
+    _test_btn  = st.button("🔌 Test Connection", key="cdc_test")
+    _fetch_btn = st.button("📡 Fetch & Preview", key="cdc_fetch",
+                           type="primary", disabled=acc_id is None)
+
+    if _test_btn:
+        if remember:
+            try:
+                save_app_setting("cdc_api_key",    api_key.strip())
+                save_app_setting("cdc_api_secret", api_secret.strip())
+            except Exception:
+                pass
+        try:
+            from data.cryptocom_connector import test_connection as _cdc_test
+            with st.spinner("Connecting to Crypto.com Exchange…"):
+                balances = _cdc_test(api_key.strip(), api_secret.strip())
+            st.success(f"✅ Connected — {len(balances)} non-zero balance(s):")
+            st.dataframe(
+                pd.DataFrame(balances),
+                hide_index=True, width="stretch",
+                column_config={
+                    "currency":  "Currency",
+                    "balance":   st.column_config.NumberColumn("Balance",   format="%.8f"),
+                    "available": st.column_config.NumberColumn("Available", format="%.8f"),
+                    "order":     st.column_config.NumberColumn("In Orders", format="%.8f"),
+                    "is_fiat":   "Fiat?",
+                },
+            )
+        except Exception as exc:
+            st.error(f"Connection failed: {exc}")
+        return
+
+    if _fetch_btn or st.session_state.get("cdc_parsed"):
+        from data.cryptocom_connector import (
+            fetch_all_transactions   as _cdc_fetch,
+            build_cryptocom_records  as _cdc_build,
+            check_existing_records   as _cdc_exist,
+            check_fuzzy_duplicates   as _cdc_fuzzy,
+            preview_security_matches as _cdc_sec,
+        )
+
+        if _fetch_btn:
+            if remember:
+                try:
+                    save_app_setting("cdc_api_key",    api_key.strip())
+                    save_app_setting("cdc_api_secret", api_secret.strip())
+                except Exception:
+                    pass
+
+            status_box = st.empty()
+            def _status(msg: str):
+                status_box.info(f"⏳ {msg}")
+
+            try:
+                orders, deposits, withdrawals = _cdc_fetch(
+                    api_key.strip(), api_secret.strip(),
+                    start_date=cdc_from,
+                    end_date=cdc_to,
+                    progress_cb=_status,
+                )
+                status_box.empty()
+            except Exception as exc:
+                status_box.empty()
+                st.error(f"Failed to fetch from Crypto.com: {exc}")
+                import traceback
+                st.code(traceback.format_exc())
+                return
+
+            try:
+                inv_records, tx_records = _cdc_build(orders, deposits, withdrawals)
+            except Exception as exc:
+                st.error(f"Failed to build records: {exc}")
+                import traceback
+                st.code(traceback.format_exc())
+                return
+
+            existing_inv, existing_tx = _cdc_exist(inv_records, tx_records, acc_id, cash_acc_id)
+            fuzzy_inv,    fuzzy_tx    = _cdc_fuzzy(inv_records, tx_records, acc_id, cash_acc_id)
+            fuzzy_inv -= existing_inv
+            fuzzy_tx  -= existing_tx
+            sec_matches = _cdc_sec(inv_records)
+
+            from database.queries import get_ignored_records as _get_ign_cdc
+            ignored_descs = _get_ign_cdc("Crypto.com")
+
+            st.session_state.update({
+                "cdc_inv_records":    inv_records,
+                "cdc_tx_records":     tx_records,
+                "cdc_cash_acc_id":    cash_acc_id,
+                "cdc_raw_counts":     (len(orders), len(deposits), len(withdrawals)),
+                "cdc_existing_inv":   existing_inv,
+                "cdc_existing_tx":    existing_tx,
+                "cdc_fuzzy_inv":      fuzzy_inv,
+                "cdc_fuzzy_tx":       fuzzy_tx,
+                "cdc_sec_matches":    sec_matches,
+                "cdc_ignored":        ignored_descs,
+                "cdc_parsed":         True,
+            })
+
+        inv_records    = st.session_state.get("cdc_inv_records",  [])
+        orig_tx_records= st.session_state.get("cdc_tx_records",   [])
+        tx_records     = list(orig_tx_records)
+        cash_acc_id    = st.session_state.get("cdc_cash_acc_id",  cash_acc_id)
+        existing_inv   = st.session_state.get("cdc_existing_inv", set())
+        existing_tx    = st.session_state.get("cdc_existing_tx",  set())
+        fuzzy_inv      = st.session_state.get("cdc_fuzzy_inv",    set())
+        fuzzy_tx       = st.session_state.get("cdc_fuzzy_tx",     set())
+        sec_matches    = st.session_state.get("cdc_sec_matches",  {})
+        ignored_descs  = st.session_state.get("cdc_ignored",      set())
+        raw_counts     = st.session_state.get("cdc_raw_counts",   (0, 0, 0))
+
+        # Split CashIn/CashOut out of inv_records for the preview display,
+        # but keep orig_inv_records intact for the import call.
+        orig_inv_records = list(inv_records)
+        cash_flow_recs:  list[dict] = []
+        if cash_acc_id:
+            cash_flow_recs = [r for r in inv_records if not r.get("symbol")]
+            inv_records    = [r for r in inv_records if r.get("symbol")]
+            for cf in cash_flow_recs:
+                amount = cf["total_eur"] if cf["action"] == "CashIn" else -cf["total_eur"]
+                tx_records.append({
+                    "record_type": "transaction",
+                    "source":      "Crypto.com",
+                    "desc":        cf["desc"],
+                    "date":        cf["date"],
+                    "amount":      amount,
+                    "description": f"Crypto.com {cf['action']}",
+                    "currency":    "EUR",
+                })
+
+        # ── Fetch summary ──────────────────────────────────────────────────
+        n_orders, n_dep, n_wdr = raw_counts
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Filled orders",      n_orders)
+        m2.metric("Deposits",           n_dep)
+        m3.metric("Withdrawals",        n_wdr)
+        m4.metric("Investment records", len(inv_records))
+
+        if not inv_records and not tx_records:
+            st.warning(
+                "No importable records found. "
+                "Check your date filter and that your API key has View permission."
+            )
+            return
+
+        if cash_acc_id:
+            st.info(
+                f"**Investments** → **{acc_name}** (ID {acc_id})   |   "
+                f"**Cash transactions** → **{cash_acc_name}** (ID {cash_acc_id})"
+            )
+
+        # ── Action breakdown ───────────────────────────────────────────────
+        if inv_records:
+            with st.expander("📊 Investment action breakdown"):
+                import collections
+                action_counts = collections.Counter(r["action"] for r in inv_records)
+                df_ac = pd.DataFrame(
+                    [{"action": k, "count": v} for k, v in action_counts.most_common()]
+                )
+                st.dataframe(df_ac, hide_index=True, width="stretch",
+                             column_config={
+                                 "action": "Action",
+                                 "count":  st.column_config.NumberColumn("# Records", format="%d"),
+                             })
+
+        # ── Reconciliation summary ─────────────────────────────────────────
+        truly_new_inv  = [r for r in inv_records
+                          if r["desc"] not in existing_inv
+                          and r["desc"] not in fuzzy_inv
+                          and r["desc"] not in ignored_descs]
+        truly_new_tx   = [r for r in tx_records
+                          if r["desc"] not in existing_tx
+                          and r["desc"] not in fuzzy_tx
+                          and r["desc"] not in ignored_descs]
+        fuzzy_only_inv = [r for r in inv_records if r["desc"] in fuzzy_inv]
+        fuzzy_only_tx  = [r for r in tx_records  if r["desc"] in fuzzy_tx]
+        exist_inv_count= sum(1 for r in inv_records if r["desc"] in existing_inv)
+        exist_tx_count = sum(1 for r in tx_records  if r["desc"] in existing_tx)
+        ign_inv_count  = sum(1 for r in inv_records if r["desc"] in ignored_descs)
+        ign_tx_count   = sum(1 for r in tx_records  if r["desc"] in ignored_descs)
+        _skip_inv = exist_inv_count + len(fuzzy_only_inv)
+        _skip_tx  = exist_tx_count  + len(fuzzy_only_tx)
+
+        if not truly_new_inv and not truly_new_tx and not replace_mode:
+            st.info(
+                f"✅ Nothing genuinely new — "
+                f"**{exist_inv_count}** inv exact + **{len(fuzzy_only_inv)}** likely-dup, "
+                f"**{exist_tx_count}** tx exact + **{len(fuzzy_only_tx)}** likely-dup."
+            )
+        else:
+            st.success(
+                f"Found **{len(truly_new_inv)}** new investment record(s) and "
+                f"**{len(truly_new_tx)}** new cash transaction(s) to import."
+            )
+        if fuzzy_only_inv or fuzzy_only_tx:
+            st.warning(
+                f"⚠️ **{len(fuzzy_only_inv)}** investment(s) and "
+                f"**{len(fuzzy_only_tx)}** transaction(s) match by date/amount but have "
+                "a different key — marked **⚠️ Likely duplicate** and will be skipped."
+            )
+        if ign_inv_count or ign_tx_count:
+            st.info(
+                f"⏭️ **{ign_inv_count}** investment(s) and "
+                f"**{ign_tx_count}** transaction(s) are on the ignore list."
+            )
+
+        r1, r2, r3, r4 = st.columns(4)
+        r1.metric("🆕 New investments",   len(truly_new_inv))
+        r2.metric("🔄 Skip investments",  _skip_inv + ign_inv_count,
+                  help="✅ Exact + ⚠️ Likely duplicate + ⏭️ Ignored")
+        r3.metric("🆕 New transactions",  len(truly_new_tx))
+        r4.metric("🔄 Skip transactions", _skip_tx + ign_tx_count,
+                  help="✅ Exact + ⚠️ Likely duplicate + ⏭️ Ignored")
+
+        # ── Preview ────────────────────────────────────────────────────────
+        st.markdown("### 👁️ Preview")
+        _cdc_preview_with_status(
+            inv_records, tx_records,
+            existing_inv, existing_tx,
+            fuzzy_inv, fuzzy_tx,
+            sec_matches,
+            ignored_descs=ignored_descs,
+        )
+
+        # ── Security mappings ──────────────────────────────────────────────
+        _cdc_security_mapping_ui(sec_matches)
+
+        # ── Ignore manager ─────────────────────────────────────────────────
+        _ignore_manager_ui(
+            "Crypto.com",
+            inv_records, tx_records,
+            existing_inv, existing_tx,
+            fuzzy_inv, fuzzy_tx,
+            ignored_descs,
+            session_key="cdc",
+        )
+
+        # ── Import ─────────────────────────────────────────────────────────
+        st.divider()
+        st.markdown("### 💾 Import")
+        if cash_acc_id:
+            st.caption(
+                f"Investments → **{acc_name}** (ID {acc_id})   |   "
+                f"Cash transactions → **{cash_acc_name}** (ID {cash_acc_id})"
+            )
+        else:
+            st.caption(f"Target account: **{acc_name}** (ID {acc_id})")
+
+        _cicol1, _cicol2 = st.columns(2)
+        _import_inv = _cicol1.checkbox("📈 Import investments",       value=True, key="cdc_import_inv")
+        _import_tx  = _cicol2.checkbox("💳 Import cash transactions", value=True, key="cdc_import_tx")
+
+        def _is_cash_flow(r: dict) -> bool:
+            return r["action"] in ("CashIn", "CashOut") and not r.get("symbol")
+
+        if cash_acc_id and not replace_mode:
+            new_cash_flow = [cf for cf in cash_flow_recs if cf["desc"] not in existing_tx]
+            _imp_inv = (
+                (truly_new_inv if _import_inv else [])
+                + (new_cash_flow if _import_tx else [])
+            )
+        elif replace_mode:
+            _imp_inv = []
+            if _import_inv:
+                _imp_inv += [r for r in orig_inv_records
+                             if not (cash_acc_id and _is_cash_flow(r))]
+            if _import_tx and cash_acc_id:
+                _imp_inv += [r for r in orig_inv_records if _is_cash_flow(r)]
+        else:
+            _imp_inv = truly_new_inv if _import_inv else []
+
+        _imp_tx = (
+            ([r for r in orig_tx_records
+              if r["desc"] not in existing_tx and r["desc"] not in ignored_descs]
+             if not replace_mode else orig_tx_records)
+            if _import_tx else []
+        )
+        _new_total = len(_imp_inv) + len(_imp_tx)
+
+        if _new_total == 0 and not replace_mode:
+            st.info(
+                "No records to import. "
+                "Enable **Replace mode** above if you want a clean re-import."
+            )
+        else:
+            _btn_suffix = (
+                f" ({_new_total} record{'s' if _new_total != 1 else ''})"
+                if not replace_mode else " (replace mode)"
+            )
+            if st.button(f"✅ Confirm Import{_btn_suffix}",
+                         key="cdc_confirm", type="primary"):
+                from data.cryptocom_connector import run_cryptocom_import
+                prog = st.progress(0.0, text="Importing…")
+                try:
+                    counts = run_cryptocom_import(
+                        _imp_inv, _imp_tx, acc_id,
+                        replace_mode=replace_mode,
+                        progress_cb=lambda p: prog.progress(p, text="Importing…"),
+                        cash_account_id=cash_acc_id,
+                    )
+                    prog.empty()
+                    st.success("✅ Import complete!")
+                    _import_summary(counts)
+                    try:
+                        save_app_setting("cdc_account_id", str(acc_id))
+                        if cash_acc_id:
+                            save_app_setting("cdc_cash_account_id", str(cash_acc_id))
+                    except Exception:
+                        pass
+                    for k in ("cdc_parsed", "cdc_inv_records", "cdc_tx_records",
+                              "cdc_cash_acc_id", "cdc_raw_counts",
+                              "cdc_existing_inv", "cdc_existing_tx",
+                              "cdc_fuzzy_inv", "cdc_fuzzy_tx", "cdc_sec_matches",
+                              "cdc_ignored"):
+                        st.session_state.pop(k, None)
+                    _load_accounts.clear()
+                    st.cache_data.clear()
+                    st.rerun()
+                except Exception as exc:
+                    prog.empty()
+                    st.error(f"Import failed: {exc}")
+                    import traceback
+                    st.code(traceback.format_exc())
+
+
+# ===========================================================================
 # Coinbase — main render function
 # ===========================================================================
 
@@ -3954,12 +4586,13 @@ app database) lasts ~1 year and is used to auto-renew without asking you to log 
 # ===========================================================================
 
 def render_brokerage_section() -> None:
-    """Render brokerage importers as tabs (IB · Revolut Trading · Coinbase · Capital.com · FxPro · Saxo)."""
-    tab_ib, tab_revt, tab_saxo, tab_cb, tab_capital, tab_fxpro = st.tabs([
+    """Render brokerage importers as tabs."""
+    tab_ib, tab_revt, tab_saxo, tab_cb, tab_cdc, tab_capital, tab_fxpro = st.tabs([
         "📊 Interactive Brokers",
         "💚 Revolut Trading",
         "📈 Saxo Bank",
         "₿ Coinbase",
+        "🔷 Crypto.com",
         "📈 Capital.com",
         "📈 FxPro",
     ])
@@ -3982,6 +4615,10 @@ def render_brokerage_section() -> None:
     with tab_cb:
         _brand_header("https://logo.clearbit.com/coinbase.com", "Coinbase")
         render_coinbase_import()
+
+    with tab_cdc:
+        _brand_header("https://logo.clearbit.com/crypto.com", "Crypto.com")
+        render_cryptocom_import()
 
     with tab_capital:
         _brand_header("https://logo.clearbit.com/capital.com",

@@ -533,14 +533,16 @@ def download_historical_prices_from_yahoo(tsperiod=None, target_sec_id=None):
         # ── Single batch upsert ───────────────────────────────────────────────
         if all_rows:
             execute_batch(cur, """
-                INSERT INTO Historical_Prices (Securities_Id, Date, Close, High, Low, Volume)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                INSERT INTO Historical_Prices (Securities_Id, Date, Close, High, Low, Volume, Source, Downloaded_At)
+                VALUES (%s, %s, %s, %s, %s, %s, 'Yahoo Finance', NOW())
                 ON CONFLICT (Securities_Id, Date)
                 DO UPDATE SET
-                    Close  = EXCLUDED.Close,
-                    High   = EXCLUDED.High,
-                    Low    = EXCLUDED.Low,
-                    Volume = EXCLUDED.Volume
+                    Close         = EXCLUDED.Close,
+                    High          = EXCLUDED.High,
+                    Low           = EXCLUDED.Low,
+                    Volume        = EXCLUDED.Volume,
+                    Source        = EXCLUDED.Source,
+                    Downloaded_At = EXCLUDED.Downloaded_At
             """, all_rows, page_size=500)
             conn.commit()
 
@@ -1140,14 +1142,16 @@ def download_historical_prices_from_tradingview(tsperiod="1m", target_sec_id=Non
         if all_rows:
             execute_batch(cur, """
                 INSERT INTO Historical_Prices
-                    (Securities_Id, Date, Close, High, Low, Volume)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                    (Securities_Id, Date, Close, High, Low, Volume, Source, Downloaded_At)
+                VALUES (%s, %s, %s, %s, %s, %s, 'TradingView', NOW())
                 ON CONFLICT (Securities_Id, Date)
                 DO UPDATE SET
-                    Close  = EXCLUDED.Close,
-                    High   = EXCLUDED.High,
-                    Low    = EXCLUDED.Low,
-                    Volume = EXCLUDED.Volume
+                    Close         = EXCLUDED.Close,
+                    High          = EXCLUDED.High,
+                    Low           = EXCLUDED.Low,
+                    Volume        = EXCLUDED.Volume,
+                    Source        = EXCLUDED.Source,
+                    Downloaded_At = EXCLUDED.Downloaded_At
             """, all_rows, page_size=500)
             conn.commit()
 
@@ -1250,9 +1254,12 @@ def download_bond_prices_from_solidus():
                     s_id = res[0]
                     # Use PDF Date instead of datetime.now()
                     cur.execute("""
-                        INSERT INTO Historical_Prices (Securities_Id, Date, Close)
-                        VALUES (%s, %s, %s)
-                        ON CONFLICT (Securities_Id, Date) DO UPDATE SET Close = EXCLUDED.Close
+                        INSERT INTO Historical_Prices (Securities_Id, Date, Close, Source, Downloaded_At)
+                        VALUES (%s, %s, %s, 'Solidus', NOW())
+                        ON CONFLICT (Securities_Id, Date) DO UPDATE SET
+                            Close         = EXCLUDED.Close,
+                            Source        = EXCLUDED.Source,
+                            Downloaded_At = EXCLUDED.Downloaded_At
                     """, (s_id, pdf_date, mid_price))
                     updated_count += 1
 
