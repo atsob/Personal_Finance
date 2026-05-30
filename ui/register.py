@@ -50,9 +50,9 @@ def _render_transaction_table(acc_id, payee_options, acc_options, cat_options, t
 
     if _period == "Custom":
         with f2:
-            _from_date = st.date_input("From", value=default_from, key=f"{_sk}_from")
+            _from_date = st.date_input("From", value=default_from, min_value=date(1900, 1, 1), key=f"{_sk}_from")
         with f3:
-            _to_date = st.date_input("To", value=today, key=f"{_sk}_to")
+            _to_date = st.date_input("To", value=today, min_value=date(1900, 1, 1), key=f"{_sk}_to")
         _show_future = False  # custom range already explicit
     else:
         _from_date = _period_map.get(_period, default_from)
@@ -1210,10 +1210,11 @@ def _render_edit_investment_form(acc_id, acc_type, df_accs, df_securities, get_d
     _fc1, _fc2 = st.columns(2)
     with _fc1:
         _edit_from = st.date_input("From", value=date.today() - timedelta(days=90),
-                                   min_value=date(1990, 1, 1), max_value=date.today(),
+                                   min_value=date(1990, 1, 1), 
                                     key=f"inv_edit_from_{acc_id}")
     with _fc2:
         _edit_to = st.date_input("To", value=date.today(),
+                                 min_value=date(1990, 1, 1),
                                   key=f"inv_edit_to_{acc_id}")
 
     with get_db_fn() as _conn_load:
@@ -1396,6 +1397,7 @@ def _render_edit_investment_form(acc_id, acc_type, df_accs, df_securities, get_d
         inv_date = st.date_input(
             "Date",
             value=sel_row['date'],
+            min_value=date(1990, 1, 1),
             key=f"inv_edit_date_{acc_id}",
         )
 

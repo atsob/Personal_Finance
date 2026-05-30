@@ -2258,16 +2258,43 @@ detects the format automatically.
 
     # ── Account mapping ──────────────────────────────────────────────────────
     st.markdown("### 🏦 Account Mapping")
-    st.caption(
-        "Select the app account that will hold the imported **investment** records "
-        "(buys, sells, staking rewards).  Cash transactions (fiat deposits/withdrawals, "
-        "sends/receives) will also be imported into this account."
-    )
-    acc_id, acc_name = _account_selectbox(
-        "Import into account",
-        key="cb_account",
-        type_filter=["Brokerage", "Other Investment", "Pension", "Savings"],
-    )
+
+    # Restore last-used cash account (first render only)
+    if "cb_cash_account" not in st.session_state:
+        _saved_cb_cash = get_app_setting("cb_cash_account_id")
+        if _saved_cb_cash:
+            try:
+                _cb_cash_row = _load_accounts()
+                _cb_cash_row = _cb_cash_row[_cb_cash_row["accounts_id"] == int(_saved_cb_cash)]
+                if not _cb_cash_row.empty:
+                    st.session_state["cb_cash_account"] = _cb_cash_row.iloc[0]["accounts_name"]
+            except Exception:
+                pass
+
+    _am_col1, _am_col2 = st.columns(2)
+    with _am_col1:
+        st.caption("Investment account (buys, sells, staking rewards)")
+        acc_id, acc_name = _account_selectbox(
+            "Investment account",
+            key="cb_account",
+            type_filter=["Brokerage", "Other Investment", "Pension", "Savings"],
+        )
+    with _am_col2:
+        st.caption(
+            "Cash account (fiat deposits/withdrawals) — optional.  "
+            "When set, CashIn/CashOut records go here as Transactions "
+            "instead of as investment entries in the brokerage account."
+        )
+        _df_accounts = _load_accounts()
+        _cash_options = ["— None (use investment account) —"] + _df_accounts["accounts_name"].tolist()
+        _cash_sel = st.selectbox("Cash account (optional)", _cash_options, key="cb_cash_account")
+        if _cash_sel and _cash_sel != "— None (use investment account) —":
+            _cash_row  = _df_accounts[_df_accounts["accounts_name"] == _cash_sel]
+            cash_acc_id   = int(_cash_row.iloc[0]["accounts_id"]) if not _cash_row.empty else None
+            cash_acc_name = _cash_sel
+        else:
+            cash_acc_id   = None
+            cash_acc_name = None
 
     st.divider()
 
@@ -2381,8 +2408,8 @@ detects the format automatically.
                 st.code(traceback.format_exc())
                 return
 
-            existing_inv, existing_tx = _cb_exist(inv_records, tx_records, acc_id)
-            fuzzy_inv, fuzzy_tx       = _cb_fuzzy(inv_records, tx_records, acc_id)
+            existing_inv, existing_tx = _cb_exist(inv_records, tx_records, acc_id, cash_acc_id)
+            fuzzy_inv, fuzzy_tx       = _cb_fuzzy(inv_records, tx_records, acc_id, cash_acc_id)
             fuzzy_inv -= existing_inv
             fuzzy_tx  -= existing_tx
             sec_matches = _cb_sec(inv_records)
@@ -2390,9 +2417,10 @@ detects the format automatically.
             from database.queries import get_ignored_records as _get_ign_cb
             ignored_descs = _get_ign_cb("Coinbase")
 
-            st.session_state["cb_inv_records"]  = inv_records
-            st.session_state["cb_tx_records"]   = tx_records
-            st.session_state["cb_raw_txn_count"]= len(all_txns)
+            st.session_state["cb_inv_records"]   = inv_records
+            st.session_state["cb_tx_records"]    = tx_records
+            st.session_state["cb_cash_acc_id"]   = cash_acc_id
+            st.session_state["cb_raw_txn_count"] = len(all_txns)
             st.session_state["cb_existing_inv"] = existing_inv
             st.session_state["cb_existing_tx"]  = existing_tx
             st.session_state["cb_fuzzy_inv"]    = fuzzy_inv
@@ -2401,8 +2429,10 @@ detects the format automatically.
             st.session_state["cb_ignored"]      = ignored_descs
             st.session_state["cb_parsed"]       = True
 
-        inv_records   = st.session_state.get("cb_inv_records",  [])
-        tx_records    = st.session_state.get("cb_tx_records",   [])
+        inv_records    = st.session_state.get("cb_inv_records",  [])
+        orig_tx_records = st.session_state.get("cb_tx_records", [])  # for import
+        tx_records     = list(orig_tx_records)
+        cash_acc_id    = st.session_state.get("cb_cash_acc_id",  cash_acc_id)
         existing_inv  = st.session_state.get("cb_existing_inv", set())
         existing_tx   = st.session_state.get("cb_existing_tx",  set())
         fuzzy_inv     = st.session_state.get("cb_fuzzy_inv",    set())
@@ -2410,6 +2440,28 @@ detects the format automatically.
         sec_matches   = st.session_state.get("cb_sec_matches",  {})
         ignored_descs = st.session_state.get("cb_ignored",      set())
         raw_count     = st.session_state.get("cb_raw_txn_count", 0)
+
+        # When a separate cash account is configured, split CashIn/CashOut out of
+        # inv_records so the preview shows them under "Cash Transactions" (the
+        # correct tab).  The original list is preserved for the import call
+        # because run_coinbase_import handles the routing internally.
+        orig_inv_records = list(inv_records)  # used by import button
+        cash_flow_recs: list[dict] = []
+        if cash_acc_id:
+            cash_flow_recs = [cf for cf in inv_records if not cf.get("symbol")]
+            inv_records    = [cf for cf in inv_records if cf.get("symbol")]
+            tx_records     = list(tx_records)
+            for cf in cash_flow_recs:
+                amount = cf["total_eur"] if cf["action"] == "CashIn" else -cf["total_eur"]
+                tx_records.append({
+                    "record_type": "transaction",
+                    "source":      "Coinbase",
+                    "desc":        cf["desc"],
+                    "date":        cf["date"],
+                    "amount":      amount,
+                    "description": f"Coinbase {cf['action']}",
+                    "currency":    "EUR",
+                })
 
         # ── Fetch summary ─────────────────────────────────────────────────
         m1, m2, m3 = st.columns(3)
@@ -2424,6 +2476,13 @@ detects the format automatically.
                 "`wallet:transactions:read` permission."
             )
             return
+
+        # ── Account info ──────────────────────────────────────────────────
+        if cash_acc_id:
+            st.info(
+                f"**Investments** → **{acc_name}** (ID {acc_id})   |   "
+                f"**Cash transactions** → **{cash_acc_name}** (ID {cash_acc_id})"
+            )
 
         # ── Action breakdown ──────────────────────────────────────────────
         if inv_records:
@@ -2514,14 +2573,47 @@ detects the format automatically.
         # ── Import ────────────────────────────────────────────────────────
         st.divider()
         st.markdown("### 💾 Import")
-        st.caption(f"Target account: **{acc_name}** (ID {acc_id})")
+        if cash_acc_id:
+            st.caption(
+                f"Investments → **{acc_name}** (ID {acc_id})   |   "
+                f"Cash transactions → **{cash_acc_name}** (ID {cash_acc_id})"
+            )
+        else:
+            st.caption(f"Target account: **{acc_name}** (ID {acc_id})")
 
         _cicol1, _cicol2 = st.columns(2)
         _import_inv = _cicol1.checkbox("📈 Import investments",       value=True, key="cb_import_inv")
         _import_tx  = _cicol2.checkbox("💳 Import cash transactions", value=True, key="cb_import_tx")
 
-        _imp_inv   = (truly_new_inv if not replace_mode else inv_records) if _import_inv else []
-        _imp_tx    = (truly_new_tx  if not replace_mode else tx_records)  if _import_tx  else []
+        # Pass records to run_coinbase_import.
+        # CashIn/CashOut records (no symbol) are routed by the connector to the
+        # cash account as Transactions — so they must be gated on _import_tx,
+        # not _import_inv.  Real investment records are gated on _import_inv.
+        def _is_cash_flow(r: dict) -> bool:
+            return r["action"] in ("CashIn", "CashOut") and not r.get("symbol")
+
+        if cash_acc_id and not replace_mode:
+            new_cash_flow = [cf for cf in cash_flow_recs if cf["desc"] not in existing_tx]
+            _imp_inv = (
+                (truly_new_inv if _import_inv else [])
+                + (new_cash_flow if _import_tx else [])
+            )
+        elif replace_mode:
+            _imp_inv = []
+            if _import_inv:
+                # Real investments (exclude cash-flow rows when a cash account exists)
+                _imp_inv += [r for r in orig_inv_records
+                             if not (cash_acc_id and _is_cash_flow(r))]
+            if _import_tx and cash_acc_id:
+                # Cash-flow rows that the connector will route to the cash account
+                _imp_inv += [r for r in orig_inv_records if _is_cash_flow(r)]
+        else:
+            _imp_inv = truly_new_inv if _import_inv else []
+        _imp_tx = (
+            ([r for r in orig_tx_records if r["desc"] not in existing_tx and r["desc"] not in ignored_descs]
+             if not replace_mode else orig_tx_records)
+            if _import_tx else []
+        )
         _new_total = len(_imp_inv) + len(_imp_tx)
 
         if _new_total == 0 and not replace_mode:
@@ -2543,16 +2635,20 @@ detects the format automatically.
                         _imp_inv, _imp_tx, acc_id,
                         replace_mode=replace_mode,
                         progress_cb=lambda p: prog.progress(p, text="Importing…"),
+                        cash_account_id=cash_acc_id,
                     )
                     prog.empty()
                     st.success("✅ Import complete!")
                     _import_summary(counts)
                     try:
                         save_app_setting("cb_account_id", str(acc_id))
+                        if cash_acc_id:
+                            save_app_setting("cb_cash_account_id", str(cash_acc_id))
                     except Exception:
                         pass
                     for k in ("cb_parsed", "cb_inv_records", "cb_tx_records",
-                              "cb_raw_txn_count", "cb_existing_inv", "cb_existing_tx",
+                              "cb_cash_acc_id", "cb_raw_txn_count",
+                              "cb_existing_inv", "cb_existing_tx",
                               "cb_fuzzy_inv", "cb_fuzzy_tx", "cb_sec_matches",
                               "cb_ignored", "cb_accounts"):
                         st.session_state.pop(k, None)

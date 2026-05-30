@@ -945,18 +945,31 @@ def _tx_description(tx_type: str, ccy: str, tx: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def check_existing_records(
-    inv_records: list[dict],
-    tx_records:  list[dict],
-    account_id:  int,
+    inv_records:      list[dict],
+    tx_records:       list[dict],
+    account_id:       int,
+    cash_account_id:  int | None = None,
 ) -> tuple[set[str], set[str]]:
+    """Return (existing_inv_descs, existing_tx_descs).
+
+    When *cash_account_id* is set, CashIn/CashOut records (which will be
+    inserted as Transactions into the cash account) are checked against
+    ``Transactions`` on that account rather than ``Investments`` on the
+    brokerage account.
+    """
     from database.connection import get_connection as _gc
     conn = _gc()
     cur  = conn.cursor()
     try:
         existing_inv: set[str] = set()
         existing_tx:  set[str] = set()
-        if inv_records:
-            descs = [r["desc"] for r in inv_records]
+
+        # Split inv_records: crypto investments vs. cash-flow (CashIn/CashOut)
+        crypto_inv   = [r for r in inv_records if r.get("symbol")]
+        cash_flow    = [r for r in inv_records if not r.get("symbol")]
+
+        if crypto_inv:
+            descs = [r["desc"] for r in crypto_inv]
             ph    = ",".join(["%s"] * len(descs))
             cur.execute(
                 f"SELECT Description FROM Investments "
@@ -964,15 +977,38 @@ def check_existing_records(
                 [account_id] + descs,
             )
             existing_inv = {row[0] for row in cur.fetchall()}
+
+        # CashIn/CashOut: check against Transactions in cash_account_id (if set)
+        # or against Investments in account_id (legacy single-account mode)
+        if cash_flow:
+            descs = [r["desc"] for r in cash_flow]
+            ph    = ",".join(["%s"] * len(descs))
+            if cash_account_id:
+                cur.execute(
+                    f"SELECT Description FROM Transactions "
+                    f"WHERE Accounts_Id = %s AND Description IN ({ph})",
+                    [cash_account_id] + descs,
+                )
+                existing_tx |= {row[0] for row in cur.fetchall()}
+            else:
+                cur.execute(
+                    f"SELECT Description FROM Investments "
+                    f"WHERE Accounts_Id = %s AND Description IN ({ph})",
+                    [account_id] + descs,
+                )
+                existing_inv |= {row[0] for row in cur.fetchall()}
+
         if tx_records:
+            target_id = cash_account_id if cash_account_id else account_id
             descs = [r["desc"] for r in tx_records]
             ph    = ",".join(["%s"] * len(descs))
             cur.execute(
                 f"SELECT Description FROM Transactions "
                 f"WHERE Accounts_Id = %s AND Description IN ({ph})",
-                [account_id] + descs,
+                [target_id] + descs,
             )
-            existing_tx = {row[0] for row in cur.fetchall()}
+            existing_tx |= {row[0] for row in cur.fetchall()}
+
         return existing_inv, existing_tx
     finally:
         cur.close()
@@ -980,10 +1016,18 @@ def check_existing_records(
 
 
 def check_fuzzy_duplicates(
-    inv_records: list[dict],
-    tx_records:  list[dict],
-    account_id:  int,
+    inv_records:     list[dict],
+    tx_records:      list[dict],
+    account_id:      int,
+    cash_account_id: int | None = None,
 ) -> tuple[set[str], set[str]]:
+    """Return (fuzzy_inv_descs, fuzzy_tx_descs) for likely-duplicate detection.
+
+    When *cash_account_id* is set, CashIn/CashOut records (cash-flow, no symbol)
+    are matched against Transactions in the cash account by date + abs(amount),
+    sign-insensitive so that existing entries recorded from either perspective
+    (deposit as +amount or as −amount via a linked transfer) are detected.
+    """
     from database.connection import get_connection as _gc
     conn = _gc()
     cur  = conn.cursor()
@@ -991,25 +1035,44 @@ def check_fuzzy_duplicates(
     fuzzy_tx:  set[str] = set()
     try:
         for rec in inv_records:
-            cur.execute(
-                """SELECT 1 FROM Investments
-                   WHERE Accounts_Id  = %s
-                     AND Date         = %s
-                     AND Action::text ILIKE %s
-                     AND ABS(Quantity - %s) < 0.0000001
-                   LIMIT 1""",
-                (account_id, rec["date"], rec["action"], rec["quantity"]),
-            )
-            if cur.fetchone():
-                fuzzy_inv.add(rec["desc"])
+            is_cash_flow = rec["action"] in ("CashIn", "CashOut") and not rec.get("symbol")
+
+            if is_cash_flow and cash_account_id:
+                # Match against Transactions in the cash account; ignore sign so both
+                # old linked-transfer entries (negative) and new direct entries match.
+                eur_amt = rec["total_eur"]
+                cur.execute(
+                    """SELECT 1 FROM Transactions
+                       WHERE Accounts_Id           = %s
+                         AND Date                  = %s
+                         AND ABS(ABS(Total_Amount) - %s) < 0.05
+                       LIMIT 1""",
+                    (cash_account_id, rec["date"], eur_amt),
+                )
+                if cur.fetchone():
+                    fuzzy_tx.add(rec["desc"])
+            else:
+                cur.execute(
+                    """SELECT 1 FROM Investments
+                       WHERE Accounts_Id  = %s
+                         AND Date         = %s
+                         AND Action::text ILIKE %s
+                         AND ABS(Quantity - %s) < 0.0000001
+                       LIMIT 1""",
+                    (account_id, rec["date"], rec["action"], rec["quantity"]),
+                )
+                if cur.fetchone():
+                    fuzzy_inv.add(rec["desc"])
+
+        _tx_target = cash_account_id if cash_account_id else account_id
         for rec in tx_records:
             cur.execute(
                 """SELECT 1 FROM Transactions
-                   WHERE Accounts_Id          = %s
-                     AND Date                 = %s
-                     AND ABS(Total_Amount - %s) < 0.01
+                   WHERE Accounts_Id               = %s
+                     AND Date                      = %s
+                     AND ABS(ABS(Total_Amount) - ABS(%s)) < 0.05
                    LIMIT 1""",
-                (account_id, rec["date"], rec["amount"]),
+                (_tx_target, rec["date"], rec["amount"]),
             )
             if cur.fetchone():
                 fuzzy_tx.add(rec["desc"])
@@ -1083,16 +1146,22 @@ def preview_security_matches(inv_records: list[dict]) -> dict[str, tuple]:
 # ---------------------------------------------------------------------------
 
 def run_coinbase_import(
-    inv_records:  list[dict],
-    tx_records:   list[dict],
-    account_id:   int,
-    replace_mode: bool  = False,
+    inv_records:     list[dict],
+    tx_records:      list[dict],
+    account_id:      int,
+    replace_mode:    bool     = False,
     progress_cb=None,
+    cash_account_id: int | None = None,
 ) -> dict:
     """Insert Coinbase records into the database.
 
     Uses the same _get_or_create_security logic as revolut_importer
     (saved mapping → ticker → name → create new) for crypto assets.
+
+    When *cash_account_id* is provided, CashIn/CashOut records are inserted
+    as ``Transactions`` into that account instead of as ``Investments`` into
+    the brokerage account.  This supports the two-account setup where one
+    account holds crypto investments and another holds the cash/EUR movements.
     """
     from database.connection import get_connection as _gc
     from database.crud       import update_holdings, update_accounts_balances, update_investment_balances
@@ -1111,10 +1180,17 @@ def run_coinbase_import(
                 "DELETE FROM Investments  WHERE Accounts_Id = %s AND Description LIKE %s",
                 (account_id, f"{_CB_PREFIX}%"),
             )
-            cur.execute(
-                "DELETE FROM Transactions WHERE Accounts_Id = %s AND Description LIKE %s",
-                (account_id, f"{_CB_PREFIX}%"),
-            )
+            # In replace mode delete cash-flow records from the appropriate table/account
+            if cash_account_id:
+                cur.execute(
+                    "DELETE FROM Transactions WHERE Accounts_Id = %s AND Description LIKE %s",
+                    (cash_account_id, f"{_CB_PREFIX}%"),
+                )
+            else:
+                cur.execute(
+                    "DELETE FROM Transactions WHERE Accounts_Id = %s AND Description LIKE %s",
+                    (account_id, f"{_CB_PREFIX}%"),
+                )
 
         total = len(inv_records) + len(tx_records)
         done  = 0
@@ -1122,13 +1198,24 @@ def run_coinbase_import(
         for rec in inv_records:
             desc = rec["desc"]
 
-            # CashIn / CashOut have no security (Securities_Id = NULL).
-            # They represent EUR flowing into or out of the Coinbase account
-            # and are read by balance, XIRR and net-invested queries directly
-            # from the Investments table.
             is_cash_flow = rec["action"] in ("CashIn", "CashOut") and not rec.get("symbol")
 
-            if is_cash_flow:
+            if is_cash_flow and cash_account_id:
+                # Route CashIn/CashOut to the dedicated cash account as Transactions
+                if not replace_mode and _tx_exists(cur, cash_account_id, desc):
+                    counts["transactions_skip"] += 1
+                else:
+                    amount = rec["total_eur"] if rec["action"] == "CashIn" else -rec["total_eur"]
+                    cur.execute(
+                        """INSERT INTO Transactions
+                               (Accounts_Id, Date, Total_Amount, Description, Cleared)
+                           VALUES (%s, %s, %s, %s, TRUE)""",
+                        (cash_account_id, rec["date"], amount, desc),
+                    )
+                    counts["transactions"] += 1
+
+            elif is_cash_flow:
+                # Legacy: no separate cash account — keep as Investment CashIn/CashOut
                 if not replace_mode and _inv_exists(cur, account_id, desc):
                     counts["investments_skip"] += 1
                 else:
@@ -1176,16 +1263,17 @@ def run_coinbase_import(
             if progress_cb and done % 10 == 0:
                 progress_cb(done / max(total, 1))
 
+        _tx_target = cash_account_id if cash_account_id else account_id
         for rec in tx_records:
             desc = rec["desc"]
-            if not replace_mode and _tx_exists(cur, account_id, desc):
+            if not replace_mode and _tx_exists(cur, _tx_target, desc):
                 counts["transactions_skip"] += 1
             else:
                 cur.execute(
                     """INSERT INTO Transactions
                            (Accounts_Id, Date, Total_Amount, Description, Cleared)
                        VALUES (%s, %s, %s, %s, TRUE)""",
-                    (account_id, rec["date"], rec["amount"], desc),
+                    (_tx_target, rec["date"], rec["amount"], desc),
                 )
                 counts["transactions"] += 1
             done += 1
@@ -1203,13 +1291,17 @@ def run_coinbase_import(
     finally:
         cur.close()
 
-    # Auto-create linked cash transactions when the investment account has a
-    # configured linked cash account.
-    from database.crud import create_linked_cash_transactions_for_unlinked, get_linked_account_id
-    _cb_linked = get_linked_account_id(account_id)
-    if _cb_linked:
-        create_linked_cash_transactions_for_unlinked(account_id, _cb_linked)
-        update_accounts_balances(_cb_linked)
-        update_investment_balances()
+    # When using a dedicated cash account, skip auto-linked-transaction creation
+    # (the cash account already holds the direct transactions).
+    if not cash_account_id:
+        from database.crud import create_linked_cash_transactions_for_unlinked, get_linked_account_id
+        _cb_linked = get_linked_account_id(account_id)
+        if _cb_linked:
+            create_linked_cash_transactions_for_unlinked(account_id, _cb_linked)
+            update_accounts_balances(_cb_linked)
+            update_investment_balances()
+
+    if cash_account_id:
+        update_accounts_balances(cash_account_id)
 
     return counts
