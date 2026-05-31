@@ -188,6 +188,7 @@ CREATE TABLE Holdings (
     Simple_Avg_Price NUMERIC(20, 8),
     Fifo_Avg_Price   NUMERIC(20, 8),
     Last_Update      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    Staking          BOOLEAN DEFAULT FALSE,  -- if TRUE, these holdings are currently staked/locked up and not available for trading
     embedding        vector(768),
     UNIQUE(Accounts_Id, Securities_Id)
 );

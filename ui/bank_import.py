@@ -1136,7 +1136,7 @@ def _apply_import(selected_acc_id, stmt_date, stmt_balance, app_balance,
 
             if action == 'Reconcile':
                 tx_id = meta['_match_tx_id']
-                if tx_id and not meta['_already_rec']:
+                if tx_id and not pd.isna(tx_id) and not meta['_already_rec']:
                     reconcile_ids.append(int(tx_id))
                 history_rows.append({
                     'description_key': _desc_key(desc),

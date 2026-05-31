@@ -1881,24 +1881,24 @@ def get_income_expense_data(start_date, end_date, category_id=None, cash_account
             CASE 
                 WHEN curr.currencies_shortname = 'EUR' THEN 
                     CASE 
-                        WHEN t.action IN ('Dividend', 'IntInc') THEN t.total_amount
-                        WHEN t.action IN ('MiscExp') THEN -ABS(t.total_amount)
+                        WHEN t.action IN ('Dividend', 'IntInc') THEN t.Total_Amount_AccCur
+                        WHEN t.action IN ('MiscExp') THEN -ABS(t.Total_Amount_AccCur)
                         ELSE 0
                     END
-                ELSE 
-                    CASE 
-                        WHEN t.action IN ('Dividend', 'IntInc') THEN t.total_amount * COALESCE(
-                            (SELECT fx_rate FROM FX_Rates 
-                             WHERE currencies_id_1 = curr.currencies_id 
-                               AND date <= t.date 
+                ELSE
+                    CASE
+                        WHEN t.action IN ('Dividend', 'IntInc') THEN t.Total_Amount_AccCur * COALESCE(
+                            (SELECT fx_rate FROM FX_Rates
+                             WHERE currencies_id_1 = curr.currencies_id
+                               AND date <= t.date
                              ORDER BY date DESC LIMIT 1),
                             (SELECT fx_rate FROM DefaultFX_Rates WHERE currencies_id_1 = curr.currencies_id),
                             1
                         )
-                        WHEN t.action IN ('MiscExp') THEN -ABS(t.total_amount) * COALESCE(
-                            (SELECT fx_rate FROM FX_Rates 
-                             WHERE currencies_id_1 = curr.currencies_id 
-                               AND date <= t.date 
+                        WHEN t.action IN ('MiscExp') THEN -ABS(t.Total_Amount_AccCur) * COALESCE(
+                            (SELECT fx_rate FROM FX_Rates
+                             WHERE currencies_id_1 = curr.currencies_id
+                               AND date <= t.date
                              ORDER BY date DESC LIMIT 1),
                             (SELECT fx_rate FROM DefaultFX_Rates WHERE currencies_id_1 = curr.currencies_id),
                             1
@@ -1906,9 +1906,9 @@ def get_income_expense_data(start_date, end_date, category_id=None, cash_account
                         ELSE 0
                     END
             END as split_amount_eur,
-            CASE 
-                WHEN t.action IN ('Dividend', 'IntInc') THEN t.total_amount
-                WHEN t.action IN ('MiscExp') THEN -ABS(t.total_amount)
+            CASE
+                WHEN t.action IN ('Dividend', 'IntInc') THEN t.Total_Amount_AccCur
+                WHEN t.action IN ('MiscExp') THEN -ABS(t.Total_Amount_AccCur)
                 ELSE 0
             END as split_amount_original,
             curr.currencies_shortname as original_currency,
@@ -1932,7 +1932,7 @@ def get_income_expense_data(start_date, end_date, category_id=None, cash_account
     --      AND a.accounts_type IN ('Brokerage', 'Pension', 'Other Investment', 'Margin')
           AND a.accounts_type IN %s
           AND t.action IN ('Dividend', 'IntInc', 'MiscExp')
-          AND t.total_amount != 0
+          AND t.Total_Amount_AccCur != 0
     ),
     TransactionData AS (
         SELECT * FROM BankTransactionData

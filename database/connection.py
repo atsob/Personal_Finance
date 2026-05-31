@@ -120,6 +120,8 @@ def _run_startup_migrations():
         "ALTER TABLE Historical_Prices ADD COLUMN IF NOT EXISTS Source        VARCHAR(50)",
         "ALTER TABLE Historical_Prices ADD COLUMN IF NOT EXISTS Downloaded_At TIMESTAMPTZ",
         "CREATE INDEX IF NOT EXISTS idx_price_source ON Historical_Prices(Source)",
+        # Holdings: staking flag (migration 004)
+        "ALTER TABLE Holdings ADD COLUMN IF NOT EXISTS Staking BOOLEAN DEFAULT FALSE",
     ]
     try:
         conn     = psycopg2.connect(**DB_CONFIG)

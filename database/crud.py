@@ -224,6 +224,78 @@ def execute_db_save(df_original, df_edited, table_name, id_col, current_acc_id=N
                             (mirror_total, mirror_total_target, int(transfers_id), tx_id),
                         )
 
+                # ── NEW TRANSFER: plain tx → transfer when target account added ──
+                # If the user sets accounts_id_target on a row that had no
+                # transfers_id, we need to: allocate a transfers_id, stamp it
+                # on the source row, and insert the mirror transaction.
+                for _, row in df_updates.iterrows():
+                    if _safe_val(row.get('transfers_id')):
+                        continue          # already a transfer — handled above
+                    new_target_acc = _safe_val(row.get('accounts_id_target'))
+                    if not new_target_acc:
+                        continue          # no target account set
+                    tx_id = int(row[id_col])
+                    orig_rows = df_original[df_original[id_col] == tx_id]
+                    if orig_rows.empty:
+                        continue
+                    if _safe_val(orig_rows.iloc[0].get('accounts_id_target')):
+                        continue          # target was already set before this edit
+
+                    # ── allocate a new transfers_id ────────────────────────────
+                    cur.execute("SELECT nextval('transfers_id_seq')")
+                    new_tid = cur.fetchone()[0]
+
+                    tx_total        = _safe_val(row.get('total_amount'))
+                    tx_total_target = _safe_val(row.get('total_amount_target'))
+                    tx_date         = _safe_val(row.get('date'))
+                    tx_payee        = _safe_val(row.get('payees_id'))
+                    tx_desc         = _safe_val(row.get('description'))
+                    tx_acc_id       = _safe_val(row.get('accounts_id'))
+                    if tx_total is None:
+                        continue
+
+                    # Mirror: opposite-signed inflow on the target account
+                    if tx_total_target is not None:
+                        mirror_amount = math.copysign(
+                            abs(float(tx_total_target)), -float(tx_total)
+                        )
+                    else:
+                        mirror_amount = -float(tx_total)
+
+                    # Stamp transfers_id on the (already saved) source row
+                    cur.execute(
+                        "UPDATE Transactions SET transfers_id = %s WHERE transactions_id = %s",
+                        (new_tid, tx_id),
+                    )
+
+                    # Insert mirror row on the target account
+                    cur.execute("""
+                        INSERT INTO Transactions
+                            (Accounts_Id, Date, Payees_Id, Description, Total_Amount,
+                             Cleared, Accounts_Id_Target, Total_Amount_Target, Transfers_Id)
+                        VALUES (%s, %s, %s, %s, %s, TRUE, %s, %s, %s)
+                        RETURNING Transactions_Id
+                    """, (
+                        int(new_target_acc),
+                        tx_date,
+                        tx_payee,
+                        tx_desc,
+                        mirror_amount,
+                        int(tx_acc_id) if tx_acc_id else None,
+                        abs(float(tx_total)),
+                        new_tid,
+                    ))
+                    mirror_tx_id = cur.fetchone()[0]
+
+                    # Insert a balancing split for the mirror row
+                    cur.execute(
+                        "INSERT INTO Splits (Transactions_Id, Categories_Id, Amount, Memo)"
+                        " VALUES (%s, NULL, %s, 'Transfer')",
+                        (mirror_tx_id, mirror_amount),
+                    )
+
+                    _inv_acc_ids_to_refresh.add(int(new_target_acc))
+
                 # ── Single-split sync ──────────────────────────────────────────
                 # When a transaction with exactly one split has its total_amount
                 # changed in the register, keep that split's amount in sync so
@@ -274,6 +346,9 @@ def execute_db_save(df_original, df_edited, table_name, id_col, current_acc_id=N
 
         if table_name == "Transactions" and current_acc_id:
             update_accounts_balances(current_acc_id)
+            # Also refresh any newly-created mirror account balances (new transfers)
+            for _aid in _inv_acc_ids_to_refresh:
+                update_accounts_balances(_aid)
             st.session_state.balance_update_counter = st.session_state.get('balance_update_counter', 0) + 1
             # Invalidate the account list cache so the selectbox reflects new balances.
             st.session_state.pop("df_accs", None)
@@ -728,6 +803,38 @@ def update_holdings():
         cur.close()
         conn.close()
         
+
+def insert_staking_reinvest(entries):
+    """Insert Reinvest investment entries for staking rewards.
+
+    entries: list of dicts with keys:
+        accounts_id, securities_id, quantity, price_per_share, date
+    """
+    if not entries:
+        return
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        for e in entries:
+            qty   = float(e['quantity'])
+            price = float(e.get('price_per_share') or 0)
+            total = qty * price
+            cur.execute("""
+                INSERT INTO Investments
+                    (Accounts_Id, Securities_Id, Date, Action, Quantity,
+                     Price_Per_Share, Commission,
+                     Total_Amount_AccCur, Total_Amount_SecCur, FX_Rate, Description)
+                VALUES (%s, %s, %s, 'Reinvest', %s, %s, 0, %s, %s, 1.0, 'Staking reward')
+            """, (e['accounts_id'], e['securities_id'], e['date'],
+                  qty, price, total, total))
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        raise exc
+    finally:
+        cur.close()
+        conn.close()
+
 
 def update_payee_default_category():
     """Update payee default category based on usage and when not defined."""

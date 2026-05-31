@@ -3,7 +3,7 @@ import pandas as pd
 from datetime import datetime, date, timedelta
 import calendar
 from database.connection import get_db
-from database.crud import save_changes, execute_db_save, update_accounts_balances, update_holdings, update_investment_balances, update_pension_balances
+from database.crud import save_changes, execute_db_save, update_accounts_balances, update_holdings, update_investment_balances, update_pension_balances, insert_staking_reinvest
 from ui.components import copy_df_button
 
 def _render_transaction_table(acc_id, payee_options, acc_options, cat_options, tab_key, acc_balance=0.0):
@@ -1989,8 +1989,9 @@ def render_register():
     # Update session state with the selected account
     st.session_state.account_id_internal = acc_id
     
-    acc_type = df_accs.loc[df_accs['accounts_id'] == acc_id, 'accounts_type'].values[0]
+    acc_type    = df_accs.loc[df_accs['accounts_id'] == acc_id, 'accounts_type'].values[0]
     acc_balance = df_accs.loc[df_accs['accounts_id'] == acc_id, 'accounts_balance'].values[0]
+    acc_credit_limit = float(df_accs.loc[df_accs['accounts_id'] == acc_id, 'credit_limit'].values[0] or 0)
 
     # Main transactions df
     if 'register_df' not in st.session_state or st.session_state.get('register_acc_id') != acc_id:
@@ -2002,8 +2003,14 @@ def render_register():
         df = st.session_state.register_df
     
     if acc_type not in ['Brokerage', 'Pension', 'Other Investment', 'Margin']:  #'Brokerage', 'Pension', 'Other Investment', 'Margin', 'Real Estate', 'Vehicle', 'Asset', 'Liability'
-        
-        st.subheader(f"Outstanding Balance: {acc_balance:,.2f}")
+
+        if acc_type == 'Credit Card' and acc_credit_limit != 0:
+            available_credit = abs(acc_credit_limit) + float(acc_balance)  # balance is negative for CC debt
+            _cc1, _cc2 = st.columns(2)
+            _cc1.subheader(f"Outstanding Balance: {acc_balance:,.2f}")
+            _cc2.subheader(f"Available Credit: {available_credit:,.2f} / {abs(acc_credit_limit):,.2f}")
+        else:
+            st.subheader(f"Outstanding Balance: {acc_balance:,.2f}")
 
         t_new, t_view = st.tabs(["➕ New Transaction / Transfer", "👁️ View Register"])
 
@@ -3213,7 +3220,7 @@ def render_register():
         with tab_edit_hold:
          #   st.subheader(f"Current Holdings: {selected_inv_acc['accounts_name']}")
             with get_db() as conn:
-                df_h = pd.read_sql(f"SELECT Holdings_Id, Accounts_Id, Securities_Id, Quantity, Simple_Avg_Price, Fifo_Avg_Price FROM Holdings WHERE Accounts_Id = {acc_id}", conn)
+                df_h = pd.read_sql(f"SELECT Holdings_Id, Accounts_Id, Securities_Id, Quantity, Simple_Avg_Price, Fifo_Avg_Price, Staking FROM Holdings WHERE Accounts_Id = {acc_id}", conn)
 
             # Creation of a new column with Status icons
             def get_status_icon(q):
@@ -3245,7 +3252,8 @@ def render_register():
                     # Format numbers
                     "quantity": st.column_config.NumberColumn("Quantity", format="%,.8f"),
                     "simple_avg_price": st.column_config.NumberColumn("Simple Avg Price", format="%,.4f"),
-                    "fifo_avg_price": st.column_config.NumberColumn("FIFO Avg Price", format="%,.4f")
+                    "fifo_avg_price": st.column_config.NumberColumn("FIFO Avg Price", format="%,.4f"),
+                    "staking": st.column_config.CheckboxColumn("Staking", help="When enabled, a quantity increase auto-creates a Reinvest entry for the difference"),
                 },
                 hide_index=True
             )
@@ -3254,11 +3262,36 @@ def render_register():
             _copy_h_edit = _copy_h_edit.rename(columns={"securities_id": "Security"})
             copy_df_button(_copy_h_edit, key=f"dl_reg_holdings_edit_{acc_id}")
 
-        #    save_changes(df_h, edited_h, "Holdings", "holdings_id")
-
             if not edited_h.equals(df_h):
                 save_df = edited_h.drop(columns=["Status"])
-                save_changes(df_h.drop(columns=["Status"]), save_df, "Holdings", "holdings_id")
+                orig_df = df_h.drop(columns=["Status"])
+
+                # Detect staking holdings where quantity increased → queue Reinvest entries
+                staking_entries = []
+                for _, row in save_df.iterrows():
+                    if row.get('staking'):
+                        orig_rows = orig_df[orig_df['holdings_id'] == row['holdings_id']]
+                        if not orig_rows.empty:
+                            old_qty = float(orig_rows.iloc[0]['quantity'])
+                            new_qty = float(row['quantity'])
+                            diff = new_qty - old_qty
+                            if diff > 0:
+                                staking_entries.append({
+                                    'accounts_id':    int(row['accounts_id']),
+                                    'securities_id':  int(row['securities_id']),
+                                    'quantity':       diff,
+                                    'price_per_share': 0,
+                                    'date':           datetime.today().date(),
+                                })
+
+                if staking_entries:
+                    n = len(staking_entries)
+                    st.info(f"📊 Staking: will create {n} Reinvest entr{'y' if n == 1 else 'ies'} for the quantity increase{'s' if n > 1 else ''}")
+
+                if st.button("💾 Save Holdings"):
+                    if staking_entries:
+                        insert_staking_reinvest(staking_entries)
+                    execute_db_save(orig_df, save_df, "Holdings", "holdings_id")
 
             _render_security_transactions(acc_id, sec_options, "edit")
 
