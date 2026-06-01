@@ -16,6 +16,75 @@ from config.settings import ENV_CONFIG
 from psycopg2.extras import execute_batch
 
 
+# ── Trading-day validation ─────────────────────────────────────────────────────
+# Maps TradingView TV_Exchange codes → exchange_calendars calendar IDs.
+# Securities whose exchange is NOT listed get a weekday-only (Mon-Fri) check.
+# Securities in _TV_ALWAYS_OPEN (crypto, FX 24/7) bypass the day filter entirely.
+_TV_TO_XCAL: dict[str, str] = {
+    "ATHEX":    "ASEX",    # Athens Stock Exchange
+    "AMEX":     "XASE",    # NYSE American
+    "BME":      "XMAD",    # Bolsa de Madrid
+    "EURONEXT": "XPAR",    # Euronext (Paris as default)
+    "FWB":      "XFRA",    # Frankfurt
+    "NASDAQ":   "NASDAQ",
+    "NYSE":     "NYSE",
+    "NYMEX":    "NYMEX",   # Commodities futures
+    "TSX":      "TSX",     # Toronto
+    "VIE":      "XWBO",    # Vienna
+    "XETR":     "XETR",    # Frankfurt XETRA
+    "ICE":      "ICE",     # ICE Futures
+    "SWB":      "XSTU",    # Stuttgart
+    "CBOE":     "CFE",     # CBOE Futures
+}
+
+# Exchanges that trade around the clock — never filter by day
+_TV_ALWAYS_OPEN: frozenset = frozenset({
+    "COINBASE", "KRAKEN", "OKX", "BINANCE", "GEMINI",
+    "BITSTAMP", "KUCOIN", "BYBIT",
+})
+
+_xcal_cache: dict[str, object] = {}   # cache calendar objects (one per process)
+
+
+def _is_tv_trading_day(dt_str: str, tv_exchange: str) -> bool:
+    """Return True if *dt_str* is a valid trading session for *tv_exchange*.
+
+    Logic (in order):
+      1. Crypto / always-open exchanges → True unconditionally.
+      2. Saturday / Sunday → False for all equity/futures exchanges.
+      3. Exchange in _TV_TO_XCAL → query the exchange_calendars holiday calendar.
+      4. Unknown exchange → weekday check already passed in step 2; allow.
+    """
+    exch = (tv_exchange or "").upper().strip()
+
+    # 1. Crypto — 24/7, no restriction
+    if exch in _TV_ALWAYS_OPEN:
+        return True
+
+    from datetime import date as _date
+    try:
+        dt = _date.fromisoformat(dt_str)
+    except ValueError:
+        return True     # unparseable date — don't block it
+
+    # 2. Weekends are never trading days for equity/futures markets
+    if dt.weekday() >= 5:       # 5 = Saturday, 6 = Sunday
+        return False
+
+    # 3. Full holiday calendar via exchange_calendars
+    cal_code = _TV_TO_XCAL.get(exch)
+    if cal_code:
+        try:
+            import exchange_calendars as _xcals
+            if cal_code not in _xcal_cache:
+                _xcal_cache[cal_code] = _xcals.get_calendar(cal_code)
+            return bool(_xcal_cache[cal_code].is_session(dt_str))
+        except Exception as _e:
+            logging.debug("exchange_calendars check failed for %s %s: %s", cal_code, dt_str, _e)
+
+    # 4. Exchange not in map — weekday check already passed; allow
+    return True
+
 
 def download_historical_fx(tsperiod=None, currencies_id=None):
     """Download historical FX rates from Yahoo Finance.
@@ -1137,6 +1206,112 @@ def download_historical_prices_from_tradingview(tsperiod="1m", target_sec_id=Non
                         _tv_inst.ws = None
                 except Exception:
                     pass
+
+        # ── Validate before upsert ───────────────────────────────────────────
+        # Two guards:
+        #
+        #  1. Future-date filter — TradingView sometimes returns an incomplete
+        #     intraday bar for today when the market is still open. Storing it as
+        #     "today's close" would be wrong, and because the scheduler may not
+        #     re-run after the market closes the bad price can persist for days.
+        #     We skip any row whose date is strictly in the future relative to the
+        #     server's wall-clock date.  (Today = allowed; tomorrow+ = skipped.)
+        #
+        #  2. Ratio check vs existing price — if the incoming close deviates by
+        #     more than MAX_OVERWRITE_RATIO in either direction from the already-
+        #     stored close for that (security, date) pair, TradingView almost
+        #     certainly returned bad data.  We keep the existing price and log
+        #     a warning so the anomaly is visible in the scheduler log.
+
+        MAX_OVERWRITE_RATIO = 10.0   # 10× either way = obviously wrong
+        today_str           = datetime.today().strftime("%Y-%m-%d")
+
+        # Build per-security lookups for readable log messages and exchange calendars
+        sec_name_lkp:   dict[int, str] = {sid: sname for sid, sname, _, _ in securities}
+        sid_to_exchange: dict[int, str] = {sid: exch  for sid, _, _, exch in securities}
+
+        if all_rows:
+            # Fetch existing closes for every (securities_id, date) pair we are
+            # about to touch — one query, not N per security.
+            uniq_sids  = list({r[0] for r in all_rows})
+            uniq_dates = list({r[1] for r in all_rows})
+            ph_s = ",".join(["%s"] * len(uniq_sids))
+            ph_d = ",".join(["%s"] * len(uniq_dates))
+            cur.execute(
+                f"SELECT Securities_Id, Date::text, Close "
+                f"FROM Historical_Prices "
+                f"WHERE Securities_Id IN ({ph_s}) AND Date::text IN ({ph_d})",
+                uniq_sids + uniq_dates,
+            )
+            existing_closes: dict[tuple, float] = {
+                (int(r[0]), str(r[1])): float(r[2]) for r in cur.fetchall()
+            }
+
+            safe_rows:        list = []
+            skipped_future:   int  = 0
+            skipped_holiday:  int  = 0
+            skipped_ratio:    int  = 0
+
+            for row in all_rows:
+                sid, dt, close = int(row[0]), str(row[1]), float(row[2])
+                sec_name = sec_name_lkp.get(sid, f"id={sid}")
+                tv_exch  = sid_to_exchange.get(sid, "")
+
+                # Guard 1 — future date
+                if dt > today_str:
+                    skipped_future += 1
+                    logging.debug("TV: future-dated row skipped  sid=%s  date=%s", sid, dt)
+                    continue
+
+                # Guard 2 — non-trading day (weekend or exchange holiday)
+                if not _is_tv_trading_day(dt, tv_exch):
+                    skipped_holiday += 1
+                    msg = (
+                        f"TradingView NON-TRADING DAY — {sec_name}: "
+                        f"date={dt}  exchange={tv_exch}  close={close:.6f}  → SKIPPED"
+                    )
+                    logging.warning(msg)
+                    print(f"  ⚠️ {msg}")
+                    continue
+
+                # Guard 3 — ratio vs existing stored price
+                existing = existing_closes.get((sid, dt))
+                if existing and existing > 0 and close > 0:
+                    ratio = max(close / existing, existing / close)
+                    if ratio > MAX_OVERWRITE_RATIO:
+                        skipped_ratio += 1
+                        msg = (
+                            f"TradingView SUSPICIOUS PRICE — {sec_name}: "
+                            f"date={dt}  incoming={close:.6f}  "
+                            f"stored={existing:.6f}  ratio={ratio:.1f}×  → SKIPPED"
+                        )
+                        logging.warning(msg)
+                        print(f"  ⚠️ {msg}")
+                        continue
+
+                safe_rows.append(row)
+
+            if skipped_future:
+                logging.info("TV: skipped %d future-dated row(s).", skipped_future)
+                print(f"  ℹ️  Skipped {skipped_future} future-dated row(s).")
+            if skipped_holiday:
+                logging.warning("TV: skipped %d non-trading-day row(s).", skipped_holiday)
+                print(
+                    f"  ⚠️  Skipped {skipped_holiday} non-trading-day price(s) "
+                    "(exchange closed — weekend or holiday)."
+                )
+            if skipped_ratio:
+                logging.warning(
+                    "TV: skipped %d suspicious row(s) that would have overwritten "
+                    "an existing price by more than %.0f×.",
+                    skipped_ratio, MAX_OVERWRITE_RATIO,
+                )
+                print(
+                    f"  ⚠️  Skipped {skipped_ratio} suspicious price(s) "
+                    f"(>{MAX_OVERWRITE_RATIO:.0f}× deviation). "
+                    "Check logs or the Price Quality tool for details."
+                )
+            all_rows = safe_rows
 
         # ── Single batch upsert ───────────────────────────────────────────────
         if all_rows:

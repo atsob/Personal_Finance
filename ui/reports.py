@@ -4078,7 +4078,7 @@ def render_net_worth_report():
             with st.expander(
                 f"⚠️ {len(_zero_accs)} selected account(s) have zero balance and are hidden "
                 f"(enable 'Show zero-balance accounts' or click 🔄 Refresh Data)",
-                expanded=True,
+                expanded=False,
             ):
                 st.dataframe(
                     _zero_accs,

@@ -341,6 +341,7 @@ def get_net_worth_report_data(start_date: str, interval: str = 'Year', account_i
     -- Historical reconstruction mirrors the Dashboard: subtract future Transactions
     -- from current balance.  The net of unlinked Investments is baked into
     -- Accounts_Balance, so only future Transactions need to be unwound.
+/*
     other_inv_like AS (
         SELECT
             p.period_end,
@@ -363,6 +364,30 @@ def get_net_worth_report_data(start_date: str, interval: str = 'Year', account_i
         WHERE a.Accounts_Type = 'Other Investment'
           {acc_filter}
     ),
+*/
+    other_inv_like AS (
+        SELECT
+            p.period_end,
+            a.Accounts_Id,
+            a.Accounts_Name,
+            a.Accounts_Type,
+            GREATEST(0, a.Accounts_Balance - COALESCE((
+                SELECT SUM(CASE
+                    WHEN Action IN ('CashIn', 'IntInc') THEN  Total_Amount_AccCur
+                    WHEN Action IN ('CashOut')          THEN -Total_Amount_AccCur
+                    ELSE 0 END)
+                FROM Investments
+                WHERE Accounts_Id = a.Accounts_Id AND Date > p.period_end
+            ), 0)) * COALESCE(
+                (SELECT fx_rate FROM daily_fx
+                 WHERE period_end = p.period_end AND Currencies_Id = a.Currencies_Id),
+                1
+            ) AS balance_eur
+        FROM period_dates p
+        CROSS JOIN Accounts a
+        WHERE a.Accounts_Type = 'Other Investment'
+          {acc_filter}
+    ),    
     -- Brokerage / Margin: forward cumulative qty per security × price × fx
     -- Uses Investments table directly so fully-sold securities appear in history
     investment_universe AS (
@@ -403,7 +428,8 @@ def get_net_worth_report_data(start_date: str, interval: str = 'Year', account_i
         CROSS JOIN investment_universe i
         JOIN Accounts   a ON i.Accounts_Id   = a.Accounts_Id
         JOIN Securities s ON i.Securities_Id = s.Securities_Id
-        WHERE a.Accounts_Type IN ('Brokerage', 'Margin')
+        WHERE a.Accounts_Type IN ('Brokerage', 'Margin', 'Other Investment')
+          {acc_filter}
         GROUP BY p.period_end, a.Accounts_Id, a.Accounts_Name, a.Accounts_Type
     ),
     -- Pension: backwards from current balance via CashIn/CashOut
