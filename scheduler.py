@@ -37,6 +37,12 @@ from database.connection import get_connection
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s [scheduler] %(message)s",
+    handlers=[
+        # Write to a file in the shared /app volume (same mount as the Streamlit
+        # container) so the Log Viewer tool can read scheduler output too.
+        logging.FileHandler("/app/scheduler.log", encoding="utf-8"),
+        logging.StreamHandler(),   # keep stdout for Docker logs
+    ],
 )
 
 # ── Market-data refresh config ────────────────────────────────────────────────

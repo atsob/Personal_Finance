@@ -40,7 +40,7 @@ _TV_TO_XCAL: dict[str, str] = {
 # Exchanges that trade around the clock — never filter by day
 _TV_ALWAYS_OPEN: frozenset = frozenset({
     "COINBASE", "KRAKEN", "OKX", "BINANCE", "GEMINI",
-    "BITSTAMP", "KUCOIN", "BYBIT",
+    "BITSTAMP", "KUCOIN", "BYBIT", "CRYPTO", 
 })
 
 _xcal_cache: dict[str, object] = {}   # cache calendar objects (one per process)
@@ -1223,7 +1223,7 @@ def download_historical_prices_from_tradingview(tsperiod="1m", target_sec_id=Non
         #     certainly returned bad data.  We keep the existing price and log
         #     a warning so the anomaly is visible in the scheduler log.
 
-        MAX_OVERWRITE_RATIO = 10.0   # 10× either way = obviously wrong
+        MAX_OVERWRITE_RATIO = 5.0   # 5× either way = obviously wrong
         today_str           = datetime.today().strftime("%Y-%m-%d")
 
         # Build per-security lookups for readable log messages and exchange calendars

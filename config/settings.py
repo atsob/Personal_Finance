@@ -8,6 +8,11 @@ def get_env_config():
         'db_host': os.getenv("DB_HOST", "192.168.4.20"),
         'db_port': os.getenv("DB_PORT", "5432"),
         'db_name': os.getenv("DB_NAME", "Finance"),
+        # Timezone applied to every PostgreSQL session so that TIMESTAMPTZ columns
+        # (e.g. Historical_Prices.Downloaded_At) display in local time rather than UTC.
+        # The PostgreSQL Docker container typically runs UTC; this client-side setting
+        # converts stored UTC values to the configured zone without touching the server.
+        'db_timezone': os.getenv("DB_TIMEZONE", "Europe/Athens"),
         'ollama_ip': os.getenv("OLLAMA_IP", "192.168.4.20"),
         'ollama_port': os.getenv("OLLAMA_PORT", "11434"),
         'ollama_model': os.getenv("OLLAMA_MODEL", "llama3.2:3b"),

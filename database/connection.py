@@ -15,6 +15,10 @@ DB_CONFIG = {
     'host':     ENV_CONFIG['db_host'],
     'port':     int(ENV_CONFIG['db_port']),
     'connect_timeout': 10,
+    # Apply the local timezone to every session so TIMESTAMPTZ columns are
+    # returned in local time (EET/EEST) rather than the PostgreSQL server's UTC.
+    # This is a session-level SET; it does not alter the server configuration.
+    'options':  f"-c TimeZone={ENV_CONFIG['db_timezone']}",
 }
 
 _pool: "pool.SimpleConnectionPool | None" = None

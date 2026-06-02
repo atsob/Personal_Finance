@@ -160,46 +160,6 @@ def _render_db_maintenance():
 
     st.divider()
 
-    # ── Schema migrations ──────────────────────────────────────────────────────
-    st.markdown("#### 🔧 Schema Migrations")
-    st.caption(
-        "Apply pending database schema changes (new columns, indexes, etc.). "
-        "Safe to run multiple times — all statements use `IF NOT EXISTS` / `ADD COLUMN IF NOT EXISTS`."
-    )
-
-    _MIGRATIONS: list[tuple[str, str]] = [
-        (
-            "Historical_Prices: add Source + Downloaded_At columns",
-            """
-            ALTER TABLE Historical_Prices
-                ADD COLUMN IF NOT EXISTS Source        VARCHAR(50),
-                ADD COLUMN IF NOT EXISTS Downloaded_At TIMESTAMPTZ;
-            CREATE INDEX IF NOT EXISTS idx_price_source ON Historical_Prices(Source);
-            """,
-        ),
-    ]
-
-    for mig_label, mig_sql in _MIGRATIONS:
-        mc1, mc2 = st.columns([4, 1])
-        mc1.markdown(f"**{mig_label}**")
-        with mc2:
-            if st.button("▶ Apply", key=f"mig_{hash(mig_label)}", width="stretch"):
-                try:
-                    _mig_conn = get_connection()
-                    _mig_cur  = _mig_conn.cursor()
-                    # Run each statement separately (psycopg2 doesn't support
-                    # multi-statement strings in a single execute call)
-                    for _stmt in [s.strip() for s in mig_sql.split(";") if s.strip()]:
-                        _mig_cur.execute(_stmt)
-                    _mig_conn.commit()
-                    _mig_cur.close()
-                    _mig_conn.close()
-                    st.success(f"✅ Applied: {mig_label}")
-                except Exception as _mig_exc:
-                    st.error(f"❌ Migration failed: {_mig_exc}")
-
-    st.divider()
-
     # ── Balance recalculation ──────────────────────────────────────────────────
     st.markdown("#### 💰 Recalculate Account Balances")
     st.caption(
@@ -1732,6 +1692,105 @@ def _render_fix_transfer_sign_mismatches():
         st.rerun()
 
 
+def _render_log_viewer():
+    import os
+
+    st.subheader("📋 Log Viewer")
+    st.caption(
+        "Reads **app.log** (Streamlit application) and **scheduler.log** (background scheduler) "
+        "from the shared `/app` data volume. Filter by log level or keyword, then download the full file."
+    )
+
+    # ── Locate log files ───────────────────────────────────────────────────────
+    # Both containers mount the same volume at /app; when running locally the
+    # logs land in the working directory next to app.py.
+    _candidates = [
+        ("app.log",       "Streamlit app"),
+        ("scheduler.log", "Scheduler"),
+    ]
+    log_files: dict[str, str] = {}
+    for fname, label in _candidates:
+        for base in ("/app", os.path.dirname(os.path.dirname(__file__)), "."):
+            path = os.path.join(base, fname)
+            if os.path.exists(path):
+                log_files[f"{label} ({fname})"] = path
+                break
+
+    if not log_files:
+        st.info(
+            "No log files found yet. "
+            "Log files are created in `/app` (Docker) or the project root when the app runs. "
+            "If you just started the app, try refreshing in a moment."
+        )
+        return
+
+    # ── Controls ───────────────────────────────────────────────────────────────
+    selected_label = st.selectbox(
+        "Log file:", list(log_files.keys()), key="log_file_sel"
+    )
+    log_path = log_files[selected_label]
+
+    ctrl1, ctrl2, ctrl3 = st.columns([1, 2, 2])
+    with ctrl1:
+        n_lines = st.number_input(
+            "Last N lines:", min_value=50, max_value=50_000,
+            value=500, step=100, key="log_n_lines",
+        )
+    with ctrl2:
+        level_filter = st.multiselect(
+            "Level filter:",
+            ["ERROR", "WARNING", "INFO", "DEBUG"],
+            default=["ERROR", "WARNING"],
+            key="log_level_filter",
+            help="Leave empty to show all levels.",
+        )
+    with ctrl3:
+        search_term = st.text_input(
+            "Keyword search:", key="log_search",
+            placeholder="e.g. TradingView  or  suspicious",
+        )
+
+    # ── Read & filter ──────────────────────────────────────────────────────────
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as fh:
+            all_lines = fh.readlines()
+    except Exception as exc:
+        st.error(f"Cannot read log file: {exc}")
+        return
+
+    # Tail first, then filter so "last N lines" applies to the raw file
+    tail = all_lines[-int(n_lines):]
+
+    filtered = tail
+    if level_filter:
+        filtered = [l for l in filtered if any(lvl in l for lvl in level_filter)]
+    if search_term.strip():
+        filtered = [l for l in filtered if search_term.strip().lower() in l.lower()]
+
+    # ── Stats & display ────────────────────────────────────────────────────────
+    file_size_kb = os.path.getsize(log_path) / 1024
+    st.caption(
+        f"File: `{log_path}`  •  {file_size_kb:,.1f} KB  •  "
+        f"{len(all_lines):,} total lines  •  showing **{len(filtered):,}** after filters"
+    )
+
+    # Colour-code severity in the text block
+    log_text = "".join(filtered) if filtered else "(no lines match the current filters)"
+    st.code(log_text, language=None)
+
+    # ── Download ───────────────────────────────────────────────────────────────
+    dl_col, _ = st.columns([1, 4])
+    with dl_col:
+        st.download_button(
+            label="⬇️ Download full log",
+            data="".join(all_lines).encode("utf-8"),
+            file_name=os.path.basename(log_path),
+            mime="text/plain",
+            key="log_download_btn",
+            width="stretch",
+        )
+
+
 _CATEGORIES = {
     "💾 Database": [
         "💾 Backup & Restore",
@@ -1746,6 +1805,9 @@ _CATEGORIES = {
         "🔍 Price Quality",
         "⚖ Normalize Investments",
     ],
+    "📋 Logs": [
+        "📋 Log Viewer",
+    ],
 }
 
 _TOOL_RENDERERS = {
@@ -1758,6 +1820,7 @@ _TOOL_RENDERERS = {
     "📥 Fill Missing Prices":           _render_fill_missing_prices,
     "🔍 Price Quality":                 _render_price_quality,
     "⚖ Normalize Investments":         _render_normalize_investments,
+    "📋 Log Viewer":                    _render_log_viewer,
 }
 
 
