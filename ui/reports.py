@@ -4076,7 +4076,7 @@ def render_net_worth_report():
         _zero_accs = _df_bal[_df_bal["accounts_balance"].abs() < 0.005]
         if not _zero_accs.empty:
             with st.expander(
-                f"⚠️ {len(_zero_accs)} selected account(s) have zero balance and are hidden "
+                f"⚠️ {len(_zero_accs)} selected account(s) have zero balance and might be hidden "
                 f"(enable 'Show zero-balance accounts' or click 🔄 Refresh Data)",
                 expanded=False,
             ):

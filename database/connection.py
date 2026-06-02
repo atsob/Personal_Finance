@@ -23,6 +23,25 @@ DB_CONFIG = {
 
 _pool: "pool.SimpleConnectionPool | None" = None
 
+_TZ = ENV_CONFIG['db_timezone']   # e.g. "Europe/Athens"
+
+
+def _apply_tz(conn) -> None:
+    """Explicitly SET TIME ZONE on *conn*.
+
+    Belt-and-suspenders alongside the `options` parameter in DB_CONFIG:
+    pooled connections created before a code reload would not have the
+    `options` applied, so we enforce the timezone on every checkout too.
+    """
+    try:
+        cur = conn.cursor()
+        cur.execute(f"SET TIME ZONE %s", (_TZ,))
+        cur.close()
+        conn.commit()
+    except Exception as exc:
+        log.debug("_apply_tz failed: %s", exc)
+
+
 _RETRY_ATTEMPTS = 3
 _RETRY_BASE_DELAY = 1.5   # seconds; doubles each attempt
 
@@ -97,6 +116,10 @@ def get_db():
             p = _get_pool()
             conn = p.getconn()
 
+    # Enforce local timezone on every checkout (handles pool connections that
+    # were created before the DB_CONFIG `options` setting was in place).
+    _apply_tz(conn)
+
     try:
         yield conn
         conn.commit()
@@ -152,7 +175,9 @@ def get_connection() -> extensions.connection:
 
     Kept for backward compatibility. Prefer get_db() for new code.
     """
-    return _retry(lambda: psycopg2.connect(**DB_CONFIG), "get_connection")
+    conn = _retry(lambda: psycopg2.connect(**DB_CONFIG), "get_connection")
+    _apply_tz(conn)
+    return conn
 
 
 def get_sql_database() -> SQLDatabase:

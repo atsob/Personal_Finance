@@ -1692,50 +1692,267 @@ def _render_fix_transfer_sign_mismatches():
         st.rerun()
 
 
+def _read_docker_container_logs(container_name: str, tail: int) -> "tuple[str, str] | None":
+    """Read container stdout+stderr via the Docker Unix socket.
+
+    Returns (plain_text, source_label) or None if the socket is unavailable.
+    Uses the Docker HTTP API directly — no extra packages required.
+    The Docker multiplexed stream format uses an 8-byte header per frame:
+        [stream_type(1), 0, 0, 0, size_big_endian(4)]
+    """
+    import os, socket, struct
+
+    sock_path = "/var/run/docker.sock"
+    if not os.path.exists(sock_path):
+        return None
+
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(10)
+        sock.connect(sock_path)
+
+        req = (
+            f"GET /containers/{container_name}/logs"
+            f"?stdout=1&stderr=1&tail={tail}&timestamps=0 HTTP/1.0\r\n"
+            f"Host: localhost\r\n\r\n"
+        )
+        sock.sendall(req.encode())
+
+        raw = b""
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            raw += chunk
+        sock.close()
+
+        # Split HTTP header from body
+        sep = raw.find(b"\r\n\r\n")
+        if sep == -1:
+            return None
+        # Check for HTTP error
+        status_line = raw[:raw.find(b"\r\n")].decode("utf-8", errors="replace")
+        if " 404 " in status_line or " 500 " in status_line:
+            return None
+
+        body = raw[sep + 4:]
+
+        # Parse Docker multiplexed stream
+        lines: list[str] = []
+        pos = 0
+        while pos + 8 <= len(body):
+            # stream_type: 1=stdout, 2=stderr (we show both)
+            frame_size = struct.unpack(">I", body[pos + 4: pos + 8])[0]
+            pos += 8
+            if frame_size == 0:
+                continue
+            if pos + frame_size > len(body):
+                break
+            lines.append(body[pos: pos + frame_size].decode("utf-8", errors="replace"))
+            pos += frame_size
+
+        text = "".join(lines)
+        return text, f"Docker container `{container_name}` (via socket)"
+    except Exception:
+        return None
+
+
+def _docker_utc_to_local(utc_str: str) -> str:
+    """Convert a Docker UTC timestamp string to local time (from DB_TIMEZONE env var).
+
+    Docker `time` format: "2026-06-02T13:20:50.188349634Z"
+    Returns a formatted local-time string like "2026-06-02 16:20:50".
+    Falls back to the original string on any error.
+    """
+    try:
+        import os
+        from datetime import datetime, timezone
+        import zoneinfo
+        raw = utc_str.rstrip("Z")[:26]          # truncate to microseconds
+        dt_utc = datetime.fromisoformat(raw).replace(tzinfo=timezone.utc)
+        tz_name = os.getenv("DB_TIMEZONE", "Europe/Athens")
+        dt_local = dt_utc.astimezone(zoneinfo.ZoneInfo(tz_name))
+        return dt_local.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return utc_str
+
+
+def _has_log_timestamp(text: str) -> bool:
+    """Return True if *text* already starts with a Python logging timestamp
+    (YYYY-MM-DD HH:MM:SS …).
+    """
+    import re
+    return bool(re.match(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", text.lstrip()))
+
+
+def _read_docker_json_log(container_name: str, tail: int) -> "tuple[str, str] | None":
+    """Read the Docker JSON log file for *container_name* from
+    /var/lib/docker/containers/.  Returns (plain_text, label) or None.
+
+    Deduplication
+    -------------
+    The scheduler (and Streamlit app) write to both print() → stdout AND
+    logging → stderr, so Docker captures each message twice in the JSON log.
+    We prefer the stderr lines (which carry the Python-formatted local timestamp)
+    and suppress the matching stdout duplicate.
+
+    Timestamp normalisation
+    -----------------------
+    Docker `time` fields are always UTC.  For stdout lines that have no Python
+    timestamp prefix we prepend the converted local-time equivalent so every
+    visible line shows the same timezone (EET/EEST).
+    """
+    import os, json, glob as _glob
+
+    base = "/var/lib/docker/containers"
+    if not os.path.isdir(base):
+        return None
+    try:
+        # Find the log file by matching the container name in config.v2.json
+        matches = []
+        for config_path in _glob.glob(f"{base}/*/config.v2.json"):
+            try:
+                with open(config_path) as cf:
+                    cfg = json.load(cf)
+                if cfg.get("Name", "").lstrip("/") == container_name:
+                    cid = cfg["ID"]
+                    log_path = f"{base}/{cid}/{cid}-json.log"
+                    if os.path.exists(log_path):
+                        matches.append(log_path)
+            except Exception:
+                pass
+
+        if not matches:
+            return None
+
+        log_path = matches[0]
+        with open(log_path, encoding="utf-8", errors="replace") as fh:
+            all_lines = fh.readlines()
+
+        tail_lines = all_lines[-tail:]
+
+        # ── Parse JSON, build dedup set from stderr lines ─────────────────────
+        parsed: list[tuple[str, str, str]] = []   # (stream, local_time, log_text)
+        stderr_messages: set[str] = set()
+
+        for raw in tail_lines:
+            try:
+                obj      = json.loads(raw)
+                stream   = obj.get("stream", "stdout")
+                log_text = obj.get("log", "")
+                dt_local = _docker_utc_to_local(obj.get("time", ""))
+                parsed.append((stream, dt_local, log_text))
+
+                if stream == "stderr":
+                    # Extract bare message text for dedup (strip Python log prefix)
+                    msg = log_text.strip()
+                    if _has_log_timestamp(msg):
+                        # "2026-06-02 16:20:50,188 INFO ✔ Something…"
+                        # strip up to and including the level keyword
+                        import re as _re
+                        m = _re.match(
+                            r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[,\d]* "
+                            r"(?:INFO|WARNING|ERROR|DEBUG|CRITICAL)\s+(.*)",
+                            msg, _re.DOTALL,
+                        )
+                        bare = m.group(1) if m else msg
+                    else:
+                        bare = msg
+                    stderr_messages.add(bare.rstrip())
+            except Exception:
+                parsed.append(("stdout", "", raw))
+
+        # ── Build output — drop stdout duplicates, normalise timestamps ────────
+        plain_lines: list[str] = []
+        for stream, dt_local, log_text in parsed:
+            stripped = log_text.strip()
+
+            if stream == "stdout" and stripped:
+                # Drop if the same message appeared on stderr
+                if stripped in stderr_messages:
+                    continue
+                if any(stripped in m for m in stderr_messages):
+                    continue
+                # Prepend local time for timestampless stdout lines
+                if not _has_log_timestamp(stripped):
+                    log_text = f"{dt_local}  {log_text}"
+
+            plain_lines.append(log_text)
+
+        return "".join(plain_lines), f"Docker JSON log for `{container_name}`"
+    except Exception:
+        return None
+
+
 def _render_log_viewer():
     import os
 
     st.subheader("📋 Log Viewer")
     st.caption(
-        "Reads **app.log** (Streamlit application) and **scheduler.log** (background scheduler) "
-        "from the shared `/app` data volume. Filter by log level or keyword, then download the full file."
+        "Shows logs for the **Streamlit app** and **background scheduler**. "
+        "Sources tried in order: ① log files in the shared `/app` volume "
+        "(available after containers are rebuilt with the new code), "
+        "② Docker socket at `/var/run/docker.sock` (requires the socket mount in docker-compose.yml), "
+        "③ Docker JSON log files at `/var/lib/docker/containers/` (if host path is mounted)."
     )
 
-    # ── Locate log files ───────────────────────────────────────────────────────
-    # Both containers mount the same volume at /app; when running locally the
-    # logs land in the working directory next to app.py.
-    _candidates = [
-        ("app.log",       "Streamlit app"),
-        ("scheduler.log", "Scheduler"),
+    # ── Known log sources ──────────────────────────────────────────────────────
+    # Each entry: (display_label, type, identifier)
+    #   type "file"      → identifier is a filesystem path
+    #   type "docker"    → identifier is the Docker container name
+    SOURCES = [
+        ("Streamlit app",  "file",   None),          # path resolved below
+        ("Scheduler",      "file",   None),           # path resolved below
+        ("Streamlit app",  "docker", "personal_finance"),
+        ("Scheduler",      "docker", "personal_finance_scheduler"),
     ]
-    log_files: dict[str, str] = {}
-    for fname, label in _candidates:
-        for base in ("/app", os.path.dirname(os.path.dirname(__file__)), "."):
-            path = os.path.join(base, fname)
-            if os.path.exists(path):
-                log_files[f"{label} ({fname})"] = path
-                break
 
-    if not log_files:
-        st.info(
-            "No log files found yet. "
-            "Log files are created in `/app` (Docker) or the project root when the app runs. "
-            "If you just started the app, try refreshing in a moment."
-        )
+    # Resolve file paths
+    app_data_dir = os.getenv("APP_DATA_DIR", ".")
+    _file_candidates = {
+        "Streamlit app": [
+            os.path.join(app_data_dir, "app.log"),
+            os.path.join(os.path.dirname(os.path.dirname(__file__)), "app.log"),
+            "app.log",
+        ],
+        "Scheduler": [
+            os.path.join(app_data_dir, "scheduler.log"),
+            os.path.join(os.path.dirname(os.path.dirname(__file__)), "scheduler.log"),
+            "scheduler.log",
+        ],
+    }
+
+    available: list[tuple[str, str, str]] = []   # (dropdown_label, type, identifier)
+    for label, src_type, identifier in SOURCES:
+        if src_type == "file":
+            for candidate in _file_candidates.get(label, []):
+                if os.path.exists(candidate):
+                    sz = os.path.getsize(candidate) / 1024
+                    available.append(
+                        (f"{label} — file ({os.path.basename(candidate)}, {sz:,.0f} KB)",
+                         "file", candidate)
+                    )
+                    break
+        else:
+            available.append(
+                (f"{label} — Docker container ({identifier})", "docker", identifier)
+            )
+
+    if not available:
+        st.warning("No log sources configured. See caption above for setup instructions.")
         return
 
     # ── Controls ───────────────────────────────────────────────────────────────
-    selected_label = st.selectbox(
-        "Log file:", list(log_files.keys()), key="log_file_sel"
-    )
-    log_path = log_files[selected_label]
+    labels = [a[0] for a in available]
+    sel_label = st.selectbox("Log source:", labels, key="log_source_sel")
+    _, sel_type, sel_id = available[labels.index(sel_label)]
 
     ctrl1, ctrl2, ctrl3 = st.columns([1, 2, 2])
     with ctrl1:
-        n_lines = st.number_input(
+        n_lines = int(st.number_input(
             "Last N lines:", min_value=50, max_value=50_000,
             value=500, step=100, key="log_n_lines",
-        )
+        ))
     with ctrl2:
         level_filter = st.multiselect(
             "Level filter:",
@@ -1750,41 +1967,67 @@ def _render_log_viewer():
             placeholder="e.g. TradingView  or  suspicious",
         )
 
-    # ── Read & filter ──────────────────────────────────────────────────────────
-    try:
-        with open(log_path, encoding="utf-8", errors="replace") as fh:
-            all_lines = fh.readlines()
-    except Exception as exc:
-        st.error(f"Cannot read log file: {exc}")
-        return
+    # ── Fetch log content ──────────────────────────────────────────────────────
+    all_lines: list[str] = []
+    source_desc = ""
 
-    # Tail first, then filter so "last N lines" applies to the raw file
-    tail = all_lines[-int(n_lines):]
+    if sel_type == "file":
+        try:
+            with open(sel_id, encoding="utf-8", errors="replace") as fh:
+                all_lines = fh.readlines()
+            source_desc = f"file `{sel_id}`  •  {os.path.getsize(sel_id)/1024:,.1f} KB"
+        except Exception as exc:
+            st.error(f"Cannot read log file: {exc}")
+            return
+    else:
+        # Docker container — try socket first, then JSON log file
+        result = _read_docker_container_logs(sel_id, tail=n_lines)
+        if result is None:
+            result = _read_docker_json_log(sel_id, tail=n_lines)
+        if result is None:
+            st.error(
+                f"Cannot read Docker logs for container **{sel_id}**.\n\n"
+                "Make sure `/var/run/docker.sock` is mounted in `docker-compose.yml`:\n"
+                "```yaml\n"
+                "volumes:\n"
+                "  - /var/run/docker.sock:/var/run/docker.sock:ro\n"
+                "```\n"
+                "Then recreate the container with `docker compose up -d --force-recreate personal_finance`."
+            )
+            return
+        text, source_desc = result
+        all_lines = text.splitlines(keepends=True)
 
-    filtered = tail
+    # ── Filter ─────────────────────────────────────────────────────────────────
+    tail_lines = all_lines[-n_lines:]
+
+    filtered = tail_lines
     if level_filter:
         filtered = [l for l in filtered if any(lvl in l for lvl in level_filter)]
     if search_term.strip():
-        filtered = [l for l in filtered if search_term.strip().lower() in l.lower()]
+        needle = search_term.strip().lower()
+        filtered = [l for l in filtered if needle in l.lower()]
 
-    # ── Stats & display ────────────────────────────────────────────────────────
-    file_size_kb = os.path.getsize(log_path) / 1024
+    # ── Display ────────────────────────────────────────────────────────────────
     st.caption(
-        f"File: `{log_path}`  •  {file_size_kb:,.1f} KB  •  "
+        f"Source: {source_desc}  •  "
         f"{len(all_lines):,} total lines  •  showing **{len(filtered):,}** after filters"
     )
 
-    # Colour-code severity in the text block
     log_text = "".join(filtered) if filtered else "(no lines match the current filters)"
     st.code(log_text, language=None)
 
     # ── Download ───────────────────────────────────────────────────────────────
     dl_col, _ = st.columns([1, 4])
     with dl_col:
+        download_name = (
+            os.path.basename(sel_id) if sel_type == "file"
+            else f"{sel_id}.log"
+        )
         st.download_button(
             label="⬇️ Download full log",
             data="".join(all_lines).encode("utf-8"),
-            file_name=os.path.basename(log_path),
+            file_name=download_name,
             mime="text/plain",
             key="log_download_btn",
             width="stretch",

@@ -11,6 +11,7 @@ services:
       - DB_HOST=127.0.0.1
       - DB_PORT=5432
       - DB_TIMEZONE=Europe/Athens
+      - APP_DATA_DIR=/app
       - OLLAMA_IP=127.0.0.1
       - OLLAMA_PORT=11434
       - OLLAMA_MODEL=llama3.2:3b
@@ -23,6 +24,7 @@ services:
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
       - /mnt/dockerapps/docker/docker_data/personal_finance/data:/app
+      - /var/run/docker.sock:/var/run/docker.sock:ro   # Docker socket for Log Viewer
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "--fail", "http://localhost:8501/_stcore/health"]
@@ -42,6 +44,7 @@ services:
       - DB_HOST=127.0.0.1
       - DB_PORT=5432
       - DB_TIMEZONE=Europe/Athens
+      - APP_DATA_DIR=/app
       - OLLAMA_IP=127.0.0.1
       - OLLAMA_PORT=11434
       - OLLAMA_MODEL=llama3.2:3b
@@ -69,6 +72,7 @@ services:
       - DB_HOST=127.0.0.1
       - DB_PORT=5432
       - DB_TIMEZONE=Europe/Athens
+      - APP_DATA_DIR=/app
       - OLLAMA_IP=127.0.0.1
       - OLLAMA_PORT=11434
       - OLLAMA_MODEL=llama3.2:3b

@@ -34,14 +34,17 @@ from ai.update_vector import update_all_embeddings
 from database.backup import DatabaseBackup
 from database.connection import get_connection
 
+import os as _os
+_log_dir  = _os.getenv("APP_DATA_DIR", ".")
+_log_path = _os.path.join(_log_dir, "scheduler.log")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s [scheduler] %(message)s",
     handlers=[
-        # Write to a file in the shared /app volume (same mount as the Streamlit
-        # container) so the Log Viewer tool can read scheduler output too.
-        logging.FileHandler("/app/scheduler.log", encoding="utf-8"),
-        logging.StreamHandler(),   # keep stdout for Docker logs
+        # Write to APP_DATA_DIR/scheduler.log (shared volume) so the Log Viewer
+        # can read it; also keep stdout so `docker logs` continues to work.
+        logging.FileHandler(_log_path, encoding="utf-8"),
+        logging.StreamHandler(),
     ],
 )
 
