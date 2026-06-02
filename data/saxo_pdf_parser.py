@@ -86,9 +86,10 @@ _PDF_CHARGE_MAP: dict[str, str] = {
     "CustodyFee":          "CashOut",
     "VAT":                 "CashOut",
     "FinancingCost":       "CashOut",
-    # Cash deposits → CashIn
-    "Deposit":             "CashIn",
-    "Withdrawal":          "CashOut",
+    # Deposits and withdrawals are recorded in the linked cash account
+    # via bank import — exclude here to avoid duplicates.
+    # "Deposit":           intentionally excluded
+    # "Withdrawal":        intentionally excluded
     # Miscellaneous events (may be instrument-linked)
     "OtherEvent":          "MiscExp",
     "DepositoryCharges":   "MiscExp",
@@ -104,7 +105,7 @@ _PDF_CHARGE_KEYS: list[str] = sorted(
 # Charge types that are purely account-level (Cash product, no instrument).
 # These get the Saxo Bank placeholder security and a ||date|amount dedup key.
 _ACCT_LEVEL_TYPES: frozenset[str] = frozenset({
-    "CustodyFee", "VAT", "FinancingCost", "Deposit", "Withdrawal",
+    "CustodyFee", "VAT", "FinancingCost",
 })
 
 # Date pattern: DD-Mon-YYYY (case-insensitive for robustness)
@@ -433,18 +434,26 @@ def parse_saxo_transactions_pdf(
                 _pdf_sec_amt: float | None = None
                 _pdf_fx_rate: float | None = None
 
-                if len(amt_vals) == 3:
-                    # [sec_amount, conv_rate_token, eur_amount]
-                    # Use the actual amounts (left and right) rather than the PDF's
-                    # rate token, as that avoids any direction ambiguity.
+                if len(amt_vals) >= 3:
+                    # [sec_amount, conv_rate_token, eur_amount, ...]
+                    # Use the leftmost value as sec_amount and compute the FX rate
+                    # from the ratio (avoids direction ambiguity with the rate token).
                     _pdf_sec_amt = abs(amt_vals[0][1])
                     if _pdf_sec_amt:
                         _pdf_fx_rate = round(abs(amount) / _pdf_sec_amt, 8)
                 elif len(amt_vals) == 2:
-                    # [sec_amount, eur_amount] — no explicit rate column
-                    _pdf_sec_amt = abs(amt_vals[0][1])
-                    if _pdf_sec_amt:
-                        _pdf_fx_rate = round(abs(amount) / _pdf_sec_amt, 8)
+                    # Charge rows with exactly 2 captured values have the layout
+                    # [ConversionRate, BookedAmount_EUR].  The intermediate
+                    # "Amount in sec currency" column is empty/zero for most charges
+                    # (e.g. CFD Cash Adjustment).  Treat the first value as the rate
+                    # and derive sec_amount = eur_amount / rate.
+                    _pdf_fx_rate = abs(amt_vals[0][1])
+                    if _pdf_fx_rate and _pdf_fx_rate != 1.0:
+                        _pdf_sec_amt = round(abs(amount) / _pdf_fx_rate, 8)
+                    else:
+                        # Same-currency (rate = 1.0): no conversion needed
+                        _pdf_fx_rate = None
+                        _pdf_sec_amt = None
                 # Single value → EUR-only entry; sec_amt and fx_rate stay None
 
                 # ── Currency ──────────────────────────────────────────────────
@@ -576,6 +585,74 @@ def _find_post_part(
             return instr_frag
         break   # empty row — stop searching
     return ""
+
+
+# ---------------------------------------------------------------------------
+# Trade-row commission extractor
+# ---------------------------------------------------------------------------
+
+def parse_trade_commissions(pdf_path: str | Path) -> dict[str, float]:
+    """Extract Booked Costs (commission) for each trade from a SAXO PDF.
+
+    Parses transaction rows that have a numeric Trade ID (stock/ETF/FX trades)
+    and returns a mapping of TradeID → commission_eur (always positive).
+
+    The PDF Transaction table columns (right side):
+      ... | ConversionRate | RealizedP/L | Booked amount | Booked Costs | Total costs
+
+    Booked Costs is the second-to-last numeric value in each trade row.
+    """
+    try:
+        import pdfplumber
+    except ImportError as e:
+        raise ImportError("pdfplumber is required. pip install pdfplumber") from e
+
+    result: dict[str, float] = {}
+
+    with pdfplumber.open(str(pdf_path)) as pdf:
+        for page in pdf.pages:
+            if not _is_transaction_page(page):
+                continue
+
+            rows = _extract_page_rows(page)
+            for row in rows:
+                if not _is_date_row(row):
+                    continue
+
+                # Only trade rows have a numeric Trade ID
+                tradeid_toks = _col(row, _X_DATE_MAX, _X_TRADEID_MAX)
+                if not tradeid_toks or tradeid_toks[0] == "-":
+                    continue
+                trade_id = tradeid_toks[0]
+                if not trade_id.isdigit():
+                    continue
+
+                # Collect all numeric tokens to the right of the Type column.
+                # Layout: ... ConversionRate | RealizedP/L | BookedAmt | BookedCosts | TotalCosts
+                # BookedCosts is always the second-to-last numeric value.
+                amt_words = sorted(
+                    [w for w in row if w["x0"] >= _X_TYPE_MAX],
+                    key=lambda w: w["x0"],
+                )
+                nums: list[float] = []
+                for w in amt_words:
+                    v = _to_float(w["text"])
+                    if v is not None:
+                        nums.append(v)
+
+                # Need at least: BookedAmt + BookedCosts + TotalCosts (last 3)
+                if len(nums) < 3:
+                    continue
+
+                booked_costs = nums[-2]   # second-to-last = Booked Costs
+                if booked_costs != 0.0:
+                    result[trade_id] = round(abs(booked_costs), 4)
+
+    log.info(
+        "saxo_pdf_parser: extracted commissions for %d trades from %s",
+        len(result), pdf_path,
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------

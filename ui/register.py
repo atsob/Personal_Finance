@@ -719,8 +719,8 @@ def _render_new_investment_form(acc_id, acc_type, df_accs, df_securities, get_db
         'MiscExp', 'MiscInc', 'ShrIn', 'ShrOut', 'CashIn', 'CashOut',
         'Split', 'Vest', 'Grant', 'Exercise', 'Expire',
     ]
-    CASH_OUT_ACTIONS = {'Buy', 'MiscExp'}
-    CASH_IN_ACTIONS  = {'Sell', 'Dividend', 'IntInc', 'RtrnCap'}
+    CASH_OUT_ACTIONS = {'Buy', 'MiscExp', 'CashOut'}
+    CASH_IN_ACTIONS  = {'Sell', 'Dividend', 'IntInc', 'RtrnCap', 'MiscInc', 'CashIn'}
     LINKED_CAPABLE   = CASH_OUT_ACTIONS | CASH_IN_ACTIONS
     NO_SECURITY_ACTIONS = {'CashIn', 'CashOut'}
     QTY_REQUIRED_ACTIONS = {'Buy', 'Sell', 'ShrIn', 'ShrOut', 'Reinvest', 'Split', 'Vest', 'Grant', 'Exercise', 'Expire'}
@@ -1177,8 +1177,8 @@ def _render_edit_investment_form(acc_id, acc_type, df_accs, df_securities, get_d
         'MiscExp', 'MiscInc', 'ShrIn', 'ShrOut', 'CashIn', 'CashOut',
         'Split', 'Vest', 'Grant', 'Exercise', 'Expire',
     ]
-    CASH_OUT_ACTIONS     = {'Buy', 'MiscExp'}
-    CASH_IN_ACTIONS      = {'Sell', 'Dividend', 'IntInc', 'RtrnCap'}
+    CASH_OUT_ACTIONS     = {'Buy', 'MiscExp', 'CashOut'}
+    CASH_IN_ACTIONS      = {'Sell', 'Dividend', 'IntInc', 'RtrnCap', 'MiscInc', 'CashIn'}
     LINKED_CAPABLE       = CASH_OUT_ACTIONS | CASH_IN_ACTIONS
     NO_SECURITY_ACTIONS  = {'CashIn', 'CashOut'}
     QTY_REQUIRED_ACTIONS = {'Buy', 'Sell', 'ShrIn', 'ShrOut', 'Reinvest', 'Split',

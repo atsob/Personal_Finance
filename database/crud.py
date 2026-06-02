@@ -40,6 +40,11 @@ def execute_db_save(df_original, df_edited, table_name, id_col, current_acc_id=N
                     if mirrored:
                         cur.execute("DELETE FROM Splits WHERE transactions_id = %s", (mirrored[0],))
                         cur.execute("DELETE FROM Transactions WHERE transactions_id = %s", (mirrored[0],))
+            # NULL out any Investment rows that reference these transactions before deleting
+            cur.execute(
+                "UPDATE Investments SET Transactions_Id = NULL WHERE Transactions_Id IN %s",
+                (tuple(ids_to_delete),)
+            )
             cur.execute("DELETE FROM Splits WHERE transactions_id IN %s", (tuple(ids_to_delete),))
             cur.execute(f"DELETE FROM {table_name} WHERE {id_col} IN %s", (tuple(ids_to_delete),))
 
@@ -568,8 +573,8 @@ def update_investment_balances():
         cur.close()
         conn.close()
 
-_LINKED_TX_VIABLE_ACTIONS = frozenset({'Buy', 'Sell', 'Dividend', 'IntInc', 'RtrnCap', 'MiscExp'})
-_LINKED_TX_CASH_OUT      = frozenset({'Buy', 'MiscExp'})
+_LINKED_TX_VIABLE_ACTIONS = frozenset({'Buy', 'Sell', 'Dividend', 'IntInc', 'RtrnCap', 'MiscExp', 'MiscInc', 'CashOut', 'CashIn'})
+_LINKED_TX_CASH_OUT      = frozenset({'Buy', 'MiscExp', 'CashOut'})
 
 
 def _get_or_create_payee_in_cur(cur, name: str) -> "int | None":
@@ -623,7 +628,7 @@ def create_linked_cash_transactions_for_unlinked(
             LEFT   JOIN Securities s ON s.securities_id = i.securities_id
             WHERE  i.accounts_id     = %s
               AND  i.transactions_id IS NULL
-              AND  i.action IN ('Buy', 'Sell', 'Dividend', 'IntInc', 'RtrnCap', 'MiscExp')
+              AND  i.action IN ('Buy', 'Sell', 'Dividend', 'IntInc', 'RtrnCap', 'MiscExp', 'MiscInc', 'CashOut', 'CashIn')
             ORDER  BY i.date, i.investments_id
             """,
             (acc_id,),
@@ -663,6 +668,13 @@ def create_linked_cash_transactions_for_unlinked(
                 errors.append(f"Inv #{inv_id}: {row_err}")
 
         conn.commit()
+
+        # Recalculate balances for both sides after all cash transactions are created.
+        # update_accounts_balances recalculates the linked cash account from Transactions.
+        # update_investment_balances recalculates the investment account from Investments.
+        update_accounts_balances(linked_acc_id)
+        update_investment_balances()
+
     except Exception as outer_err:
         conn.rollback()
         errors.append(f"Outer error: {outer_err}")

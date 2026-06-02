@@ -275,6 +275,10 @@ _CHARGE_ACTION_MAP: dict[str, str] = {
     "WithholdingTax":        "MiscExp",
     # Misc
     "OtherEvent":            "MiscExp",
+    # Deposits and withdrawals are handled by the cash account bank import
+    # and must NOT be imported as investment charges to avoid duplicates.
+    # "Deposit":            intentionally excluded
+    # "Withdrawal":         intentionally excluded
 }
 
 
@@ -740,19 +744,29 @@ def parse_trades(
                     if back_comm > 0.0001:
                         commission = round(back_comm, 4)
 
-            # Fallback: CommissionAccountCurrency carries the flat broker fee for
-            # Sell trades (and cross-currency Buys where back-calc can't run).
-            # SAXO charges the commission as a separate debit on Sell — it is NOT
-            # embedded in BookedAmountAccountCurrency for that direction.
+            # Fallback: CommissionAccountCurrency / TotalCostAccountCurrency /
+            # BookedCostAccountCurrency carry the flat broker fee for cross-currency
+            # Buys and Sell trades.
             if commission == 0 and comm_field > 0:
                 commission = comm_field
+            if commission == 0 and total_cost > 0:
+                commission = total_cost
+
+            acc_currency = t.get("AccountCurrency", "")
+            cross_currency = bool(currency and acc_currency and currency != acc_currency)
+
+            # For cross-currency Buy: BookedAmountAccountCurrency is the pure trade
+            # value (FX-converted); commission is reported separately but in the same
+            # account currency, so it is safe to add directly.
+            # For same-currency Buy the commission is already embedded in booked_amt
+            # via the back-calc above, so do NOT add it again.
+            if action == "Buy" and commission > 0 and cross_currency:
+                total_acc = round(booked_amt + commission, 2)
 
             # For Sell: net proceeds = gross proceeds − commission.
             # Only adjust when instrument and account share the same base currency
-            # so booked_amt and commission are in the same unit (avoids mixing
-            # e.g. USD gross proceeds with an EUR commission figure).
+            # so booked_amt and commission are in the same unit.
             if action == "Sell" and commission > 0:
-                acc_currency = t.get("AccountCurrency", "")
                 if currency and acc_currency and currency == acc_currency:
                     total_acc = max(0.0, round(booked_amt - commission, 2))
 
@@ -1159,12 +1173,36 @@ def run_import(
         # ── Optional: wipe existing SAXO records for re-import ────────────────
         if replace_mode:
             for db_acc_id in set(account_map.values()):
+                # Collect linked cash transaction IDs before deleting investments
+                cur.execute(
+                    "SELECT Transactions_Id FROM Investments "
+                    "WHERE Accounts_Id = %s AND Description LIKE %s "
+                    "  AND Transactions_Id IS NOT NULL",
+                    (db_acc_id, f"{_SAXO_PREFIX}%"),
+                )
+                linked_tx_ids = [r[0] for r in cur.fetchall()]
+
                 cur.execute(
                     "DELETE FROM Investments "
                     "WHERE Accounts_Id = %s AND Description LIKE %s",
                     (db_acc_id, f"{_SAXO_PREFIX}%"),
                 )
-                log.info("Replace mode: deleted existing SAXO records for account %d", db_acc_id)
+
+                # Delete orphaned linked cash transactions (and their splits)
+                if linked_tx_ids:
+                    cur.execute(
+                        "DELETE FROM Splits WHERE transactions_id = ANY(%s)",
+                        (linked_tx_ids,)
+                    )
+                    cur.execute(
+                        "DELETE FROM Transactions WHERE Transactions_Id = ANY(%s)",
+                        (linked_tx_ids,)
+                    )
+
+                log.info(
+                    "Replace mode: deleted SAXO investments + %d linked transactions "
+                    "for account %d", len(linked_tx_ids), db_acc_id
+                )
 
         # ── Load user-defined security mappings once ──────────────────────────
         from database.queries import get_security_mappings as _get_sec_map
@@ -1504,6 +1542,111 @@ def _get_or_create_account_fee_security(cur, currency: str = "EUR") -> int:
     return cur.fetchone()[0]
 
 
+def apply_pdf_commissions(pdf_path: "str | Path") -> "tuple[int, list[str]]":
+    """Read Booked Costs from a SAXO Transaction PDF and update Investment records.
+
+    Matches each trade's commission to the Investment row via its Description
+    field (stored as ``SAXO|TRADE|{trade_id}``).
+
+    For each matched trade:
+      • Sets Commission on the Investment row.
+      • Adjusts Total_Amount_AccCur: Buy → +commission, Sell → −commission.
+      • If a linked cash Transaction exists (Investments.Transactions_Id IS NOT NULL),
+        adjusts Transactions.Total_Amount by the same signed delta so the cash
+        account balance stays correct.
+
+    Returns (rows_updated, warnings).
+    """
+    from data.saxo_pdf_parser import parse_trade_commissions
+
+    commissions = parse_trade_commissions(pdf_path)
+    if not commissions:
+        return 0, ["No trade commissions found in PDF."]
+
+    updated   = 0
+    warnings: list[str] = []
+    prefix    = "SAXO|TRADE|"
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            for trade_id, comm_eur in commissions.items():
+                desc_pattern = f"%{prefix}{trade_id}%"
+
+                # Fetch the investment row (skip if already has commission)
+                cur.execute(
+                    """SELECT Investments_Id, Action, Total_Amount_AccCur,
+                              Transactions_Id, Commission
+                         FROM Investments
+                        WHERE Description LIKE %s""",
+                    (desc_pattern,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    warnings.append(
+                        f"TradeID {trade_id} ({comm_eur:.2f} EUR): not in DB — "
+                        f"trade was not imported (outside API fetch range)."
+                    )
+                    continue
+                if row[4] is not None and float(row[4]) != 0:
+                    warnings.append(
+                        f"TradeID {trade_id} ({comm_eur:.2f} EUR): skipped — "
+                        f"commission already set to {float(row[4]):.4f} EUR "
+                        f"(CFD/FX position trade)."
+                    )
+                    continue
+
+                inv_id, action, total_acc_cur, tx_id, _ = row
+
+                # Signed delta: Buy costs more (+), Sell yields less (−)
+                delta = comm_eur if action == "Buy" else -comm_eur
+                new_total = (float(total_acc_cur) + delta) if total_acc_cur is not None else delta
+
+                cur.execute(
+                    """UPDATE Investments
+                          SET Commission          = %s,
+                              Total_Amount_AccCur = %s
+                        WHERE Investments_Id = %s""",
+                    (comm_eur, new_total, inv_id),
+                )
+                updated += 1
+
+                # Update linked cash transaction when present
+                if tx_id:
+                    # Cash Total_Amount is negative for Buy (outflow), positive for Sell (inflow)
+                    # For Buy: more cost → more negative → delta is −comm_eur on the cash side
+                    # For Sell: less received → delta is −comm_eur on the cash side
+                    cur.execute(
+                        """UPDATE Transactions
+                              SET Total_Amount = Total_Amount - %s
+                            WHERE Transactions_Id = %s""",
+                        (comm_eur, tx_id),
+                    )
+
+        conn.commit()
+
+    # Recalculate balances: investment totals changed, linked cash transactions updated.
+    from database.crud import update_investment_balances, update_accounts_balances, get_linked_account_id
+    update_investment_balances()
+    # Refresh the linked cash account for every investment account that was touched.
+    touched_inv_accs: set[int] = set()
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT DISTINCT i.Accounts_Id
+                     FROM Investments i
+                    WHERE i.Description LIKE %s
+                      AND i.Commission > 0""",
+                (f"%{prefix}%",),
+            )
+            touched_inv_accs = {r[0] for r in cur.fetchall()}
+    for _inv_acc in touched_inv_accs:
+        _linked = get_linked_account_id(_inv_acc)
+        if _linked:
+            update_accounts_balances(_linked)
+
+    return updated, warnings
+
+
 def run_charges_import(
     charge_records: list,
     account_map:    "dict[str, int]",
@@ -1548,10 +1691,28 @@ def run_charges_import(
         if replace_mode:
             for db_acc_id in set(account_map.values()):
                 cur.execute(
+                    "SELECT Transactions_Id FROM Investments "
+                    "WHERE Accounts_Id = %s AND Description LIKE %s "
+                    "  AND Transactions_Id IS NOT NULL",
+                    (db_acc_id, f"{_SAXO_CHARGE_PREFIX}%"),
+                )
+                linked_tx_ids = [r[0] for r in cur.fetchall()]
+
+                cur.execute(
                     "DELETE FROM Investments "
                     "WHERE Accounts_Id = %s AND Description LIKE %s",
                     (db_acc_id, f"{_SAXO_CHARGE_PREFIX}%"),
                 )
+
+                if linked_tx_ids:
+                    cur.execute(
+                        "DELETE FROM Splits WHERE transactions_id = ANY(%s)",
+                        (linked_tx_ids,)
+                    )
+                    cur.execute(
+                        "DELETE FROM Transactions WHERE Transactions_Id = ANY(%s)",
+                        (linked_tx_ids,)
+                    )
                 log.info(
                     "Replace mode: deleted SAXO charge records for account %d",
                     db_acc_id,

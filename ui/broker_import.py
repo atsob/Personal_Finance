@@ -4367,14 +4367,18 @@ app database) lasts ~1 year and is used to auto-renew without asking you to log 
 
             if _parse_pdf_btn or st.session_state.get("saxo_pdf_parsed"):
                 if _parse_pdf_btn:
+                    # Store PDF bytes in session state so they survive reruns
+                    st.session_state["saxo_pdf_bytes"] = _pdf_file.read()
+
                     # Write to a temp file so pdfplumber can open it
                     with tempfile.NamedTemporaryFile(
                         suffix=".pdf", delete=False
                     ) as _tmp:
-                        _tmp.write(_pdf_file.read())
+                        _tmp.write(st.session_state["saxo_pdf_bytes"])
                         _tmp_path = _tmp.name
 
                     try:
+                        st.session_state["saxo_pdf_tmp_path"] = _tmp_path
                         from data.saxo_pdf_parser import (
                             parse_saxo_transactions_pdf, reconcile_charges,
                         )
@@ -4425,7 +4429,7 @@ app database) lasts ~1 year and is used to auto-renew without asking you to log 
                             _rc = _rconn.cursor()
                             _acc_ids = list(set(_imp_map.values()))
                             _rc.execute(
-                                """SELECT Date, Description, Total_Amount,
+                                """SELECT Date, Description, Total_Amount_AccCur,
                                           Action, Securities_Id
                                    FROM  Investments
                                    WHERE Accounts_Id = ANY(%s)
@@ -4574,10 +4578,47 @@ app database) lasts ~1 year and is used to auto-renew without asking you to log 
                                 st.error(f"PDF import failed: {_exc}")
                                 st.code(traceback.format_exc())
 
+                    st.divider()
+                    st.markdown("**Update stock trade commissions from this PDF**")
+                    st.caption(
+                        "The Saxo API does not include commission in stock trade "
+                        "records. This reads 'Booked Costs' from the PDF and "
+                        "updates Commission + Total on already-imported trades."
+                    )
+                    if st.button(
+                        "💰 Apply Commissions from PDF",
+                        key="saxo_apply_commissions_btn",
+                    ):
+                        _pdf_bytes = st.session_state.get("saxo_pdf_bytes")
+                        if not _pdf_bytes:
+                            st.warning("Re-upload and parse the PDF first.")
+                        else:
+                            # Recreate temp file from stored bytes (original may be gone)
+                            with tempfile.NamedTemporaryFile(
+                                suffix=".pdf", delete=False
+                            ) as _tmp_c:
+                                _tmp_c.write(_pdf_bytes)
+                                _tmp_comm = _tmp_c.name
+                            try:
+                                from data.saxo_connector import apply_pdf_commissions
+                                with st.spinner("Updating commissions…"):
+                                    _upd, _warns = apply_pdf_commissions(_tmp_comm)
+                                if _upd:
+                                    st.success(f"Updated {_upd} investment record(s).")
+                                else:
+                                    st.info("No records updated (all already have commissions or no trades matched).")
+                                for _w in _warns:
+                                    st.warning(_w)
+                            except Exception as _exc:
+                                st.error(f"Commission update failed: {_exc}")
+                                st.code(traceback.format_exc())
+
                     if st.button("🔄 Clear PDF / Re-upload", key="saxo_pdf_clear"):
                         st.session_state.pop("saxo_pdf_parsed",      None)
                         st.session_state.pop("saxo_pdf_charges",     None)
                         st.session_state.pop("saxo_pdf_sec_matches", None)
+                        st.session_state.pop("saxo_pdf_tmp_path",    None)
+                        st.session_state.pop("saxo_pdf_bytes",       None)
                         st.rerun()
 
 
