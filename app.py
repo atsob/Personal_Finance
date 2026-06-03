@@ -18,6 +18,7 @@ from ui.ai_assistant import render_ai_assistant
 from ui.tools import render_tools
 from ui.importers import render_importers
 from ui.static_data import render_static_data
+from ui.recurring import render_recurring
 
 @st.cache_resource
 def startup_db_maintenance():
@@ -47,6 +48,96 @@ def startup_db_maintenance():
         cursor.execute("""
             ALTER TABLE Investments
             ADD COLUMN IF NOT EXISTS Instrument_Type VARCHAR(50)
+        """)
+        # ── Migration 005: Recurring Templates ───────────────────────────────
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS Recurring_Templates (
+                Templates_Id        SERIAL PRIMARY KEY,
+                Name                VARCHAR(100) NOT NULL,
+                Accounts_Id         INTEGER NOT NULL REFERENCES Accounts(Accounts_Id) ON DELETE CASCADE,
+                Payees_Id           INTEGER REFERENCES Payees(Payees_Id),
+                Description         TEXT,
+                Total_Amount        NUMERIC(28, 18),
+                Periodicity         VARCHAR(20) NOT NULL DEFAULT 'Monthly',
+                Next_Due_Date       DATE NOT NULL,
+                End_Date            DATE,
+                Auto_Confirm        BOOLEAN DEFAULT FALSE,
+                Active              BOOLEAN DEFAULT TRUE,
+                Accounts_Id_Target  INTEGER REFERENCES Accounts(Accounts_Id),
+                Created_At          TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS Recurring_Template_Splits (
+                Splits_Id       SERIAL PRIMARY KEY,
+                Templates_Id    INTEGER NOT NULL
+                    REFERENCES Recurring_Templates(Templates_Id) ON DELETE CASCADE,
+                Categories_Id   INTEGER REFERENCES Categories(Categories_Id),
+                Amount          NUMERIC(28, 18),
+                Memo            TEXT
+            )
+        """)
+        cursor.execute("""
+            ALTER TABLE Transactions
+                ADD COLUMN IF NOT EXISTS Is_Draft   BOOLEAN DEFAULT FALSE
+        """)
+        cursor.execute("""
+            ALTER TABLE Transactions
+                ADD COLUMN IF NOT EXISTS Templates_Id INTEGER
+                    REFERENCES Recurring_Templates(Templates_Id) ON DELETE SET NULL
+        """)
+        # Draft-aware balance trigger (replaces existing function in-place)
+        cursor.execute("""
+            CREATE OR REPLACE FUNCTION public.update_accounts_balance_with_transfer()
+                RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                IF (TG_OP = 'INSERT') THEN
+                    IF NEW.Is_Draft THEN RETURN NULL; END IF;
+                    UPDATE Accounts SET Accounts_Balance = Accounts_Balance + NEW.Total_Amount
+                     WHERE Accounts_Id = NEW.Accounts_Id;
+                    IF NEW.Accounts_Id_Target IS NOT NULL THEN
+                        UPDATE Accounts
+                           SET Accounts_Balance = Accounts_Balance + COALESCE(NEW.Total_Amount_Target, -NEW.Total_Amount)
+                         WHERE Accounts_Id = NEW.Accounts_Id_Target;
+                    END IF;
+                ELSIF (TG_OP = 'DELETE') THEN
+                    IF OLD.Is_Draft THEN RETURN NULL; END IF;
+                    UPDATE Accounts SET Accounts_Balance = Accounts_Balance - OLD.Total_Amount
+                     WHERE Accounts_Id = OLD.Accounts_Id;
+                    IF OLD.Accounts_Id_Target IS NOT NULL THEN
+                        UPDATE Accounts
+                           SET Accounts_Balance = Accounts_Balance - COALESCE(OLD.Total_Amount_Target, -OLD.Total_Amount)
+                         WHERE Accounts_Id = OLD.Accounts_Id_Target;
+                    END IF;
+                ELSIF (TG_OP = 'UPDATE') THEN
+                    IF OLD.Is_Draft AND NEW.Is_Draft THEN
+                        RETURN NULL;
+                    ELSIF OLD.Is_Draft AND NOT NEW.Is_Draft THEN
+                        UPDATE Accounts SET Accounts_Balance = Accounts_Balance + NEW.Total_Amount
+                         WHERE Accounts_Id = NEW.Accounts_Id;
+                        IF NEW.Accounts_Id_Target IS NOT NULL THEN
+                            UPDATE Accounts
+                               SET Accounts_Balance = Accounts_Balance + COALESCE(NEW.Total_Amount_Target, -NEW.Total_Amount)
+                             WHERE Accounts_Id = NEW.Accounts_Id_Target;
+                        END IF;
+                    ELSIF NOT OLD.Is_Draft AND NEW.Is_Draft THEN
+                        UPDATE Accounts SET Accounts_Balance = Accounts_Balance - OLD.Total_Amount
+                         WHERE Accounts_Id = OLD.Accounts_Id;
+                        IF OLD.Accounts_Id_Target IS NOT NULL THEN
+                            UPDATE Accounts
+                               SET Accounts_Balance = Accounts_Balance - COALESCE(OLD.Total_Amount_Target, -OLD.Total_Amount)
+                             WHERE Accounts_Id = OLD.Accounts_Id_Target;
+                        END IF;
+                    ELSE
+                        UPDATE Accounts SET Accounts_Balance = Accounts_Balance - OLD.Total_Amount
+                         WHERE Accounts_Id = OLD.Accounts_Id;
+                        UPDATE Accounts SET Accounts_Balance = Accounts_Balance + NEW.Total_Amount
+                         WHERE Accounts_Id = NEW.Accounts_Id;
+                    END IF;
+                END IF;
+                RETURN NULL;
+            END;
+            $$
         """)
         # Extend the securities_type ENUM with new instrument categories.
         # ADD VALUE IF NOT EXISTS is safe to run repeatedly; the label must be
@@ -175,7 +266,7 @@ def main():
         [
             "🏛️ Dashboard",
             "📝 Register",
-        #    "🥧 Investments (DEPRECIATED)",
+            "🔁 Recurring",
             "⏳ Reports",
             "📋 Static Data",
             "🌍 Market Data",
@@ -210,8 +301,10 @@ def main():
             render_market_data()
         elif menu == "📥 Importers":
             render_importers()
+        elif menu == "🔁 Recurring":
+            render_recurring()
         elif menu == "🛠️ Tools":
-            render_tools(conn)       
+            render_tools(conn)
         elif menu == "🧠 AI Assistant":
             render_ai_assistant(llm, agent_with_history, rag_engine, db=db)            
 

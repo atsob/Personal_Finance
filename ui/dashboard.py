@@ -424,7 +424,18 @@ def render_dashboard(conn):
             else:
                 df_projected = pd.DataFrame(columns=['date', 'payee', 'amount_eur', 'category', 'type'])
 
-            # 3. Merge, sort, display  (filter out empty frames to avoid dtype FutureWarning)
+            # 3. Drop projected rows that are covered by a confirmed entry for the
+            #    same payee within 7 days — avoids showing both when the recurring
+            #    estimate lands just before/after the actual scheduled transaction.
+            if not df_projected.empty and not df_confirmed.empty:
+                _TOLERANCE = pd.Timedelta(days=7)
+                def _has_confirmed(row):
+                    same_payee = df_confirmed['payee'] == row['payee']
+                    close_date = (df_confirmed['date'] - row['date']).abs() <= _TOLERANCE
+                    return (same_payee & close_date).any()
+                df_projected = df_projected[~df_projected.apply(_has_confirmed, axis=1)]
+
+            # Merge, sort, display  (filter out empty frames to avoid dtype FutureWarning)
             _frames = [df for df in [df_confirmed, df_projected] if not df.empty]
             df_bills = pd.concat(_frames, ignore_index=True) if _frames else pd.DataFrame(columns=['date', 'payee', 'amount_eur', 'category', 'type'])
             df_bills  = df_bills.sort_values('date').reset_index(drop=True)

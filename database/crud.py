@@ -1118,6 +1118,389 @@ def normalize_investment_prices(investments_ids: list) -> int:
         conn.close()
 
 
+# =============================================================================
+# RECURRING TEMPLATES
+# =============================================================================
+# Column naming follows the schema convention: plural-prefix for all PKs/FKs.
+#   Recurring_Templates PK  → Templates_Id
+#   Recurring_Template_Splits FK → Templates_Id
+#   Transactions FK         → Templates_Id
+
+def get_recurring_templates() -> pd.DataFrame:
+    """Return all templates (header-level) ordered by active then next due date."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    t.Templates_Id,
+                    t.Name,
+                    t.Accounts_Id,
+                    a.Accounts_Name,
+                    t.Payees_Id,
+                    p.Payees_Name,
+                    t.Description,
+                    t.Total_Amount,
+                    t.Periodicity,
+                    t.Next_Due_Date,
+                    t.End_Date,
+                    t.Auto_Confirm,
+                    t.Active,
+                    t.Accounts_Id_Target,
+                    t.Created_At
+                FROM Recurring_Templates t
+                JOIN Accounts a ON a.Accounts_Id = t.Accounts_Id
+                LEFT JOIN Payees p ON p.Payees_Id = t.Payees_Id
+                ORDER BY t.Active DESC, t.Next_Due_Date ASC
+            """)
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description]
+        return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(
+            columns=['templates_id','name','accounts_id','accounts_name','payees_id','payees_name',
+                     'description','total_amount','periodicity','next_due_date','end_date',
+                     'auto_confirm','active','accounts_id_target','created_at']
+        )
+    finally:
+        conn.close()
+
+
+def get_template_splits(templates_id: int) -> pd.DataFrame:
+    """Return splits for one template with full recursive category path."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                WITH RECURSIVE ch AS (
+                    SELECT Categories_Id, Categories_Name::TEXT AS full_path
+                    FROM   Categories
+                    WHERE  Categories_Id_Parent IS NULL
+                    UNION ALL
+                    SELECT c.Categories_Id, ch.full_path || ' : ' || c.Categories_Name
+                    FROM   Categories c
+                    JOIN   ch ON c.Categories_Id_Parent = ch.Categories_Id
+                )
+                SELECT s.Splits_Id, s.Templates_Id, s.Categories_Id,
+                       ch.full_path AS categories_name, s.Amount, s.Memo
+                FROM Recurring_Template_Splits s
+                LEFT JOIN ch ON ch.Categories_Id = s.Categories_Id
+                WHERE s.Templates_Id = %s
+                ORDER BY s.Splits_Id
+            """, (templates_id,))
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description]
+        return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(
+            columns=['splits_id','templates_id','categories_id','categories_name','amount','memo']
+        )
+    finally:
+        conn.close()
+
+
+def save_recurring_template(template: dict, splits: list) -> int:
+    """Upsert a template and replace its splits atomically. Returns templates_id."""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        tid = template.get('templates_id')
+        if tid:
+            cur.execute("""
+                UPDATE Recurring_Templates SET
+                    Name = %s, Accounts_Id = %s, Payees_Id = %s, Description = %s,
+                    Total_Amount = %s, Periodicity = %s, Next_Due_Date = %s,
+                    End_Date = %s, Auto_Confirm = %s, Active = %s, Accounts_Id_Target = %s
+                WHERE Templates_Id = %s
+            """, (
+                template['name'], template['accounts_id'], template.get('payees_id'),
+                template.get('description'), template.get('total_amount'),
+                template['periodicity'], template['next_due_date'],
+                template.get('end_date'), bool(template.get('auto_confirm', False)),
+                bool(template.get('active', True)), template.get('accounts_id_target'),
+                int(tid),
+            ))
+            cur.execute("DELETE FROM Recurring_Template_Splits WHERE Templates_Id = %s", (int(tid),))
+        else:
+            cur.execute("""
+                INSERT INTO Recurring_Templates
+                    (Name, Accounts_Id, Payees_Id, Description, Total_Amount,
+                     Periodicity, Next_Due_Date, End_Date, Auto_Confirm, Active, Accounts_Id_Target)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                RETURNING Templates_Id
+            """, (
+                template['name'], template['accounts_id'], template.get('payees_id'),
+                template.get('description'), template.get('total_amount'),
+                template['periodicity'], template['next_due_date'],
+                template.get('end_date'), bool(template.get('auto_confirm', False)),
+                bool(template.get('active', True)), template.get('accounts_id_target'),
+            ))
+            tid = cur.fetchone()[0]
+
+        if splits:
+            execute_values(cur,
+                "INSERT INTO Recurring_Template_Splits (Templates_Id, Categories_Id, Amount, Memo) VALUES %s",
+                [(int(tid), s.get('categories_id'), s.get('amount'), s.get('memo') or None)
+                 for s in splits]
+            )
+        conn.commit()
+        return int(tid)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+def delete_recurring_template(templates_id: int):
+    """Delete a template; nullifies any draft transactions that were generated from it."""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "UPDATE Transactions SET Templates_Id = NULL WHERE Templates_Id = %s AND Is_Draft = TRUE",
+            (templates_id,)
+        )
+        cur.execute("DELETE FROM Recurring_Templates WHERE Templates_Id = %s", (templates_id,))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+def create_template_from_transaction(transaction_id: int) -> int:
+    """Seed a new Recurring_Template from an existing confirmed transaction and its splits."""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT Accounts_Id, Payees_Id, Description, Total_Amount, Accounts_Id_Target
+            FROM Transactions WHERE Transactions_Id = %s
+        """, (transaction_id,))
+        tx = cur.fetchone()
+        if not tx:
+            raise ValueError(f"Transaction {transaction_id} not found")
+        acc_id, payee_id, desc, amount, target_acc = tx
+
+        cur.execute("""
+            INSERT INTO Recurring_Templates
+                (Name, Accounts_Id, Payees_Id, Description, Total_Amount,
+                 Periodicity, Next_Due_Date, Accounts_Id_Target)
+            VALUES (%s,%s,%s,%s,%s,'Monthly', CURRENT_DATE + INTERVAL '1 month', %s)
+            RETURNING Templates_Id
+        """, (desc or f"Template #{transaction_id}", acc_id, payee_id, desc, amount, target_acc))
+        tid = cur.fetchone()[0]
+
+        cur.execute("""
+            INSERT INTO Recurring_Template_Splits (Templates_Id, Categories_Id, Amount, Memo)
+            SELECT %s, Categories_Id, Amount, Memo FROM Splits WHERE Transactions_Id = %s
+        """, (tid, transaction_id))
+
+        conn.commit()
+        return int(tid)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+def generate_draft_transactions() -> int:
+    """Generate draft transactions for every active template whose Next_Due_Date <= today.
+
+    Auto-confirm templates (installments etc.) are inserted as confirmed directly.
+    Returns the count of transactions created.
+    """
+    try:
+        from dateutil.relativedelta import relativedelta
+    except ImportError:
+        relativedelta = None
+
+    from datetime import timedelta as _td
+
+    if relativedelta is not None:
+        _DELTAS = {
+            'Daily':     lambda d: d + relativedelta(days=1),
+            'Weekly':    lambda d: d + relativedelta(weeks=1),
+            'Biweekly':  lambda d: d + relativedelta(weeks=2),
+            'Monthly':   lambda d: d + relativedelta(months=1),
+            'Quarterly': lambda d: d + relativedelta(months=3),
+            'Annually':  lambda d: d + relativedelta(years=1),
+        }
+    else:
+        _DELTAS = {
+            'Daily':     lambda d: d + _td(days=1),
+            'Weekly':    lambda d: d + _td(weeks=7),
+            'Biweekly':  lambda d: d + _td(weeks=2),
+            'Monthly':   lambda d: d + _td(days=30),
+            'Quarterly': lambda d: d + _td(days=91),
+            'Annually':  lambda d: d + _td(days=365),
+        }
+
+    conn = get_connection()
+    cur = conn.cursor()
+    created = 0
+    try:
+        cur.execute("""
+            SELECT Templates_Id, Accounts_Id, Payees_Id, Description, Total_Amount,
+                   Periodicity, Next_Due_Date, End_Date, Auto_Confirm, Accounts_Id_Target
+            FROM Recurring_Templates
+            WHERE Active = TRUE
+              AND Next_Due_Date <= CURRENT_DATE
+              AND (End_Date IS NULL OR End_Date >= CURRENT_DATE)
+        """)
+        templates = cur.fetchall()
+
+        for (tid, acc_id, payee_id, desc, amount, periodicity,
+             next_due, end_date, auto_confirm, target_acc) in templates:
+
+            cur.execute("""
+                SELECT 1 FROM Transactions
+                WHERE Templates_Id = %s AND Date = %s AND Is_Draft = TRUE
+            """, (tid, next_due))
+            if cur.fetchone():
+                adv = _DELTAS.get(periodicity, _DELTAS['Monthly'])
+                cur.execute(
+                    "UPDATE Recurring_Templates SET Next_Due_Date = %s WHERE Templates_Id = %s",
+                    (adv(next_due), tid)
+                )
+                continue
+
+            is_draft = not bool(auto_confirm)
+
+            cur.execute("""
+                INSERT INTO Transactions
+                    (Accounts_Id, Date, Payees_Id, Description, Total_Amount,
+                     Is_Draft, Templates_Id, Cleared, Accounts_Id_Target)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,FALSE,%s)
+                RETURNING Transactions_Id
+            """, (acc_id, next_due, payee_id, desc, amount, is_draft, tid, target_acc))
+            tx_id = cur.fetchone()[0]
+
+            cur.execute("""
+                INSERT INTO Splits (Transactions_Id, Categories_Id, Amount, Memo)
+                SELECT %s, Categories_Id, Amount, Memo
+                FROM Recurring_Template_Splits WHERE Templates_Id = %s
+            """, (tx_id, tid))
+
+            adv = _DELTAS.get(periodicity, _DELTAS['Monthly'])
+            cur.execute(
+                "UPDATE Recurring_Templates SET Next_Due_Date = %s WHERE Templates_Id = %s",
+                (adv(next_due), tid)
+            )
+            created += 1
+
+        conn.commit()
+        return created
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+def confirm_draft_transaction(transaction_id: int):
+    """Confirm a single draft — flips Is_Draft to FALSE which triggers balance update."""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "UPDATE Transactions SET Is_Draft = FALSE WHERE Transactions_Id = %s AND Is_Draft = TRUE",
+            (transaction_id,)
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+def get_draft_transactions() -> pd.DataFrame:
+    """Return all draft transactions with split summary and template name."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    t.Transactions_Id,
+                    t.Date,
+                    t.Accounts_Id,
+                    a.Accounts_Name,
+                    t.Payees_Id,
+                    p.Payees_Name,
+                    t.Description,
+                    t.Total_Amount,
+                    t.Templates_Id,
+                    rt.Name        AS Template_Name,
+                    rt.Periodicity,
+                    COALESCE(
+                        STRING_AGG(
+                            c.Categories_Name || ': ' || ROUND(s.Amount::numeric, 2)::text,
+                            ' | '
+                            ORDER BY s.Splits_Id
+                        ),
+                        '—'
+                    ) AS Splits_Summary
+                FROM Transactions t
+                JOIN Accounts a ON a.Accounts_Id = t.Accounts_Id
+                LEFT JOIN Payees p ON p.Payees_Id = t.Payees_Id
+                LEFT JOIN Recurring_Templates rt ON rt.Templates_Id = t.Templates_Id
+                LEFT JOIN Splits s ON s.Transactions_Id = t.Transactions_Id
+                LEFT JOIN Categories c ON c.Categories_Id = s.Categories_Id
+                WHERE t.Is_Draft = TRUE
+                GROUP BY t.Transactions_Id, t.Date, t.Accounts_Id, a.Accounts_Name,
+                         t.Payees_Id, p.Payees_Name, t.Description, t.Total_Amount,
+                         t.Templates_Id, rt.Name, rt.Periodicity
+                ORDER BY t.Date ASC
+            """)
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description]
+        return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(
+            columns=['transactions_id','date','accounts_id','accounts_name','payees_id',
+                     'payees_name','description','total_amount','templates_id',
+                     'template_name','periodicity','splits_summary']
+        )
+    finally:
+        conn.close()
+
+
+def get_confirmed_from_templates() -> pd.DataFrame:
+    """Return confirmed transactions that originated from a recurring template (history log)."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    t.Transactions_Id,
+                    t.Date,
+                    a.Accounts_Name,
+                    p.Payees_Name,
+                    t.Description,
+                    t.Total_Amount,
+                    rt.Name AS Template_Name,
+                    rt.Periodicity
+                FROM Transactions t
+                JOIN Accounts a ON a.Accounts_Id = t.Accounts_Id
+                LEFT JOIN Payees p ON p.Payees_Id = t.Payees_Id
+                JOIN Recurring_Templates rt ON rt.Templates_Id = t.Templates_Id
+                WHERE t.Is_Draft = FALSE AND t.Templates_Id IS NOT NULL
+                ORDER BY t.Date DESC
+                LIMIT 200
+            """)
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description]
+        return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(
+            columns=['transactions_id','date','accounts_name','payees_name',
+                     'description','total_amount','template_name','periodicity']
+        )
+    finally:
+        conn.close()
+
+
 def save_nwr_account_selection(account_ids: list, settings_key: str = 'nwr_account_ids'):
     """Persist an account selection to app_settings under *settings_key*."""
     import json

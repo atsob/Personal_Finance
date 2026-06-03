@@ -33,6 +33,7 @@ from data.downloaders import (
 from ai.update_vector import update_all_embeddings
 from database.backup import DatabaseBackup
 from database.connection import get_connection
+from database.crud import generate_draft_transactions
 
 import os as _os
 _log_dir  = _os.getenv("APP_DATA_DIR", ".")
@@ -200,6 +201,16 @@ def _backup_job():
         logging.error(f"Backup retention purge failed: {e}", exc_info=True)
 
 
+def _recurring_drafts_job():
+    """Generate draft transactions for all active templates due today or earlier."""
+    logging.info("Running recurring drafts generation…")
+    try:
+        n = generate_draft_transactions()
+        logging.info(f"Recurring drafts: {n} transaction(s) created.")
+    except Exception as e:
+        logging.error(f"Recurring drafts generation failed: {e}", exc_info=True)
+
+
 def _morning_maintenance_job():
     """VACUUM ANALYZE the database, then refresh all embeddings."""
     # --- VACUUM ANALYZE ---
@@ -266,6 +277,11 @@ if __name__ == "__main__":
     except Exception:
         pass  # if check fails, let the normal schedule handle it
 
+    # Recurring drafts: run once at startup
+    logging.info("Running initial recurring drafts generation.")
+    _recurring_drafts_job()
+    _last_recurring_drafts_date: date = date.today()
+
     # Securities info: run once at startup every day
     _last_securities_info_date: date = date.min
     logging.info("Running initial securities info refresh.")
@@ -296,6 +312,11 @@ if __name__ == "__main__":
         if _is_market_open(now) and minutes_since_refresh >= MARKET_REFRESH_INTERVAL_MINUTES:
             _market_data_job()
             _last_market_refresh = now
+
+        # ── Recurring drafts: once per calendar day ───────────────────────────
+        if _last_recurring_drafts_date != date.today():
+            _recurring_drafts_job()
+            _last_recurring_drafts_date = date.today()
 
         # ── Securities info: once per calendar day (including weekends) ─────────
         if _last_securities_info_date != date.today():
