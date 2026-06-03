@@ -1247,10 +1247,12 @@ def download_historical_prices_from_tradingview(tsperiod="1m", target_sec_id=Non
                 (int(r[0]), str(r[1])): float(r[2]) for r in cur.fetchall()
             }
 
-            safe_rows:        list = []
-            skipped_future:   int  = 0
-            skipped_holiday:  int  = 0
-            skipped_ratio:    int  = 0
+            safe_rows:          list = []
+            holiday_deletes:    list = []   # (sid, dt) pairs to DELETE from DB
+            skipped_future:     int  = 0
+            skipped_holiday:    int  = 0
+            deleted_holiday:    int  = 0
+            skipped_ratio:      int  = 0
 
             for row in all_rows:
                 sid, dt, close = int(row[0]), str(row[1]), float(row[2])
@@ -1272,6 +1274,14 @@ def download_historical_prices_from_tradingview(tsperiod="1m", target_sec_id=Non
                     )
                     logging.warning(msg)
                     print(f"  ⚠️ {msg}")
+                    # If a (bad) price was already stored for this non-trading day,
+                    # schedule it for deletion so it cannot linger indefinitely.
+                    if (sid, dt) in existing_closes:
+                        holiday_deletes.append((sid, dt))
+                        logging.warning(
+                            "TV: scheduling stale holiday price for deletion — "
+                            "%s %s stored=%.4f", sec_name, dt, existing_closes[(sid, dt)]
+                        )
                     continue
 
                 # Guard 3 — ratio vs existing stored price
@@ -1291,14 +1301,35 @@ def download_historical_prices_from_tradingview(tsperiod="1m", target_sec_id=Non
 
                 safe_rows.append(row)
 
+            # ── Delete stale holiday prices ───────────────────────────────────
+            # Prices that were stored on non-trading days (by old code, before
+            # the holiday guard was in place) are removed now so they can never
+            # corrupt P&L or position reports.
+            if holiday_deletes:
+                for del_sid, del_dt in holiday_deletes:
+                    cur.execute(
+                        "DELETE FROM Historical_Prices "
+                        "WHERE Securities_Id = %s AND Date = %s",
+                        (del_sid, del_dt),
+                    )
+                    if cur.rowcount:
+                        deleted_holiday += 1
+                        print(
+                            f"  🗑️  Deleted stale holiday price: "
+                            f"{sec_name_lkp.get(del_sid, str(del_sid))} {del_dt}"
+                        )
+
             if skipped_future:
                 logging.info("TV: skipped %d future-dated row(s).", skipped_future)
                 print(f"  ℹ️  Skipped {skipped_future} future-dated row(s).")
             if skipped_holiday:
-                logging.warning("TV: skipped %d non-trading-day row(s).", skipped_holiday)
+                logging.warning("TV: skipped %d non-trading-day row(s) (%d stale deleted).",
+                                skipped_holiday, deleted_holiday)
                 print(
                     f"  ⚠️  Skipped {skipped_holiday} non-trading-day price(s) "
-                    "(exchange closed — weekend or holiday)."
+                    f"(exchange closed — weekend or holiday)"
+                    + (f"; deleted {deleted_holiday} stale holiday price(s) from DB."
+                       if deleted_holiday else ".")
                 )
             if skipped_ratio:
                 logging.warning(

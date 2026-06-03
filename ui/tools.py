@@ -365,6 +365,15 @@ def _render_sql_interface():
 
     default_sql = "SELECT table_name\nFROM information_schema.tables\nWHERE table_schema = 'public'\nORDER BY table_name;"
 
+    # Handle clear request from the PREVIOUS render cycle.
+    # We must pop sql_query BEFORE the widget is instantiated — Streamlit raises
+    # StreamlitAPIException if you write to a widget-bound key after it renders.
+    if st.session_state.pop("sql_clear_requested", False):
+        st.session_state.pop("sql_query",    None)
+        st.session_state.pop("sql_result",   None)
+        st.session_state.pop("sql_error",    None)
+        st.session_state.pop("sql_dml_info", None)
+
     sql = st.text_area(
         "SQL Query",
         value=st.session_state.get("sql_query", default_sql),
@@ -380,10 +389,9 @@ def _render_sql_interface():
         run = st.button("▶ Run Query", type="primary", width="stretch")
     with col_clear:
         if st.button("✖ Clear", width="stretch"):
-            st.session_state["sql_query"] = default_sql
-            st.session_state.pop("sql_result", None)
-            st.session_state.pop("sql_error", None)
-            st.session_state.pop("sql_dml_info", None)
+            # Cannot write to "sql_query" here — the widget is already rendered.
+            # Set a flag and rerun; the key is popped at the top of the next render.
+            st.session_state["sql_clear_requested"] = True
             st.rerun()
     with col_export:
         export_placeholder = st.empty()
