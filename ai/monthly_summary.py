@@ -177,6 +177,8 @@ def _gather_context(conn, month_start: str, month_end: str) -> str:
                 f"TOTAL: €{total:,.0f}"
             )
     except Exception as e:
+        conn.rollback()
+        logging.exception("NET WORTH query failed")
         blocks.append(f"NET WORTH: unavailable ({e})")
 
     # 2. Monthly income & expenses
@@ -196,16 +198,32 @@ def _gather_context(conn, month_start: str, month_end: str) -> str:
         """, (month_start, month_end))
         if not df.empty:
             r = df.iloc[0]
+            income   = float(r.income   or 0)
+            expense  = float(r.expense  or 0)
+            tax      = float(r.tax      or 0)
+            interest = float(r.interest or 0)
+            other    = float(r.other    or 0)
+            net        = income + expense + tax + interest + other
+            total_out  = abs(expense) + abs(tax) + abs(other if other < 0 else 0)
+            if net >= 0:
+                net_explanation = f"You saved €{net:,.2f} this month (income exceeded all outflows)."
+            else:
+                net_explanation = (
+                    f"Total outflows (expenses + tax + other) of €{total_out:,.2f} "
+                    f"exceeded income of €{income:,.2f} by €{abs(net):,.2f}."
+                )
             blocks.append(
                 f"MONTHLY CASH FLOWS (last 30 days):\n"
-                f"  Income: €{float(r.income or 0):,.2f}  "
-                f"Expenses: €{float(r.expense or 0):,.2f}  "
-                f"Tax: €{float(r.tax or 0):,.2f}  "
-                f"Interest: €{float(r.interest or 0):,.2f}  "
-                f"Other: €{float(r.other or 0):,.2f}  "
-                f"Net: €{float((r.income or 0) + (r.expense or 0) + (r.tax or 0) + (r.interest or 0) + (r.other or 0)):,.2f}"
+                f"  Income:   €{income:,.2f}\n"
+                f"  Expenses: €{expense:,.2f}  (negative = money out)\n"
+                f"  Tax:      €{tax:,.2f}  (negative = money out, treated as an expense)\n"
+                f"  Interest: €{interest:,.2f}\n"
+                f"  Other:    €{other:,.2f}\n"
+                f"  NET:      €{net:,.2f}  — {net_explanation}"
             )
     except Exception as e:
+        conn.rollback()
+        logging.exception("MONTHLY CASH FLOWS query failed")
         blocks.append(f"MONTHLY CASH FLOWS: unavailable ({e})")
 
     # 3. Investment P&L this month
@@ -272,8 +290,8 @@ def _gather_context(conn, month_start: str, month_end: str) -> str:
                     i.Accounts_Id, i.Securities_Id,
                     -- Converts each cash flow immediately using its specific historical transaction date FX rate
                     SUM(CASE WHEN i.Date > p.mtd_start AND i.Date <= p.today THEN
-                        (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share)
-                            WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share)
+                        (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share)
+                            WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share)
                             ELSE 0 END) * COALESCE(hfx.FX_Rate, 1)
                         ELSE 0 END) AS cf_mtd_eur
                 FROM periods p
@@ -300,28 +318,36 @@ def _gather_context(conn, month_start: str, month_end: str) -> str:
             pnl = float(df.iloc[0]['pnl_mtd_eur'] or 0)
             blocks.append(f"INVESTMENT P&L (month): €{pnl:+,.2f}")
     except Exception as e:
+        conn.rollback()
+        logging.exception("INVESTMENT P&L query failed")
         blocks.append(f"INVESTMENT P&L: unavailable ({e})")
 
-    # 4. Top 10 payees this month (largest absolute amounts)
+    # 4. Top 10 payees this month (largest absolute amounts, real expenses only)
     try:
         df = _query(conn, """
             SELECT p.Payees_Name, ABS(SUM(t.Total_Amount)) AS abs_amount, SUM(t.Total_Amount) AS total_amount
             FROM Transactions t
             LEFT JOIN Payees p ON t.Payees_Id = p.Payees_Id
             WHERE t.Date >= %s AND t.Date <= %s
-            AND	t.Transfers_Id IS NULL  -- Exclude internal transfers to avoid cluttering the list with large but non-impactful movements
+            AND t.Transfers_Id IS NULL  -- exclude internal transfers
+            AND t.Transactions_Id NOT IN (
+                SELECT Transactions_Id FROM Investments WHERE Transactions_Id IS NOT NULL
+            )  -- exclude investment funding transactions
+            AND p.Payees_Name IS NOT NULL  -- exclude unnamed payees
             GROUP BY p.Payees_Name
-			HAVING SUM(t.Total_Amount) < 0
+            HAVING SUM(t.Total_Amount) < 0
             ORDER BY ABS(SUM(t.Total_Amount)) DESC
             LIMIT 10
         """, (month_start, month_end))
         if not df.empty:
             rows = "\n".join(
-                f"  {r.payees_name or 'N/A':30s}  €{float(r.total_amount):+,.2f}"
+                f"  {r.payees_name:30s}  €{abs(float(r.total_amount)):,.2f}"
                 for _, r in df.iterrows()
             )
-            blocks.append(f"TOP 10 PAYEES THIS MONTH:\n{rows}")
+            blocks.append(f"TOP 10 PAYEES THIS MONTH (expenses only, amounts are positive outflows):\n{rows}")
     except Exception as e:
+        conn.rollback()
+        logging.exception("TOP PAYEES query failed")
         blocks.append(f"TOP PAYEES: unavailable ({e})")
 
     return "\n\n".join(blocks)
@@ -335,14 +361,30 @@ SYSTEM_PROMPT = textwrap.dedent("""\
     You are a personal finance assistant producing a concise monthly summary
     for the account holder. Use plain, friendly language. Highlight any
     noteworthy items (unusually large expenses, good investment month, etc.).
-    Keep the summary under 500 words. Do not invent numbers — only use those
-    provided in the CONTEXT block below. Do not invent payee names and expenses.
-    Only summarize the top 10 largest payees provided.
+    Keep the summary under 500 words.
+
+    STRICT RULES — violating any of these makes the summary wrong:
+    1. Never invent or calculate numbers. Copy figures verbatim from the CONTEXT block.
+    2. Never use bracket placeholders. Address the reader as "you" / "your".
+    3. Do not summarise any payees or amounts not present in the CONTEXT block.
+       The top-payees list is complete — do not add an "unnamed payee" or "remaining amount" line.
+    4. Do not claim data is unavailable unless the CONTEXT block explicitly says "unavailable".
+    5. Do NOT write a letter. No greeting, no sign-off. Write plain paragraphs only.
+    6. Tax is treated as an expense. The NET already accounts for all outflows including tax.
+       Use the pre-computed explanation on the NET line verbatim — do not rephrase or recalculate it.
+    7. Present the top-payees list EXACTLY ONCE as a single numbered list with name and amount on each line.
+       Do not repeat payees as bullet highlights AND again as a numbered list.
 """)
 
 
 def generate_summary(llm, context: str) -> str:
-    prompt = f"{SYSTEM_PROMPT}\n\nCONTEXT:\n{context}\n\nPlease write the monthly summary:"
+    prompt = (
+        f"{SYSTEM_PROMPT}\n\n"
+        f"--- BEGIN CONTEXT (use ONLY these numbers) ---\n"
+        f"{context}\n"
+        f"--- END CONTEXT ---\n\n"
+        f"Write the monthly summary now, using only the data above:"
+    )
     try:
         response = llm.invoke(prompt)
         if hasattr(response, "content"):
@@ -415,7 +457,7 @@ def run(target_month=None):
         logging.info(f"Month end: {month_end}")
 
         context = _gather_context(conn, month_start, month_end)
-        logging.info("Context gathered.")
+        logging.info("Context gathered:\n%s", context)
 
         llm = init_llm()
         summary = generate_summary(llm, context)

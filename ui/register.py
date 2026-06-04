@@ -845,12 +845,12 @@ def _render_new_investment_form(acc_id, acc_type, df_accs, df_securities, get_db
             key=f"inv_qty_{rc}",
         )
         inv_price = st.number_input(
-            "Price Per Share", min_value=0.0, value=0.0, step=0.0001, format="%.8f",
+            "Price Per Share", min_value=0.0, value=0.0, step=0.00000001, format="%.8f",
             key=f"inv_price_{rc}",
         )
         inv_comm = st.number_input(
             "Commission (0 = auto-derive)",
-            min_value=0.0, value=0.0, step=0.01, format="%.8f",
+            min_value=0.0, value=0.0, step=0.00000001, format="%.8f",
             key=f"inv_comm_{rc}",
             help=(
                 "Leave 0 to auto-derive from Qty × Price vs Total (Sec Currency): "
@@ -912,7 +912,7 @@ def _render_new_investment_form(acc_id, acc_type, df_accs, df_securities, get_db
         inv_fx_rate = st.number_input(
             "FX Rate (1 Sec → Acc)",
             value=_def_fx_new,
-            min_value=0.000001, step=0.000001, format="%.6f",
+            min_value=0.000001, step=0.00000001, format="%.8f",
             key=f"inv_fx_{rc}",
             help=(
                 "1 unit of security currency = this many account-currency units. "
@@ -1438,14 +1438,14 @@ def _render_edit_investment_form(acc_id, acc_type, df_accs, df_securities, get_d
         inv_price = st.number_input(
             "Price Per Share", min_value=0.0,
             value=float(sel_row['price_per_share']) if sel_row.get('price_per_share') is not None else 0.0,
-            step=0.0001, format="%.8f",
+            step=0.00000001, format="%.8f",
             key=f"inv_edit_price_{acc_id}",
         )
         inv_comm = st.number_input(
             "Commission (0 = auto-derive)",
             min_value=0.0,
             value=float(sel_row['commission']) if sel_row.get('commission') is not None else 0.0,
-            step=0.01, format="%.8f",
+            step=0.00000001, format="%.8f",
             key=f"inv_edit_comm_{acc_id}",
             help=(
                 "Leave 0 to auto-derive from Qty × Price vs Total (Sec Currency): "
@@ -1503,7 +1503,7 @@ def _render_edit_investment_form(acc_id, acc_type, df_accs, df_securities, get_d
         inv_fx_rate = st.number_input(
             "FX Rate (1 Sec → Acc)",
             value=st.session_state.get(f"inv_edit_fx_{acc_id}", 1.0),
-            min_value=0.000001, step=0.000001, format="%.6f",
+            min_value=0.000001, step=0.00000001, format="%.8f",
             key=f"inv_edit_fx_{acc_id}",
             help=(
                 "Stored FX rate for this transaction. "

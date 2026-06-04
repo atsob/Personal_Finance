@@ -182,6 +182,8 @@ def _gather_context(conn, week_start: str, period_end: str) -> str:
                 f"TOTAL: €{total:,.0f}"
             )
     except Exception as e:
+        conn.rollback()
+        logging.exception("NET WORTH query failed")
         blocks.append(f"NET WORTH: unavailable ({e})")
 
     # 2. Weekly income & expenses
@@ -201,16 +203,32 @@ def _gather_context(conn, week_start: str, period_end: str) -> str:
         """, (week_start, period_end))
         if not df.empty:
             r = df.iloc[0]
+            income   = float(r.income   or 0)
+            expense  = float(r.expense  or 0)
+            tax      = float(r.tax      or 0)
+            interest = float(r.interest or 0)
+            other    = float(r.other    or 0)
+            net       = income + expense + tax + interest + other
+            total_out = abs(expense) + abs(tax) + abs(other if other < 0 else 0)
+            if net >= 0:
+                net_explanation = f"You saved €{net:,.2f} this week (income exceeded all outflows)."
+            else:
+                net_explanation = (
+                    f"Total outflows (expenses + tax + other) of €{total_out:,.2f} "
+                    f"exceeded income of €{income:,.2f} by €{abs(net):,.2f}."
+                )
             blocks.append(
                 f"WEEKLY CASH FLOWS ({week_start} to {period_end}):\n"
-                f"  Income: €{float(r.income or 0):,.2f}  "
-                f"Expenses: €{float(r.expense or 0):,.2f}  "
-                f"Tax: €{float(r.tax or 0):,.2f}  "
-                f"Interest: €{float(r.interest or 0):,.2f}  "
-                f"Other: €{float(r.other or 0):,.2f}  "
-                f"Net: €{float((r.income or 0) + (r.expense or 0) + (r.tax or 0) + (r.interest or 0) + (r.other or 0)):,.2f}"
+                f"  Income:   €{income:,.2f}\n"
+                f"  Expenses: €{expense:,.2f}  (negative = money out)\n"
+                f"  Tax:      €{tax:,.2f}  (negative = money out, treated as an expense)\n"
+                f"  Interest: €{interest:,.2f}\n"
+                f"  Other:    €{other:,.2f}\n"
+                f"  NET:      €{net:,.2f}  — {net_explanation}"
             )
     except Exception as e:
+        conn.rollback()
+        logging.exception("WEEKLY CASH FLOWS query failed")
         blocks.append(f"WEEKLY CASH FLOWS: unavailable ({e})")
 
     # 3. Investment P&L this week
@@ -284,17 +302,17 @@ def _gather_context(conn, week_start: str, period_end: str) -> str:
                         i.Accounts_Id, i.Securities_Id,
                         -- WTD CF
                         SUM(CASE WHEN i.Date > (SELECT wtd_start FROM periods) THEN
-                            (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share)
-                                WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share)
+                            (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share)
+                                WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share)
                                 ELSE 0 END) ELSE 0 END) AS cf_wtd,
                         -- WTD CF EUR
                         SUM(CASE WHEN i.Date > (SELECT wtd_start FROM periods) THEN
-                            (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
-                                WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
+                            (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
+                                WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
                                 ELSE 0 END) ELSE 0 END) AS cf_wtd_eur,
                         -- Συνολικό CF (για Realized P&L)
-                        SUM(CASE WHEN i.Action IN ('Buy', 'MiscExp', 'Reinvest', 'Exercise', 'ShrIn') THEN COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share)
-                                WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'RtrnCap', 'ShrOut') THEN -COALESCE(NULLIF(i.Total_Amount, 0), i.Quantity * i.Price_Per_Share)
+                        SUM(CASE WHEN i.Action IN ('Buy', 'MiscExp', 'Reinvest', 'Exercise', 'ShrIn') THEN COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share)
+                                WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'RtrnCap', 'ShrOut') THEN -COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share)
                                 ELSE 0 END) AS cf_all_time
                     FROM Investments i
                     JOIN Accounts a ON i.Accounts_Id = a.Accounts_Id
@@ -321,26 +339,35 @@ def _gather_context(conn, week_start: str, period_end: str) -> str:
             pnl = float(df.iloc[0]['pnl_wtd_eur'] or 0)
             blocks.append(f"INVESTMENT P&L (week): €{pnl:+,.2f}")
     except Exception as e:
+        conn.rollback()
+        logging.exception("INVESTMENT P&L query failed")
         blocks.append(f"INVESTMENT P&L: unavailable ({e})")
 
-    # 4. Top 5 transactions this week (largest absolute amounts)
+    # 4. Top 5 transactions this week (largest absolute amounts, real expenses only)
     try:
         df = _query(conn, """
-            SELECT t.Date, p.Payees_Name, ABS(t.Total_Amount) AS abs_amount, t.Total_Amount
+            SELECT t.Date, p.Payees_Name, ABS(t.Total_Amount) AS abs_amount, t.Total_Amount,
+                   CASE WHEN t.Total_Amount < 0 THEN 'EXPENSE/BUY' ELSE 'INCOME/SELL' END AS direction
             FROM Transactions t
             LEFT JOIN Payees p ON t.Payees_Id = p.Payees_Id
             WHERE t.Date BETWEEN %s AND %s
             AND t.Transfers_Id IS NULL
+            AND t.Transactions_Id NOT IN (
+                SELECT Transactions_Id FROM Investments WHERE Transactions_Id IS NOT NULL
+            )  -- exclude investment funding transactions
+            AND p.Payees_Name IS NOT NULL
             ORDER BY ABS(t.Total_Amount) DESC
             LIMIT 5
         """, (week_start, period_end))
         if not df.empty:
             rows = "\n".join(
-                f"  {r.date}  {r.payees_name or 'N/A':30s}  €{float(r.total_amount):+,.2f}"
+                f"  {r.date}  {r.direction:12s}  {r.payees_name:30s}  €{abs(float(r.total_amount)):,.2f}"
                 for _, r in df.iterrows()
             )
-            blocks.append(f"TOP 5 TRANSACTIONS THIS WEEK:\n{rows}")
+            blocks.append(f"TOP 5 TRANSACTIONS THIS WEEK (direction is EXPENSE/BUY or INCOME/SELL):\n{rows}")
     except Exception as e:
+        conn.rollback()
+        logging.exception("TOP TRANSACTIONS query failed")
         blocks.append(f"TOP TRANSACTIONS: unavailable ({e})")
 
     return "\n\n".join(blocks)
@@ -354,13 +381,32 @@ SYSTEM_PROMPT = textwrap.dedent("""\
     You are a personal finance assistant producing a concise weekly summary
     for the account holder. Use plain, friendly language. Highlight any
     noteworthy items (unusually large expenses, good investment week, etc.).
-    Keep the summary under 250 words. Do not invent numbers — only use those
-    provided in the CONTEXT block below. Do not invent duplicate transactions - only summarize the top 5 largest ones provided.
+    Keep the summary under 250 words.
+
+    STRICT RULES — violating any of these makes the summary wrong:
+    1. Never invent or calculate numbers. Copy figures verbatim from the CONTEXT block.
+    2. Never use bracket placeholders. Address the reader as "you" / "your".
+    3. Each transaction row includes a direction label: EXPENSE/BUY means money went out;
+       INCOME/SELL means money came in. Use this label — do not guess the direction from the name.
+    4. Do not summarise any transactions not present in the CONTEXT block.
+       The transaction list is complete — do not add an "unnamed payee" or "remaining amount" line.
+    5. Do not claim data is unavailable unless the CONTEXT block explicitly says "unavailable".
+    6. Do NOT write a letter. No greeting, no sign-off. Write plain paragraphs only.
+    7. Tax is treated as an expense. The NET already accounts for all outflows including tax.
+       Use the pre-computed explanation on the NET line verbatim — do not rephrase or recalculate it.
+    8. Present the top-transactions list EXACTLY ONCE as a single numbered list with name and amount.
+       Do not repeat transactions as bullet highlights AND again as a numbered list.
 """)
 
 
 def generate_summary(llm, context: str) -> str:
-    prompt = f"{SYSTEM_PROMPT}\n\nCONTEXT:\n{context}\n\nPlease write the weekly summary:"
+    prompt = (
+        f"{SYSTEM_PROMPT}\n\n"
+        f"--- BEGIN CONTEXT (use ONLY these numbers) ---\n"
+        f"{context}\n"
+        f"--- END CONTEXT ---\n\n"
+        f"Write the weekly summary now, using only the data above:"
+    )
     try:
         response = llm.invoke(prompt)
         if hasattr(response, "content"):
@@ -375,15 +421,21 @@ def generate_summary(llm, context: str) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def save_summary(conn, week_start: date, summary_text: str):
-    with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO AI_Weekly_Summaries (Week_Start, Summary_Text)
-            VALUES (%s, %s)
-            ON CONFLICT (Week_Start)
-            DO UPDATE SET Summary_Text = EXCLUDED.Summary_Text,
-                          Generated_At = CURRENT_TIMESTAMP
-        """, (week_start, summary_text))
-    conn.commit()
+    conn.rollback()  # clear any aborted transaction from data-gathering failures
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO AI_Weekly_Summaries (Week_Start, Summary_Text)
+                VALUES (%s, %s)
+                ON CONFLICT (Week_Start)
+                DO UPDATE SET Summary_Text = EXCLUDED.Summary_Text,
+                              Generated_At = CURRENT_TIMESTAMP
+            """, (week_start, summary_text))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logging.exception("save_summary failed")
+        raise
 
 
 # ──────────────────────────────────────────────────────────────────────────────

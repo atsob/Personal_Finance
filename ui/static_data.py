@@ -270,9 +270,9 @@ def render_static_data():
 
             with get_db() as conn:
                 df_cat_preview = pd.read_sql("""
-                    SELECT DISTINCT t.Date, a1.Accounts_Name,
+                    SELECT s.Splits_Id, t.Date, a1.Accounts_Name,
                         COALESCE((SELECT Payees_Name FROM Payees WHERE Payees_Id = t.Payees_Id), 'NO PAYEE') AS Payees_Name,
-                        t.Description, t.Total_Amount,
+                        t.Description, s.Amount AS Split_Amount, t.Total_Amount,
                         (SELECT a2.Accounts_Name FROM Accounts a2 WHERE a2.Accounts_Id = t.Accounts_Id_Target) AS Accounts_Name_Target,
                         t.Total_Amount_Target
                     FROM Transactions t
@@ -282,17 +282,33 @@ def render_static_data():
                 """, conn, params=(_cat_from_id,))
 
             _from_label = _from_cat_options.get(_cat_from_id, str(_cat_from_id))
-            st.markdown(f"**Transactions for:** {_from_label}")
-            st.dataframe(df_cat_preview, width="stretch", hide_index=True, column_config={
-                "date": st.column_config.DateColumn("Date", width="small"),
-                "accounts_name": st.column_config.TextColumn("Account", width="medium"),
-                "payees_name": st.column_config.TextColumn("Payee", width="medium"),
-                "description": st.column_config.TextColumn("Description", width="medium"),
-                "total_amount": st.column_config.NumberColumn("Amount", format="%,.2f", width="small"),
-                "accounts_name_target": st.column_config.TextColumn("Target Account", width="medium"),
-                "total_amount_target": st.column_config.NumberColumn("Target Amount", format="%,.2f", width="small"),
-            })
+            st.markdown(f"**Splits for:** {_from_label}")
+            st.caption("Select specific rows to merge only those splits. Leave all unselected to merge all.")
+            _cat_sel_event = st.dataframe(
+                df_cat_preview.drop(columns=["splits_id"]),
+                width="stretch", hide_index=True,
+                selection_mode="multi-row", on_select="rerun",
+                key="sd_cat_preview_sel",
+                column_config={
+                    "date": st.column_config.DateColumn("Date", width="small"),
+                    "accounts_name": st.column_config.TextColumn("Account", width="medium"),
+                    "payees_name": st.column_config.TextColumn("Payee", width="medium"),
+                    "description": st.column_config.TextColumn("Description", width="medium"),
+                    "split_amount": st.column_config.NumberColumn("Split Amount", format="%,.2f", width="small"),
+                    "total_amount": st.column_config.NumberColumn("Tx Amount", format="%,.2f", width="small"),
+                    "accounts_name_target": st.column_config.TextColumn("Target Account", width="medium"),
+                    "total_amount_target": st.column_config.NumberColumn("Target Amount", format="%,.2f", width="small"),
+                },
+            )
             copy_df_button(df_cat_preview, key="sd_dl_cat_preview")
+
+            _cat_sel_rows = [i for i in (_cat_sel_event.selection.rows if _cat_sel_event else []) if i is not None and i < len(df_cat_preview)]
+            _cat_selected_ids = (
+                df_cat_preview.iloc[_cat_sel_rows]["splits_id"].tolist()
+                if _cat_sel_rows else []
+            )
+            _cat_all_selected = len(_cat_selected_ids) == 0  # empty selection = all
+            _cat_merge_count = len(df_cat_preview) if _cat_all_selected else len(_cat_selected_ids)
 
             # Show any deferred post-merge message (persisted across the rerun)
             if 'sd_merge_post_msg' in st.session_state:
@@ -305,25 +321,38 @@ def render_static_data():
             if _cat_to_id:
                 _from_cat_name = _from_cat_options.get(_cat_from_id, "")
                 _to_cat_name   = _to_cat_options.get(_cat_to_id, "")
-                _splits_count  = int(df_cats_with_splits.loc[df_cats_with_splits["categories_id"] == _cat_from_id, "splits_count"].iloc[0])
 
+                with get_db() as conn:
+                    _child_count_pre = pd.read_sql(
+                        "SELECT COUNT(*) AS cnt FROM Categories WHERE Categories_Id_Parent = %s",
+                        conn, params=(_cat_from_id,)
+                    ).iloc[0]["cnt"]
+
+                _delete_disabled = not _cat_all_selected or _child_count_pre > 0
+                _delete_help = (
+                    "After all splits are moved, permanently delete the source category. "
+                    "Only available when merging all splits and the category has no sub-categories. "
+                    "Any associated budget entries and payee-default references are cleaned up automatically."
+                )
                 _also_delete = st.checkbox(
                     "Also delete source category after merge",
                     key="sd_merge_cat_also_delete",
-                    help=(
-                        "After all splits are moved, permanently delete the source category. "
-                        "Requires the category to have no sub-categories. "
-                        "Any associated budget entries and payee-default references are cleaned up automatically."
-                    ),
+                    disabled=_delete_disabled,
+                    help=_delete_help,
                 )
+                if not _cat_all_selected:
+                    st.caption(f"ℹ️ {len(_cat_selected_ids)} of {len(df_cat_preview)} split(s) selected — delete option disabled.")
+                elif _child_count_pre > 0:
+                    st.caption(f"ℹ️ Source category has {_child_count_pre} sub-categor{'y' if _child_count_pre == 1 else 'ies'} — delete option disabled.")
 
                 if st.button("▶️ Merge Category Splits", type="primary", key="sd_merge_cat_btn"):
                     st.session_state['sd_merge_cat_confirm'] = True
 
                 if st.session_state.get('sd_merge_cat_confirm'):
                     _delete_note = " and permanently **delete** the source category" if _also_delete else ""
+                    _scope_note = "all" if _cat_all_selected else f"{_cat_merge_count} selected"
                     st.warning(
-                        f"⚠️ This will move **{_splits_count} split(s)** from "
+                        f"⚠️ This will move **{_scope_note} split(s)** from "
                         f"**{_from_cat_name}** → **{_to_cat_name}**{_delete_note}. "
                         "This cannot be undone."
                     )
@@ -334,20 +363,27 @@ def render_static_data():
                             st.rerun()
                     with _cy:
                         if st.button("✔ Yes, merge", type="primary", key="sd_merge_cat_yes", width="stretch"):
-                            with st.spinner(f"Moving {_splits_count} splits…"):
+                            with st.spinner(f"Moving {_cat_merge_count} splits…"):
                                 try:
-                                    # 1. Reassign all splits
+                                    # 1. Reassign selected or all splits
                                     with get_db() as conn:
                                         cur = conn.cursor()
-                                        cur.execute(
-                                            "UPDATE Splits SET Categories_Id = %s WHERE Categories_Id = %s",
-                                            (_cat_to_id, _cat_from_id),
-                                        )
+                                        if _cat_all_selected:
+                                            cur.execute(
+                                                "UPDATE Splits SET Categories_Id = %s WHERE Categories_Id = %s",
+                                                (_cat_to_id, _cat_from_id),
+                                            )
+                                        else:
+                                            _placeholders = ",".join(["%s"] * len(_cat_selected_ids))
+                                            cur.execute(
+                                                f"UPDATE Splits SET Categories_Id = %s WHERE Splits_Id IN ({_placeholders})",
+                                                [_cat_to_id] + _cat_selected_ids,
+                                            )
 
                                     st.session_state['sd_merge_cat_confirm'] = False
                                     _sd_load_cats_with_splits.clear()
                                     st.toast(
-                                        f"✅ {_splits_count} split(s) moved from "
+                                        f"✅ {_cat_merge_count} split(s) moved from "
                                         f"**{_from_cat_name}** to **{_to_cat_name}**.",
                                         icon="✅",
                                     )
@@ -503,7 +539,7 @@ def render_static_data():
 
             with get_db() as conn:
                 df_payee_preview = pd.read_sql("""
-                    SELECT DISTINCT t.Date, a1.Accounts_Name, p.Payees_Name, t.Description, t.Total_Amount,
+                    SELECT t.Transactions_Id, t.Date, a1.Accounts_Name, p.Payees_Name, t.Description, t.Total_Amount,
                         (SELECT a2.Accounts_Name FROM Accounts a2 WHERE a2.Accounts_Id = t.Accounts_Id_Target) AS Accounts_Name_Target,
                         t.Total_Amount_Target
                     FROM Transactions t JOIN Payees p ON p.Payees_Id = t.Payees_Id
@@ -513,28 +549,44 @@ def render_static_data():
 
             _from_label = _from_payee_options.get(_payee_from_id, str(_payee_from_id))
             st.markdown(f"**Transactions for:** {_from_label}")
-            st.dataframe(df_payee_preview, width="stretch", hide_index=True, column_config={
-                "date": st.column_config.DateColumn("Date", width="small"),
-                "accounts_name": st.column_config.TextColumn("Account", width="medium"),
-                "payees_name": st.column_config.TextColumn("Payee", width="medium"),
-                "description": st.column_config.TextColumn("Description", width="medium"),
-                "total_amount": st.column_config.NumberColumn("Amount", format="%,.2f", width="small"),
-                "accounts_name_target": st.column_config.TextColumn("Target Account", width="medium"),
-                "total_amount_target": st.column_config.NumberColumn("Target Amount", format="%,.2f", width="small"),
-            })
+            st.caption("Select specific rows to merge only those transactions. Leave all unselected to merge all.")
+            _payee_sel_event = st.dataframe(
+                df_payee_preview.drop(columns=["transactions_id"]),
+                width="stretch", hide_index=True,
+                selection_mode="multi-row", on_select="rerun",
+                key="sd_payee_preview_sel",
+                column_config={
+                    "date": st.column_config.DateColumn("Date", width="small"),
+                    "accounts_name": st.column_config.TextColumn("Account", width="medium"),
+                    "payees_name": st.column_config.TextColumn("Payee", width="medium"),
+                    "description": st.column_config.TextColumn("Description", width="medium"),
+                    "total_amount": st.column_config.NumberColumn("Amount", format="%,.2f", width="small"),
+                    "accounts_name_target": st.column_config.TextColumn("Target Account", width="medium"),
+                    "total_amount_target": st.column_config.NumberColumn("Target Amount", format="%,.2f", width="small"),
+                },
+            )
             copy_df_button(df_payee_preview, key="sd_dl_payee_preview")
+
+            _payee_sel_rows = [i for i in (_payee_sel_event.selection.rows if _payee_sel_event else []) if i is not None and i < len(df_payee_preview)]
+            _payee_selected_ids = (
+                df_payee_preview.iloc[_payee_sel_rows]["transactions_id"].tolist()
+                if _payee_sel_rows else []
+            )
+            _payee_all_selected = len(_payee_selected_ids) == 0  # empty selection = all
+            _payee_merge_count = len(df_payee_preview) if _payee_all_selected else len(_payee_selected_ids)
 
             if _payee_to_id:
                 _from_payee_name = _from_payee_options.get(_payee_from_id, "")
                 _to_payee_name   = _to_payee_options.get(_payee_to_id, "")
-                _transactions_count = int(df_payees_with_transactions.loc[
-                    df_payees_with_transactions["payees_id"] == _payee_from_id, "transactions_count"].iloc[0])
 
                 _also_delete_payee = st.checkbox(
                     "Also delete source payee after merge",
                     key="sd_merge_payee_also_delete",
-                    help="After all transactions are moved, permanently delete the source payee.",
+                    disabled=not _payee_all_selected,
+                    help="After all transactions are moved, permanently delete the source payee. Only available when merging all transactions.",
                 )
+                if not _payee_all_selected:
+                    st.caption(f"ℹ️ {len(_payee_selected_ids)} of {len(df_payee_preview)} transaction(s) selected — delete option disabled.")
 
                 if st.session_state.get('sd_merge_payee_post_msg'):
                     _pm_level, _pm_text = st.session_state.pop('sd_merge_payee_post_msg')
@@ -548,8 +600,9 @@ def render_static_data():
 
                 if st.session_state.get('sd_merge_payee_confirm'):
                     _delete_note = " and permanently **delete** the source payee" if _also_delete_payee else ""
+                    _scope_note = "all" if _payee_all_selected else f"{_payee_merge_count} selected"
                     st.warning(
-                        f"⚠️ This will move **{_transactions_count} transaction(s)** from "
+                        f"⚠️ This will move **{_scope_note} transaction(s)** from "
                         f"**{_from_payee_name}** → **{_to_payee_name}**{_delete_note}. "
                         f"This cannot be undone."
                     )
@@ -560,20 +613,27 @@ def render_static_data():
                             st.rerun()
                     with _cy:
                         if st.button("✔ Yes, merge", type="primary", key="sd_merge_payee_yes", width="stretch"):
-                            with st.spinner(f"Moving {_transactions_count} transactions…"):
+                            with st.spinner(f"Moving {_payee_merge_count} transactions…"):
                                 try:
                                     with get_db() as conn:
                                         cur = conn.cursor()
                                         cur.execute("ALTER TABLE Transactions DISABLE TRIGGER trg_update_balance;")
                                         conn.commit()
-                                        cur.execute("UPDATE Transactions SET Payees_Id = %s WHERE Payees_Id = %s", (_payee_to_id, _payee_from_id))
+                                        if _payee_all_selected:
+                                            cur.execute("UPDATE Transactions SET Payees_Id = %s WHERE Payees_Id = %s", (_payee_to_id, _payee_from_id))
+                                        else:
+                                            _placeholders = ",".join(["%s"] * len(_payee_selected_ids))
+                                            cur.execute(
+                                                f"UPDATE Transactions SET Payees_Id = %s WHERE Transactions_Id IN ({_placeholders})",
+                                                [_payee_to_id] + _payee_selected_ids,
+                                            )
                                         conn.commit()
                                         cur.execute("ALTER TABLE Transactions ENABLE TRIGGER trg_update_balance;")
                                         conn.commit()
                                     st.session_state['sd_merge_payee_confirm'] = False
                                     _sd_load_payees_for_merge.clear()
                                     st.toast(
-                                        f"✅ {_transactions_count} transaction(s) moved from "
+                                        f"✅ {_payee_merge_count} transaction(s) moved from "
                                         f"**{_from_payee_name}** to **{_to_payee_name}**.",
                                         icon="✅",
                                     )
