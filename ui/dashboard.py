@@ -4,7 +4,7 @@ import plotly.express as px
 from ui.components import format_qty_display, color_negative_red, style_qty_display, copy_df_button
 from database.queries import get_hist_net_worth_data, get_transaction_anomalies, get_weekly_summaries, get_all_accounts_for_nwr, get_nwr_account_selection, get_savings_rate_data, get_cash_flow_forecast, get_category_hierarchy
 from database.connection import get_connection
-from database.crud import update_accounts_balances, update_holdings, update_investment_balances, update_pension_balances, save_nwr_account_selection
+from database.crud import update_accounts_balances, update_holdings, update_investment_balances, update_pension_balances, save_nwr_account_selection, get_draft_transactions, confirm_draft_transaction
 from datetime import datetime
 from ai.weekly_summary import run as run_weekly_summary
 from ai.monthly_summary import run as run_monthly_summary
@@ -61,9 +61,111 @@ def render_ai_monthly_summaries_ui(conn):
                     st.error(f"Error: {e}")
 
 
+def _render_pending_review_banner():
+    """Show pending draft transactions at the top of the dashboard with inline actions."""
+    df = get_draft_transactions()
+    if df.empty:
+        return
+
+    n = len(df)
+    total = df['total_amount'].apply(pd.to_numeric, errors='coerce').sum()
+
+    with st.expander(
+        f"⏳ **{n} transaction{'s' if n != 1 else ''} pending review** — total {total:+,.2f}",
+        expanded=True,
+    ):
+        # ── Bulk confirm ────────────────────────────────────────────────────
+        col_bulk, col_info = st.columns([1, 5])
+        with col_bulk:
+            if st.button("✅ Confirm All", type="primary", key="dash_confirm_all", use_container_width=True):
+                errors = []
+                for tx_id in df['transactions_id'].tolist():
+                    try:
+                        confirm_draft_transaction(int(tx_id))
+                    except Exception as exc:
+                        errors.append(str(exc))
+                if errors:
+                    st.error(f"Some confirmations failed: {'; '.join(errors)}")
+                else:
+                    st.success(f"All {n} drafts confirmed.")
+                st.rerun()
+        with col_info:
+            st.caption("Review and confirm or discard each pending transaction below, or confirm all at once.")
+
+        st.divider()
+
+        # ── Per-row cards ───────────────────────────────────────────────────
+        for _, row in df.iterrows():
+            tx_id       = int(row['transactions_id'])
+            tx_date     = row['date']
+            account     = row.get('accounts_name', '')
+            payee       = row.get('payees_name') or '—'
+            desc        = row.get('description') or '—'
+            amount      = row.get('total_amount')
+            tmpl_name   = row.get('template_name') or '—'
+            splits_sum  = row.get('splits_summary') or '—'
+
+            c_date, c_amt, c_acc, c_payee, c_splits, c_tmpl, c_confirm, c_discard = st.columns(
+                [1.1, 1.1, 1.4, 1.4, 2.5, 1.6, 0.9, 0.9]
+            )
+
+            with c_date:
+                new_date = st.date_input(
+                    "Date", value=tx_date,
+                    key=f"dash_date_{tx_id}", label_visibility="collapsed"
+                )
+            with c_amt:
+                new_amount = st.number_input(
+                    "Amount", value=float(amount) if pd.notna(amount) else 0.0,
+                    step=0.01, format="%.2f",
+                    key=f"dash_amt_{tx_id}", label_visibility="collapsed"
+                )
+            with c_acc:
+                st.markdown(f"<small>{account}</small>", unsafe_allow_html=True)
+            with c_payee:
+                st.markdown(f"<small>{payee}</small>", unsafe_allow_html=True)
+            with c_splits:
+                st.markdown(f"<small>{splits_sum}</small>", unsafe_allow_html=True)
+            with c_tmpl:
+                st.markdown(f"<small>🔁 {tmpl_name}</small>", unsafe_allow_html=True)
+            with c_confirm:
+                if st.button("✅", key=f"dash_ok_{tx_id}", help=f"Confirm — {desc}", use_container_width=True):
+                    from database.connection import get_connection as _gc
+                    conn2 = _gc()
+                    try:
+                        with conn2.cursor() as cur:
+                            cur.execute(
+                                "UPDATE Transactions SET Date = %s, Total_Amount = %s WHERE Transactions_Id = %s",
+                                (new_date, new_amount, tx_id)
+                            )
+                        conn2.commit()
+                    finally:
+                        conn2.close()
+                    confirm_draft_transaction(tx_id)
+                    st.rerun()
+            with c_discard:
+                if st.button("🗑️", key=f"dash_del_{tx_id}", help="Discard draft", use_container_width=True):
+                    from database.connection import get_connection as _gc
+                    conn2 = _gc()
+                    try:
+                        with conn2.cursor() as cur:
+                            cur.execute("DELETE FROM Splits WHERE Transactions_Id = %s", (tx_id,))
+                            cur.execute(
+                                "DELETE FROM Transactions WHERE Transactions_Id = %s AND Is_Draft = TRUE",
+                                (tx_id,)
+                            )
+                        conn2.commit()
+                    finally:
+                        conn2.close()
+                    st.rerun()
+
+
 def render_dashboard(conn):
     """Render the Dashboard page."""
     st.title("🏛 Net Worth")
+
+    # ── Pending review banner ─────────────────────────────────────────────
+    _render_pending_review_banner()
 
     # ── Account selection & options ───────────────────────────────────────
     _DASH_NW_KEY = 'dashboard_nw_account_ids'
