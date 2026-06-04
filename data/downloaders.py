@@ -86,6 +86,60 @@ def _is_tv_trading_day(dt_str: str, tv_exchange: str) -> bool:
     return True
 
 
+def _today_price_state(tv_exchange: str) -> str:
+    """Return the current state of today's session for *tv_exchange*.
+
+    Returns one of:
+      "pre_market"  — session hasn't started yet → skip (TradingView returns garbage)
+      "open"        — session is in progress    → allow (live intraday price)
+      "closed"      — session ended + 15 min    → allow (final authoritative close)
+      "holiday"     — no session today          → skip (handled by Guard 2 already)
+      "unknown"     — exchange not in calendar  → skip (be conservative)
+
+    For crypto (_TV_ALWAYS_OPEN): always "open".
+    """
+    from datetime import datetime, timezone, timedelta, date as _date
+
+    exch = (tv_exchange or "").upper().strip()
+
+    if exch in _TV_ALWAYS_OPEN:
+        return "open"
+
+    cal_code = _TV_TO_XCAL.get(exch)
+    if not cal_code:
+        return "unknown"
+
+    try:
+        import exchange_calendars as _xcals
+        today_str = _date.today().isoformat()
+
+        if cal_code not in _xcal_cache:
+            _xcal_cache[cal_code] = _xcals.get_calendar(cal_code)
+        cal = _xcal_cache[cal_code]
+
+        if not cal.is_session(today_str):
+            return "holiday"
+
+        now_utc   = datetime.now(timezone.utc)
+        open_utc  = cal.session_open(today_str).tz_convert("UTC").to_pydatetime()
+        close_utc = cal.session_close(today_str).tz_convert("UTC").to_pydatetime()
+
+        if now_utc < open_utc:
+            return "pre_market"
+        if now_utc < close_utc + timedelta(minutes=15):
+            return "open"
+        return "closed"
+
+    except Exception as exc:
+        logging.debug("_today_price_state(%s): %s", exch, exc)
+        return "unknown"
+
+
+# Kept for backward-compat (used in tests)
+def _market_closed_for_today(tv_exchange: str) -> bool:
+    return _today_price_state(tv_exchange) == "closed"
+
+
 def download_historical_fx(tsperiod=None, currencies_id=None):
     """Download historical FX rates from Yahoo Finance.
 
@@ -857,40 +911,59 @@ class _PersistentTvDatafeed(TvDatafeed):
         send("switch_timezone", [chart_session, "exchange"])
 
         raw_data = ""
+        ws_broke = False
         while True:
             try:
                 result = self.ws.recv()
                 raw_data += result + "\n"
             except Exception:
+                ws_broke = True
                 break
 
             if any(frame in result for frame in self._TERMINAL_FRAMES):
-                if "series_completed" in result:
-                    # Delete the chart session so TradingView stops sending
-                    # real-time updates (du frames) for it.  Without this,
-                    # stale du frames from old sessions bleed into the next
-                    # security's raw_data and corrupt its price history.
+                # Always delete the chart session and drain residual frames,
+                # regardless of whether the terminal frame is success or error.
+                # Without this, stale error-session frames (symbol_error, etc.)
+                # bleed into the NEXT security's recv loop on the same WS,
+                # corrupting its raw_data and causing __create_df failures.
+                try:
+                    send("chart_delete_session", [chart_session])
+                except Exception:
+                    pass
+                try:
+                    self.ws.settimeout(0.15)
+                    while True:
+                        try:
+                            self.ws.recv()
+                        except Exception:
+                            break
+                finally:
                     try:
-                        send("chart_delete_session", [chart_session])
+                        self.ws.settimeout(self._WS_TIMEOUT)
                     except Exception:
                         pass
-                    # Drain the delete-ack and any other residual frames so
-                    # the next get_hist() call starts with a clean buffer.
-                    # Simple blind drain is safe here because the session is
-                    # already deleted — TV won't send any more data frames.
-                    try:
-                        self.ws.settimeout(0.15)
-                        while True:
-                            try:
-                                self.ws.recv()
-                            except Exception:
-                                break
-                    finally:
-                        try:
-                            self.ws.settimeout(self._WS_TIMEOUT)
-                        except Exception:
-                            pass
                 break
+
+        # If recv() broke mid-stream (timeout / connection drop) before a
+        # terminal frame arrived, the chart session is still open on TV's side.
+        # Delete it and drain so the next get_hist() on this WS starts clean.
+        if ws_broke:
+            try:
+                send("chart_delete_session", [chart_session])
+            except Exception:
+                pass
+            try:
+                self.ws.settimeout(0.15)
+                while True:
+                    try:
+                        self.ws.recv()
+                    except Exception:
+                        break
+            finally:
+                try:
+                    self.ws.settimeout(self._WS_TIMEOUT)
+                except Exception:
+                    pass
 
         # ── Chart-session filtering ───────────────────────────────────────────
         # Despite chart_delete_session + the drain window, a late-arriving du
@@ -1264,6 +1337,25 @@ def download_historical_prices_from_tradingview(tsperiod="1m", target_sec_id=Non
                     skipped_future += 1
                     logging.debug("TV: future-dated row skipped  sid=%s  date=%s", sid, dt)
                     continue
+
+                # Guard 1.5 — today's date: only store if market is open OR closed
+                # Three states for today:
+                #   "pre_market" → TradingView returns pre-open garbage (volume≈0,
+                #                  wrong price). SKIP.
+                #   "open"       → Live intraday price. ALLOW (user wants P&L).
+                #   "closed"     → Final authoritative close (+ 15 min buffer). ALLOW.
+                #   "holiday"    → Handled by Guard 2 below.
+                #   "unknown"    → Exchange not in calendar. SKIP to be safe.
+                if dt == today_str:
+                    state = _today_price_state(tv_exch)
+                    if state in ("pre_market", "unknown"):
+                        skipped_future += 1
+                        logging.debug(
+                            "TV: skipping today's price for %s (%s) — state=%s",
+                            sec_name, tv_exch, state,
+                        )
+                        continue
+                    # "open" or "closed" → fall through and store
 
                 # Guard 2 — non-trading day (weekend or exchange holiday)
                 if not _is_tv_trading_day(dt, tv_exch):
