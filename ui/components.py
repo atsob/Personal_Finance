@@ -168,6 +168,84 @@ def copy_df_button(df, key: str, label: str = "📋 Copy") -> None:
     _st_components.html(html, height=38)
 
 
+def insight_card(
+    icon: str,
+    title: str,
+    message: str,
+    level: str = "info",   # "info" | "warning" | "danger" | "success"
+) -> None:
+    """Render a styled actionable insight card on the dashboard."""
+    _PALETTE = {
+        "info":    ("#3498DB", "rgba(52,152,219,0.12)", "rgba(52,152,219,0.35)"),
+        "warning": ("#F39C12", "rgba(243,156,18,0.12)",  "rgba(243,156,18,0.35)"),
+        "danger":  ("#E74C3C", "rgba(231,76,60,0.12)",   "rgba(231,76,60,0.35)"),
+        "success": ("#2ECC71", "rgba(46,204,113,0.12)",  "rgba(46,204,113,0.35)"),
+    }
+    fg, bg, border = _PALETTE.get(level, _PALETTE["info"])
+    st.markdown(
+        f"""
+        <div style="
+            background:{bg};
+            border:1px solid {border};
+            border-left:4px solid {fg};
+            border-radius:10px;
+            padding:12px 16px;
+            margin:4px 0;
+            display:flex;
+            align-items:flex-start;
+            gap:12px;
+            ">
+            <span style="font-size:1.6em;line-height:1.2">{icon}</span>
+            <div>
+                <div style="font-weight:700;color:{fg};font-size:0.88em;
+                            letter-spacing:.02em;margin-bottom:3px">{title}</div>
+                <div style="font-size:0.85em;line-height:1.5;opacity:.9">{message}</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def dark_mode_css() -> str:
+    """Return CSS that forces dark theme colours regardless of Streamlit config."""
+    return """
+<style>
+/* ── Dark Mode overrides ────────────────────────────────────────────── */
+.stApp, [data-testid="stAppViewContainer"] {
+    background-color: #0e1117 !important;
+    color: #fafafa !important;
+}
+[data-testid="stSidebar"] {
+    background-color: #1a1c24 !important;
+}
+[data-testid="stHeader"] {
+    background-color: #0e1117 !important;
+}
+.stMarkdown, .stText, p, span, label, h1, h2, h3, h4 {
+    color: #fafafa !important;
+}
+[data-testid="stMetricValue"], [data-testid="stMetricLabel"] {
+    color: #fafafa !important;
+}
+.stDataFrame, [data-testid="stDataFrame"] {
+    background-color: #1e2030 !important;
+}
+div[data-baseweb="select"] > div,
+div[data-baseweb="input"] > div,
+textarea {
+    background-color: #262730 !important;
+    color: #fafafa !important;
+    border-color: #444 !important;
+}
+[data-testid="stExpander"] {
+    background-color: #1e2030 !important;
+    border-color: #333 !important;
+}
+</style>
+"""
+
+
 def custom_metric(label, value, pnl_value):
     # Color definition: Green (>0), Red (<0), Blue (==0)
     if pnl_value > 0:

@@ -6,6 +6,7 @@ from database.connection import get_db
 from database.crud import save_changes, execute_db_save, update_accounts_balances, update_holdings, update_investment_balances, update_pension_balances, insert_staking_reinvest
 from ui.components import copy_df_button
 
+@st.fragment
 def _render_transaction_table(acc_id, payee_options, acc_options, cat_options, tab_key, acc_balance=0.0):
     """Render a filtered transaction register for one account.
 
@@ -537,6 +538,98 @@ def _render_transaction_table(acc_id, payee_options, acc_options, cat_options, t
             st.rerun()
 
 
+@st.dialog("💰 Accounts Balance Overview", width="large")
+def _multi_account_dialog() -> None:
+    """Compact balance overview for all active bank/cash/investment accounts.
+
+    Shows every account in a single table with current balance and a
+    30/60/90-day income, expenses, and net cash-flow summary.
+    No transaction lists — just the numbers you need at a glance.
+    """
+    from database.connection import get_connection as _gc
+
+    period_days = st.pills(
+        "Period",
+        [30, 60, 90, 180],
+        format_func=lambda x: f"{x}d",
+        default=30,
+        key="mac_period",
+    )
+
+    conn = _gc()
+    df_accs = pd.read_sql("""
+        SELECT a.Accounts_Id       AS accounts_id,
+               a.Accounts_Name     AS name,
+               a.Accounts_Type     AS type,
+               a.Accounts_Balance  AS balance,
+               c.Currencies_ShortName AS currency
+        FROM Accounts a
+        JOIN Currencies c ON c.Currencies_Id = a.Currencies_Id
+        WHERE a.Is_Active = TRUE
+          AND a.Accounts_Type IN ('Checking','Savings','Cash','Credit Card')
+        ORDER BY a.Accounts_Type, a.Accounts_Name
+    """, conn)
+
+    if df_accs.empty:
+        conn.close()
+        st.info("No active bank/cash accounts found.")
+        return
+
+    # Fetch period totals for all accounts in one query
+    ids_sql = ", ".join(str(int(i)) for i in df_accs['accounts_id'].tolist())
+    df_flow = pd.read_sql(f"""
+        SELECT
+            t.Accounts_Id                                          AS accounts_id,
+            SUM(CASE WHEN t.Total_Amount > 0 THEN  t.Total_Amount ELSE 0 END) AS income,
+            SUM(CASE WHEN t.Total_Amount < 0 THEN -t.Total_Amount ELSE 0 END) AS expenses
+        FROM Transactions t
+        WHERE t.Accounts_Id IN ({ids_sql})
+          AND t.Date >= CURRENT_DATE - %(days)s * INTERVAL '1 day'
+          AND t.Transfers_Id IS NULL
+          AND t.Is_Draft = FALSE
+        GROUP BY t.Accounts_Id
+    """, conn, params={"days": period_days})
+    conn.close()
+
+    df = df_accs.merge(df_flow, on='accounts_id', how='left')
+    df['income']   = df['income'].fillna(0).astype(float)
+    df['expenses'] = df['expenses'].fillna(0).astype(float)
+    df['net']      = df['income'] - df['expenses']
+    df['balance']  = df['balance'].astype(float)
+
+    # Totals row
+    total_row = pd.DataFrame([{
+        'name':     '─── TOTAL ───',
+        'type':     '',
+        'currency': 'EUR',
+        'balance':  df['balance'].sum(),
+        'income':   df['income'].sum(),
+        'expenses': df['expenses'].sum(),
+        'net':      df['net'].sum(),
+    }])
+    df_display = pd.concat(
+        [df[['name','type','currency','balance','income','expenses','net']], total_row],
+        ignore_index=True,
+    )
+
+    st.dataframe(
+        df_display,
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "name":     st.column_config.TextColumn("Account"),
+            "type":     st.column_config.TextColumn("Type",     width="small"),
+            "currency": st.column_config.TextColumn("CCY",      width="small"),
+            "balance":  st.column_config.NumberColumn("Balance",          format="%.2f"),
+            "income":   st.column_config.NumberColumn(f"Income ({period_days}d)",   format="%.2f"),
+            "expenses": st.column_config.NumberColumn(f"Expenses ({period_days}d)", format="%.2f"),
+            "net":      st.column_config.NumberColumn(f"Net ({period_days}d)",      format="%.2f"),
+        },
+        column_order=["name","type","currency","balance","income","expenses","net"],
+    )
+    st.caption(f"Transfers excluded · Period: last {period_days} days · Balances in account currency")
+
+
 def get_or_create_payee_id(cur, payee_name, categories_id_default=None):
     """Lookup or insert a payee. Accepts a cursor; commit is handled by the caller."""
     if not payee_name:
@@ -825,7 +918,7 @@ def _render_new_investment_form(acc_id, acc_type, df_accs, df_securities, get_db
 
         _INSTRUMENT_TYPES = [
             "", "Stock", "ETF", "Bond", "CFD", "CEF", "CFDOnETF", "CFDOnStock",
-            "CFDOnIndex", "CFDOnFutures", "CFDOnFund", "Fund", "Option", "Other",
+            "CFDOnIndex", "CFDOnFutures", "CFDOnFund", "Fund", "Option", "FX Spot", "Other",
         ]
         inv_instrument_type = st.selectbox(
             "Instrument Type (optional)",
@@ -835,7 +928,7 @@ def _render_new_investment_form(acc_id, acc_type, df_accs, df_securities, get_db
             help=(
                 "Capture the specific traded instrument, independent of the security master. "
                 "Useful when the same underlying is traded as both a regular security and a CFD "
-                "(e.g. Saxo: CFDOnETF, CFDOnStock, CFDOnIndex). Leave blank for standard trades."
+                "(e.g. Saxo: CFDOnETF, CFDOnStock, CFDOnIndex, FX Spot). Leave blank for standard trades."
             ),
         )
 
@@ -1973,18 +2066,25 @@ def render_register():
     # Account selection
     if 'account_id_internal' not in st.session_state or st.session_state.account_id_internal is None:
         st.session_state.account_id_internal = acc_ids_list[0] if acc_ids_list else None
-    
+
     # Determine the index for the selectbox based on current account in session state
     current_account = st.session_state.account_id_internal
     default_index = acc_ids_list.index(current_account) if current_account in acc_ids_list else 0
-    
-    acc_id = st.selectbox(
-        "Select Account:", 
-        options=acc_ids_list,
-        format_func=lambda x: acc_options.get(x, "Unknown"),
-        index=default_index,
-        key=f"account_id_internal_{st.session_state.balance_update_counter}"
-    )
+
+    _acc_col, _btn_col = st.columns([5, 1])
+    with _acc_col:
+        acc_id = st.selectbox(
+            "Select Account:",
+            options=acc_ids_list,
+            format_func=lambda x: acc_options.get(x, "Unknown"),
+            index=default_index,
+            key=f"account_id_internal_{st.session_state.balance_update_counter}",
+        )
+    with _btn_col:
+        st.write("")  # vertical alignment spacer
+        if st.button("💰 Overview", help="Balance & cash-flow summary for all accounts",
+                     key="reg_compare_btn", use_container_width=True):
+            _multi_account_dialog()
     
     # Update session state with the selected account
     st.session_state.account_id_internal = acc_id

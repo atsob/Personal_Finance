@@ -546,7 +546,7 @@ def render_reports():
     """Render the Reports page."""
     st.title("Reports")
 
-    hist_sub_menu = st.sidebar.radio(
+    hist_sub_menu = st.sidebar.selectbox(
         "Select Report:",
         [
             "Net Worth Report",
@@ -560,7 +560,7 @@ def render_reports():
             "Custom Reports",
             "Financial Planning",
         ],
-        key="hist_sub_nav"
+        key="hist_sub_nav",
     )
 
     # Force a clean rerun whenever the sub-menu changes so that Streamlit fully

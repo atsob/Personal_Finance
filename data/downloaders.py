@@ -40,7 +40,23 @@ _TV_TO_XCAL: dict[str, str] = {
 # Exchanges that trade around the clock — never filter by day
 _TV_ALWAYS_OPEN: frozenset = frozenset({
     "COINBASE", "KRAKEN", "OKX", "BINANCE", "GEMINI",
-    "BITSTAMP", "KUCOIN", "BYBIT", "CRYPTO", 
+    "BITSTAMP", "KUCOIN", "BYBIT", "CRYPTO",
+})
+
+# FX / commodity data providers on TradingView.
+# These trade Mon–Fri (no fixed exchange calendar) so today's price is valid
+# on any weekday regardless of time-of-day.  They are NOT 24/7 (stop on
+# weekends) so they don't belong in _TV_ALWAYS_OPEN.
+_TV_WEEKDAY_OPEN: frozenset = frozenset({
+    "FX_IDC",      # TradingView FX / commodity composite feed (XAGEUR, XAUUSD …)
+    "TVC",         # TradingView Composite (indices, metals, economic data)
+    "OANDA",       # OANDA FX rates
+    "FOREXCOM",    # Forex.com
+    "FXCM",        # FXCM
+    "CURRENCYCOM", # Currency.com
+    "CAPITALCOM",  # Capital.com CFDs
+    "PYTH",        # Pyth Network oracle prices
+    "ICEUS",       # ICE US (some commodity indices on TV)
 })
 
 _xcal_cache: dict[str, object] = {}   # cache calendar objects (one per process)
@@ -51,9 +67,10 @@ def _is_tv_trading_day(dt_str: str, tv_exchange: str) -> bool:
 
     Logic (in order):
       1. Crypto / always-open exchanges → True unconditionally.
-      2. Saturday / Sunday → False for all equity/futures exchanges.
-      3. Exchange in _TV_TO_XCAL → query the exchange_calendars holiday calendar.
-      4. Unknown exchange → weekday check already passed in step 2; allow.
+      2. Saturday / Sunday → False for all equity/futures/FX exchanges.
+      3. FX / commodity weekday-open exchanges → True on weekdays.
+      4. Exchange in _TV_TO_XCAL → query the exchange_calendars holiday calendar.
+      5. Unknown exchange → weekday check already passed in step 2; allow.
     """
     exch = (tv_exchange or "").upper().strip()
 
@@ -67,11 +84,15 @@ def _is_tv_trading_day(dt_str: str, tv_exchange: str) -> bool:
     except ValueError:
         return True     # unparseable date — don't block it
 
-    # 2. Weekends are never trading days for equity/futures markets
+    # 2. Weekends are never trading days for equity/futures/FX markets
     if dt.weekday() >= 5:       # 5 = Saturday, 6 = Sunday
         return False
 
-    # 3. Full holiday calendar via exchange_calendars
+    # 3. FX / commodity weekday-open — valid on any weekday (no holiday calendar)
+    if exch in _TV_WEEKDAY_OPEN:
+        return True
+
+    # 4. Full holiday calendar via exchange_calendars
     cal_code = _TV_TO_XCAL.get(exch)
     if cal_code:
         try:
@@ -94,9 +115,12 @@ def _today_price_state(tv_exchange: str) -> str:
       "open"        — session is in progress    → allow (live intraday price)
       "closed"      — session ended + 15 min    → allow (final authoritative close)
       "holiday"     — no session today          → skip (handled by Guard 2 already)
-      "unknown"     — exchange not in calendar  → skip (be conservative)
 
     For crypto (_TV_ALWAYS_OPEN): always "open".
+    For FX/commodity weekday-open exchanges (_TV_WEEKDAY_OPEN): "open" on
+      weekdays, "holiday" on weekends.
+    For exchanges not in any known set: consistent with _is_tv_trading_day() —
+      allow on weekdays ("open"), block on weekends ("holiday").
     """
     from datetime import datetime, timezone, timedelta, date as _date
 
@@ -105,9 +129,17 @@ def _today_price_state(tv_exchange: str) -> str:
     if exch in _TV_ALWAYS_OPEN:
         return "open"
 
+    # FX / commodity weekday-open exchanges — valid any time on weekdays
+    if exch in _TV_WEEKDAY_OPEN:
+        return "open" if _date.today().weekday() < 5 else "holiday"
+
     cal_code = _TV_TO_XCAL.get(exch)
     if not cal_code:
-        return "unknown"
+        # Exchange not in any known set.  Consistent with _is_tv_trading_day():
+        # allow on weekdays, block on weekends.  This covers FX/commodity pairs
+        # whose TV exchange code is not yet in _TV_WEEKDAY_OPEN (e.g. new data
+        # providers) rather than silently dropping today's valid price.
+        return "open" if _date.today().weekday() < 5 else "holiday"
 
     try:
         import exchange_calendars as _xcals
@@ -1412,8 +1444,8 @@ def download_historical_prices_from_tradingview(tsperiod="1m", target_sec_id=Non
                         )
 
             if skipped_future:
-                logging.info("TV: skipped %d future-dated row(s).", skipped_future)
-                print(f"  ℹ️  Skipped {skipped_future} future-dated row(s).")
+                logging.info("TV: skipped %d future-dated or pre-market row(s).", skipped_future)
+                print(f"  ℹ️  Skipped {skipped_future} future-dated or pre-market row(s).")
             if skipped_holiday:
                 logging.warning("TV: skipped %d non-trading-day row(s) (%d stale deleted).",
                                 skipped_holiday, deleted_holiday)

@@ -183,6 +183,13 @@ def render_dashboard(conn):
     # ── Pending review banner ─────────────────────────────────────────────
     _render_pending_review_banner()
 
+    # ── Actionable spending insights ──────────────────────────────────────
+    try:
+        from ui.insights import render_spending_insights
+        render_spending_insights()
+    except Exception:
+        pass  # insights are best-effort; never block the dashboard
+
     # ── Account selection & options ───────────────────────────────────────
     _DASH_NW_KEY = 'dashboard_nw_account_ids'
     df_accounts  = get_all_accounts_for_nwr()
