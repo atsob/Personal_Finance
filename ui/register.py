@@ -3280,7 +3280,7 @@ def render_register():
                                     'accounts_id':    int(row['accounts_id']),
                                     'securities_id':  int(row['securities_id']),
                                     'quantity':       diff,
-                                    'price_per_share': 0,
+                                    'price_per_share': None,  # auto-populated from Historical_Prices in insert_staking_reinvest
                                     'date':           datetime.today().date(),
                                 })
 

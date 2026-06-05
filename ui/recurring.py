@@ -13,10 +13,12 @@ from database.crud import (
     generate_draft_transactions,
     confirm_draft_transaction,
     get_draft_transactions,
+    get_transaction_splits,
+    save_draft_transaction,
     get_confirmed_from_templates,
 )
 
-PERIODICITIES = ['Daily', 'Weekly', 'Biweekly', 'Monthly', 'Quarterly', 'Annually']
+PERIODICITIES = ['Daily', 'Weekly', 'Biweekly', 'Monthly', 'Quarterly', 'Semiannually', 'Annually']
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -421,7 +423,7 @@ def _render_templates_tab(accounts, payees, categories):
 # Tab 2 — Pending Review
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _render_pending_tab():
+def _render_pending_tab(accounts: dict, payees: dict, categories: dict):
     col_gen, col_bulk, _ = st.columns([1.2, 1.2, 4])
     with col_gen:
         if st.button("🔄 Generate Due Drafts", use_container_width=True,
@@ -463,74 +465,165 @@ def _render_pending_tab():
     for _, row in df.iterrows():
         tx_id       = int(row['transactions_id'])
         tx_date     = row['date']
-        account     = row.get('accounts_name', '')
-        payee       = row.get('payees_name') or '—'
-        desc        = row.get('description') or '—'
         amount      = row.get('total_amount')
         tmpl_name   = row.get('template_name') or '—'
         periodicity = row.get('periodicity') or ''
-        splits_sum  = row.get('splits_summary') or '—'
 
         with st.expander(
-            f"📅 {tx_date}  |  {account}  |  {payee}  |  "
-            f"**{amount:,.2f}** *(from: {tmpl_name})*",
+            f"📅 {tx_date}  |  {row.get('accounts_name','')}  |  "
+            f"{row.get('payees_name') or '—'}  |  "
+            f"**{float(amount):,.2f}** *(from: {tmpl_name})*",
             expanded=False,
         ):
-            ed1, ed2 = st.columns(2)
-            with ed1:
+            # ── Header fields ─────────────────────────────────────────────
+            h1, h2, h3 = st.columns(3)
+            with h1:
                 new_date = st.date_input("Date", value=tx_date, key=f"pd_date_{tx_id}")
+            with h2:
                 new_amount = st.number_input(
                     "Amount", value=float(amount) if pd.notna(amount) else 0.0,
                     step=0.01, format="%.2f", key=f"pd_amt_{tx_id}"
                 )
-            with ed2:
-                st.markdown(f"**Description:** {desc}")
-                st.markdown(f"**Periodicity:** {periodicity}")
-                st.markdown(f"**Splits:** {splits_sum}")
+            with h3:
+                new_desc = st.text_input(
+                    "Description",
+                    value=row.get('description') or '',
+                    key=f"pd_desc_{tx_id}"
+                )
 
-            if st.button("Apply edits", key=f"pd_apply_{tx_id}", help="Save date/amount changes without confirming"):
+            h4, h5, h6 = st.columns(3)
+            with h4:
+                acc_options = ['— keep current —'] + list(accounts.keys())
+                new_acc_sel = st.selectbox(
+                    "Account", options=acc_options,
+                    index=acc_options.index(row.get('accounts_name'))
+                          if row.get('accounts_name') in acc_options else 0,
+                    key=f"pd_acc_{tx_id}"
+                )
+            with h5:
+                payee_options = ['— keep current —'] + list(payees.keys())
+                new_payee_sel = st.selectbox(
+                    "Payee", options=payee_options,
+                    index=payee_options.index(row.get('payees_name'))
+                          if row.get('payees_name') in payee_options else 0,
+                    key=f"pd_payee_{tx_id}"
+                )
+            with h6:
+                st.caption(f"🔁 Template: **{tmpl_name}** · {periodicity}")
+
+            # ── Splits editor ─────────────────────────────────────────────
+            st.markdown("**Splits**")
+            splits_df_raw = get_transaction_splits(tx_id)
+            cat_options   = list(categories.keys())
+
+            if splits_df_raw.empty:
+                initial_splits = [{'Category': '', 'Amount': float(amount) if pd.notna(amount) else 0.0, 'Memo': ''}]
+            else:
+                initial_splits = [
+                    {
+                        'Category': r.get('categories_name') or '',
+                        'Amount':   float(r.get('amount') or 0),
+                        'Memo':     r.get('memo') or '',
+                    }
+                    for _, r in splits_df_raw.iterrows()
+                ]
+
+            edited_splits = st.data_editor(
+                pd.DataFrame(initial_splits),
+                num_rows="dynamic",
+                use_container_width=True,
+                key=f"pd_splits_{tx_id}",
+                column_config={
+                    'Category': st.column_config.SelectboxColumn(
+                        'Category', options=cat_options
+                    ),
+                    'Amount': st.column_config.NumberColumn('Amount', format="%.2f"),
+                    'Memo':   st.column_config.TextColumn('Memo'),
+                },
+            )
+
+            # ── Action buttons ────────────────────────────────────────────
+            ba1, ba2, ba3 = st.columns([1.2, 1.2, 4])
+            with ba1:
+                save_and_confirm = st.button(
+                    "✅ Save & Confirm", key=f"pd_confirm_{tx_id}",
+                    type="primary", use_container_width=True
+                )
+            with ba2:
+                save_only = st.button(
+                    "💾 Save", key=f"pd_apply_{tx_id}",
+                    use_container_width=True,
+                    help="Save changes without confirming"
+                )
+            with ba3:
+                discard = st.button(
+                    "🗑️ Discard draft", key=f"pd_del_{tx_id}",
+                    use_container_width=True
+                )
+
+            if save_and_confirm or save_only:
+                # Resolve account / payee selections
+                resolved_acc_id = (
+                    accounts[new_acc_sel]
+                    if new_acc_sel != '— keep current —'
+                    else int(row['accounts_id'])
+                )
+                resolved_payee_id = (
+                    payees[new_payee_sel]
+                    if new_payee_sel != '— keep current —'
+                    else (row.get('payees_id') if pd.notna(row.get('payees_id')) else None)
+                )
+                total = float(edited_splits['Amount'].fillna(0).sum()) or float(new_amount)
+                splits_out = [
+                    {
+                        'categories_id': categories[r['Category']],
+                        'amount': float(r['Amount'] or 0),
+                        'memo':   str(r.get('Memo') or '').strip() or None,
+                    }
+                    for _, r in edited_splits.iterrows()
+                    if r.get('Category') and r['Category'] in categories
+                ]
+                try:
+                    save_draft_transaction(
+                        tx_id,
+                        fields={
+                            'date':               new_date,
+                            'total_amount':       total,
+                            'description':        new_desc.strip() or None,
+                            'accounts_id':        resolved_acc_id,
+                            'payees_id':          resolved_payee_id,
+                            'accounts_id_target': row.get('accounts_id_target') if pd.notna(row.get('accounts_id_target')) else None,
+                        },
+                        splits=splits_out,
+                    )
+                    if save_and_confirm:
+                        confirm_draft_transaction(tx_id)
+                        st.cache_data.clear()
+                        st.session_state.pop('df_accs', None)
+                        st.success("Saved and confirmed.")
+                    else:
+                        st.success("Changes saved.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Failed: {exc}")
+
+            if discard:
                 conn = get_connection()
                 try:
                     with conn.cursor() as cur:
+                        cur.execute("DELETE FROM Splits WHERE Transactions_Id = %s", (tx_id,))
                         cur.execute(
-                            "UPDATE Transactions SET Date = %s, Total_Amount = %s WHERE Transactions_Id = %s",
-                            (new_date, new_amount, tx_id)
+                            "DELETE FROM Transactions WHERE Transactions_Id = %s AND Is_Draft = TRUE",
+                            (tx_id,)
                         )
                     conn.commit()
-                    st.success("Changes saved.")
+                    st.success("Draft discarded.")
                     st.rerun()
                 except Exception as exc:
                     conn.rollback()
                     st.error(f"Failed: {exc}")
                 finally:
                     conn.close()
-
-            bc1, bc2 = st.columns(2)
-            with bc1:
-                if st.button("✅ Confirm", key=f"pd_confirm_{tx_id}", type="primary", use_container_width=True):
-                    try:
-                        confirm_draft_transaction(tx_id)
-                        st.cache_data.clear()
-                        st.session_state.pop('df_accs', None)
-                        st.success("Transaction confirmed.")
-                        st.rerun()
-                    except Exception as exc:
-                        st.error(f"Failed: {exc}")
-            with bc2:
-                if st.button("🗑️ Discard", key=f"pd_del_{tx_id}", use_container_width=True):
-                    conn = get_connection()
-                    try:
-                        with conn.cursor() as cur:
-                            cur.execute("DELETE FROM Splits WHERE Transactions_Id = %s", (tx_id,))
-                            cur.execute("DELETE FROM Transactions WHERE Transactions_Id = %s AND Is_Draft = TRUE", (tx_id,))
-                        conn.commit()
-                        st.success("Draft discarded.")
-                        st.rerun()
-                    except Exception as exc:
-                        conn.rollback()
-                        st.error(f"Failed: {exc}")
-                    finally:
-                        conn.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -583,7 +676,7 @@ def render_recurring():
         _render_templates_tab(accounts, payees, categories)
 
     with tab_pending:
-        _render_pending_tab()
+        _render_pending_tab(accounts, payees, categories)
 
     with tab_history:
         _render_history_tab()

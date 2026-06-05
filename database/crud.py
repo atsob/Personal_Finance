@@ -832,11 +832,39 @@ def update_holdings():
         conn.close()
         
 
+def _lookup_hist_price(cur, securities_id, date):
+    """Return the most recent closing price for a security on or before date."""
+    cur.execute("""
+        SELECT Close FROM Historical_Prices
+        WHERE Securities_Id = %s AND Date <= %s
+        ORDER BY Date DESC LIMIT 1
+    """, (securities_id, date))
+    row = cur.fetchone()
+    return float(row[0]) if row else 0.0
+
+
+def _lookup_hist_fx(cur, accounts_id, date):
+    """Return the most recent account-currency → EUR FX rate on or before date."""
+    cur.execute("""
+        SELECT hfx.FX_Rate
+        FROM Historical_FX hfx
+        JOIN Accounts a ON a.Currencies_Id = hfx.Currencies_Id_1
+        WHERE a.Accounts_Id = %s AND hfx.Date <= %s
+        ORDER BY hfx.Date DESC LIMIT 1
+    """, (accounts_id, date))
+    row = cur.fetchone()
+    return float(row[0]) if row else 1.0
+
+
 def insert_staking_reinvest(entries):
     """Insert Reinvest investment entries for staking rewards.
 
     entries: list of dicts with keys:
         accounts_id, securities_id, quantity, price_per_share, date
+
+    When price_per_share is 0 or missing, the most recent closing price from
+    Historical_Prices is used automatically so that P&L calculations capture
+    the fair-market value of the staking income at the time of receipt.
     """
     if not entries:
         return
@@ -846,15 +874,23 @@ def insert_staking_reinvest(entries):
         for e in entries:
             qty   = float(e['quantity'])
             price = float(e.get('price_per_share') or 0)
-            total = qty * price
+
+            # Auto-populate price from Historical_Prices when not provided
+            if price == 0 and qty > 0:
+                price = _lookup_hist_price(cur, e['securities_id'], e['date'])
+
+            fx_rate   = _lookup_hist_fx(cur, e['accounts_id'], e['date'])
+            total_sec = qty * price                # amount in security currency
+            total_acc = total_sec * fx_rate        # amount in account currency
+
             cur.execute("""
                 INSERT INTO Investments
                     (Accounts_Id, Securities_Id, Date, Action, Quantity,
                      Price_Per_Share, Commission,
                      Total_Amount_AccCur, Total_Amount_SecCur, FX_Rate, Description)
-                VALUES (%s, %s, %s, 'Reinvest', %s, %s, 0, %s, %s, 1.0, 'Staking reward')
+                VALUES (%s, %s, %s, 'Reinvest', %s, %s, 0, %s, %s, %s, 'Staking reward')
             """, (e['accounts_id'], e['securities_id'], e['date'],
-                  qty, price, total, total))
+                  qty, price, total_acc, total_sec, fx_rate))
         conn.commit()
     except Exception as exc:
         conn.rollback()
@@ -1337,21 +1373,23 @@ def generate_draft_transactions() -> int:
 
     if relativedelta is not None:
         _DELTAS = {
-            'Daily':     lambda d: d + relativedelta(days=1),
-            'Weekly':    lambda d: d + relativedelta(weeks=1),
-            'Biweekly':  lambda d: d + relativedelta(weeks=2),
-            'Monthly':   lambda d: d + relativedelta(months=1),
-            'Quarterly': lambda d: d + relativedelta(months=3),
-            'Annually':  lambda d: d + relativedelta(years=1),
+            'Daily':         lambda d: d + relativedelta(days=1),
+            'Weekly':        lambda d: d + relativedelta(weeks=1),
+            'Biweekly':      lambda d: d + relativedelta(weeks=2),
+            'Monthly':       lambda d: d + relativedelta(months=1),
+            'Quarterly':     lambda d: d + relativedelta(months=3),
+            'Semiannually':  lambda d: d + relativedelta(months=6),
+            'Annually':      lambda d: d + relativedelta(years=1),
         }
     else:
         _DELTAS = {
-            'Daily':     lambda d: d + _td(days=1),
-            'Weekly':    lambda d: d + _td(weeks=7),
-            'Biweekly':  lambda d: d + _td(weeks=2),
-            'Monthly':   lambda d: d + _td(days=30),
-            'Quarterly': lambda d: d + _td(days=91),
-            'Annually':  lambda d: d + _td(days=365),
+            'Daily':         lambda d: d + _td(days=1),
+            'Weekly':        lambda d: d + _td(weeks=1),
+            'Biweekly':      lambda d: d + _td(weeks=2),
+            'Monthly':       lambda d: d + _td(days=30),
+            'Quarterly':     lambda d: d + _td(days=91),
+            'Semiannually':  lambda d: d + _td(days=183),
+            'Annually':      lambda d: d + _td(days=365),
         }
 
     conn = get_connection()
@@ -1409,6 +1447,82 @@ def generate_draft_transactions() -> int:
 
         conn.commit()
         return created
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+def get_transaction_splits(transaction_id: int) -> pd.DataFrame:
+    """Return splits for a single transaction with full recursive category path."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                WITH RECURSIVE ch AS (
+                    SELECT Categories_Id, Categories_Name::TEXT AS full_path
+                    FROM   Categories
+                    WHERE  Categories_Id_Parent IS NULL
+                    UNION ALL
+                    SELECT c.Categories_Id, ch.full_path || ' : ' || c.Categories_Name
+                    FROM   Categories c
+                    JOIN   ch ON c.Categories_Id_Parent = ch.Categories_Id
+                )
+                SELECT s.Splits_Id, s.Categories_Id,
+                       ch.full_path AS categories_name, s.Amount, s.Memo
+                FROM Splits s
+                LEFT JOIN ch ON ch.Categories_Id = s.Categories_Id
+                WHERE s.Transactions_Id = %s
+                ORDER BY s.Splits_Id
+            """, (transaction_id,))
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description]
+        return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(
+            columns=['splits_id', 'categories_id', 'categories_name', 'amount', 'memo']
+        )
+    finally:
+        conn.close()
+
+
+def save_draft_transaction(transaction_id: int, fields: dict, splits: list):
+    """Update all editable fields of a draft transaction and replace its splits.
+
+    fields keys: date, total_amount, description, accounts_id, payees_id,
+                 accounts_id_target (optional)
+    splits: list of dicts with keys categories_id, amount, memo
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            UPDATE Transactions SET
+                Date               = %s,
+                Total_Amount       = %s,
+                Description        = %s,
+                Accounts_Id        = %s,
+                Payees_Id          = %s,
+                Accounts_Id_Target = %s
+            WHERE Transactions_Id = %s AND Is_Draft = TRUE
+        """, (
+            fields['date'],
+            fields['total_amount'],
+            fields.get('description') or None,
+            fields['accounts_id'],
+            fields.get('payees_id') or None,
+            fields.get('accounts_id_target') or None,
+            transaction_id,
+        ))
+        # Replace splits
+        cur.execute("DELETE FROM Splits WHERE Transactions_Id = %s", (transaction_id,))
+        if splits:
+            execute_values(cur,
+                "INSERT INTO Splits (Transactions_Id, Categories_Id, Amount, Memo) VALUES %s",
+                [(transaction_id, s['categories_id'], s['amount'], s.get('memo') or None)
+                 for s in splits if s.get('categories_id')]
+            )
+        conn.commit()
     except Exception:
         conn.rollback()
         raise

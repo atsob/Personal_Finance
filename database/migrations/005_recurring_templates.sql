@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS Recurring_Templates (
     Description         TEXT,
     Total_Amount        NUMERIC(28, 18),
     Periodicity         VARCHAR(20) NOT NULL DEFAULT 'Monthly',
-    -- Allowed values: Daily | Weekly | Biweekly | Monthly | Quarterly | Annually
+    -- Allowed values: Daily | Weekly | Biweekly | Monthly | Quarterly | Semiannually | Annually
     Next_Due_Date       DATE NOT NULL,
     End_Date            DATE,                   -- NULL = runs indefinitely
     Auto_Confirm        BOOLEAN DEFAULT FALSE,  -- TRUE = bypass review queue (e.g. installments)
