@@ -545,7 +545,7 @@ def render_custom_reports():
 def render_reports():
     """Render the Reports page."""
     st.title("Reports")
-    
+
     hist_sub_menu = st.sidebar.radio(
         "Select Report:",
         [
@@ -562,7 +562,16 @@ def render_reports():
         ],
         key="hist_sub_nav"
     )
-    
+
+    # Force a clean rerun whenever the sub-menu changes so that Streamlit fully
+    # replaces the previous report's widget tree (especially large st.tabs blocks)
+    # rather than leaving orphaned tab content visible in the DOM.
+    _prev = st.session_state.get("_prev_hist_sub_nav")
+    if _prev is not None and _prev != hist_sub_menu:
+        st.session_state["_prev_hist_sub_nav"] = hist_sub_menu
+        st.rerun()
+    st.session_state["_prev_hist_sub_nav"] = hist_sub_menu
+
     if hist_sub_menu == "Net Worth Report":
         render_net_worth_report()
 

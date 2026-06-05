@@ -1,6 +1,7 @@
 """Recurring Templates — manage schedule definitions and review draft transactions."""
 
 import streamlit as st
+import streamlit.components.v1 as _components
 import pandas as pd
 from datetime import date, timedelta
 from database.connection import get_connection
@@ -19,6 +20,31 @@ from database.crud import (
 )
 
 PERIODICITIES = ['Daily', 'Weekly', 'Biweekly', 'Monthly', 'Quarterly', 'Semiannually', 'Annually']
+
+# ── Prevent Enter from submitting the form when focus is on a number input ──
+_NO_ENTER_SUBMIT_JS = """
+<script>
+(function() {
+    function blockEnterOnNumbers(e) {
+        if (e.key === 'Enter') {
+            var el = e.target;
+            if (el && (el.type === 'number' || el.inputMode === 'decimal' || el.inputMode === 'numeric')) {
+                e.preventDefault();
+                e.stopPropagation();
+            }
+        }
+    }
+    // Attach on the parent document (Streamlit renders in an iframe)
+    var doc = window.parent ? window.parent.document : document;
+    doc.removeEventListener('keydown', blockEnterOnNumbers, true);
+    doc.addEventListener('keydown', blockEnterOnNumbers, true);
+})();
+</script>
+"""
+
+def _inject_no_enter_submit():
+    """Inject a JS listener that prevents Enter from submitting forms on number inputs."""
+    _components.html(_NO_ENTER_SUBMIT_JS, height=0, scrolling=False)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -98,6 +124,8 @@ def _template_form(accounts: dict, payees: dict, categories: dict,
     is_edit = existing is not None
     prefix = "te_edit" if is_edit else "te_new"
 
+    _inject_no_enter_submit()
+
     with st.form(key=f"{prefix}_form", border=True):
         st.subheader("✏️ Edit Template" if is_edit else "➕ New Template")
 
@@ -114,6 +142,13 @@ def _template_form(accounts: dict, payees: dict, categories: dict,
                 index=list(accounts.keys()).index(existing['accounts_name'])
                       if is_edit and existing.get('accounts_name') in accounts else 0,
                 key=f"{prefix}_acc",
+            )
+            header_amount = st.number_input(
+                "Amount",
+                value=float(existing.get('total_amount') or 0.0) if is_edit else 0.0,
+                step=0.01, format="%.2f",
+                key=f"{prefix}_amount",
+                help="For transfers: authoritative amount. For split transactions: used as default; final total is derived from splits.",
             )
             periodicity = st.selectbox(
                 "Periodicity",
@@ -231,9 +266,13 @@ def _template_form(accounts: dict, payees: dict, categories: dict,
         return None, None
 
     has_splits = not edited_splits.empty and not edited_splits['Category'].eq('').all()
-    total = float(edited_splits['Amount'].fillna(0).sum()) if has_splits else (
-        float(existing.get('total_amount') or 0) if is_edit else 0.0
-    )
+    # Transfers use the explicit header amount; split-based transactions sum their splits
+    # (falling back to header_amount if splits are empty or sum to zero).
+    if is_transfer or not has_splits:
+        total = float(header_amount)
+    else:
+        splits_sum = float(edited_splits['Amount'].fillna(0).sum())
+        total = splits_sum if splits_sum != 0 else float(header_amount)
 
     template = {
         'templates_id': existing.get('templates_id') if is_edit else None,

@@ -507,8 +507,9 @@ def render_bank_section() -> None:
     conn.close()
     _seed_default_profiles()
 
-    tab_import, tab_revolut, tab_revs, tab_profiles, tab_rules, tab_history = st.tabs([
+    tab_import, tab_se, tab_revolut, tab_revs, tab_profiles, tab_rules, tab_history = st.tabs([
         "📥 Import & Reconcile",
+        "🏦 Salt Edge (Open Banking)",
         "💚 Revolut Personal",
         "🐣 Revolut Savings",
         "⚙️ Import Profiles",
@@ -523,33 +524,40 @@ def render_bank_section() -> None:
         _render_import_tab()
 
     # =========================================================
-    # TAB 2 — Revolut Personal (bank account CSV)
+    # TAB 2 — Salt Edge (PSD2 open banking)
+    # =========================================================
+    with tab_se:
+        from ui.saltedge_import import render_saltedge_import
+        render_saltedge_import()
+
+    # =========================================================
+    # TAB 3 — Revolut Personal (bank account CSV)
     # =========================================================
     with tab_revolut:
         from ui.broker_import import render_revolut_import
         render_revolut_import()
 
     # =========================================================
-    # TAB 3 — Revolut Savings (money-market fund CSV)
+    # TAB 4 — Revolut Savings (money-market fund CSV)
     # =========================================================
     with tab_revs:
         from ui.broker_import import render_revolut_savings_import
         render_revolut_savings_import()
 
     # =========================================================
-    # TAB 4 — Import Profiles
+    # TAB 5 — Import Profiles
     # =========================================================
     with tab_profiles:
         _render_profiles_tab()
 
     # =========================================================
-    # TAB 5 — Payee Rules
+    # TAB 6 — Payee Rules
     # =========================================================
     with tab_rules:
         _render_rules_tab()
 
     # =========================================================
-    # TAB 6 — Reconciliation History
+    # TAB 7 — Reconciliation History
     # =========================================================
     with tab_history:
         _render_history_tab()

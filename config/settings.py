@@ -18,6 +18,16 @@ def get_env_config():
         'ollama_model': os.getenv("OLLAMA_MODEL", "llama3.2:3b"),
         'persist_dir': os.getenv("PERSIST_DIR", "/app/storage_rag"),
         'eodhd_api_key': os.getenv("EODHD_API_KEY", "69f3a12eacbd88.96449070"),
+        # GoCardless Bank Account Data (PSD2 open banking) — optional
+        # Set these to pre-fill credentials in the GoCardless import tab.
+        # If unset, the user must enter them manually in the UI each session.
+        'gocardless_secret_id':  os.getenv("GOCARDLESS_SECRET_ID",  ""),
+        'gocardless_secret_key': os.getenv("GOCARDLESS_SECRET_KEY", ""),
+        # Salt Edge Account Information API v5 (PSD2 open banking) — optional
+        # Set these to pre-fill credentials in the Salt Edge import tab.
+        # Obtain from: https://www.saltedge.com/dashboard → Applications
+        'saltedge_app_id': os.getenv("SALTEDGE_APP_ID", ""),
+        'saltedge_secret': os.getenv("SALTEDGE_SECRET", ""),
     }
 
 ENV_CONFIG = get_env_config()
