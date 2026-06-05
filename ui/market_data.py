@@ -6,7 +6,7 @@ from database.crud import (
     save_changes, save_changes_no_serial, save_changes_mid,
     delete_historical_prices, insert_prices_from_transactions, normalize_investment_prices,
 )
-from database.queries import get_price_anomalies, get_investments_with_dummy_prices
+from database.queries import get_price_anomalies
 from ui.components import copy_df_button
 from data.downloaders import (
     download_historical_fx,
@@ -335,11 +335,10 @@ def render_market_data():
             inv_sec_id = selected_inv_sec['securities_id']
 
             # ── Inner sub-tabs ────────────────────────────────────────────────
-            st_prices, st_inv_txs, st_anomalies, st_dummy, st_divs = st.tabs([
+            st_prices, st_inv_txs, st_anomalies, st_divs = st.tabs([
                 "📈 Prices",
                 "🧾 Investment Transactions",
                 "🔍 Price Anomalies",
-                "⚖ Dummy Prices",
                 "💰 Dividends",
             ])
 
@@ -851,127 +850,6 @@ def render_market_data():
                                 st.rerun()
 
             # ─────────────────────────────────────────────────────────────────
-            # SUB-TAB: Dummy Prices (scoped to the selected security)
-            # ─────────────────────────────────────────────────────────────────
-            with st_dummy:
-                st.caption(
-                    "Finds Buy / Sell / Reinvest / ShrIn / ShrOut transactions for **this security** "
-                    "whose Price Per Share or Quantity appears to be a placeholder (whole-number dummy) "
-                    "while a real Historical Price exists for that date. "
-                    "Updates Price → actual close price and recalculates Quantity = Total ÷ Price, "
-                    "leaving Total Amount unchanged so P&L is preserved."
-                )
-                with st.spinner("Scanning investments…"):
-                    df_dummy_all = get_investments_with_dummy_prices()
-
-                # Filter to the selected security
-                df_dummy = (
-                    df_dummy_all[df_dummy_all['securities_id'] == inv_sec_id].copy()
-                    if not df_dummy_all.empty else df_dummy_all.copy()
-                )
-
-                if df_dummy.empty:
-                    st.success("No investments with dummy prices found for this security.")
-                else:
-                    st.info(
-                        f"{len(df_dummy):,} transaction(s) with dummy prices across "
-                        f"{df_dummy['account_name'].nunique()} account(s)."
-                    )
-
-                    # Position-closure sanity check
-                    pos_check = df_dummy.copy()
-                    pos_check['signed_new_qty'] = pos_check.apply(
-                        lambda r: r['new_qty'] if r['action'] in ('Buy','Reinvest','ShrIn')
-                                  else -r['new_qty'], axis=1)
-                    net_pos  = (
-                        pos_check
-                        .groupby(['account_name','security_name'])['signed_new_qty']
-                        .sum().reset_index()
-                        .rename(columns={'signed_new_qty': 'net_qty'})
-                    )
-                    non_zero = net_pos[net_pos['net_qty'].abs() > 0.0001]
-                    if not non_zero.empty:
-                        msg = ("**Position closure warning** — after normalization the following "
-                               "will have a non-zero net holding:\n")
-                        for _, row in non_zero.iterrows():
-                            msg += f"- {row['account_name']} / {row['security_name']}: net qty = {row['net_qty']:+.6f}\n"
-                        st.warning(msg)
-
-                    df_dummy_disp        = df_dummy.copy()
-                    df_dummy_disp['date'] = pd.to_datetime(df_dummy_disp['date']).dt.date
-                    st.dataframe(
-                        df_dummy_disp,
-                        column_config={
-                            'investments_id': None, 'accounts_id': None, 'securities_id': None,
-                            'account_name':   st.column_config.TextColumn('Account'),
-                            'security_name':  st.column_config.TextColumn('Security'),
-                            'date':           st.column_config.DateColumn('Date'),
-                            'action':         st.column_config.TextColumn('Action'),
-                            'total_amount':   st.column_config.NumberColumn('Total Amount',  format='%.4f'),
-                            'current_qty':    st.column_config.NumberColumn('Current Qty',   format='%.6f'),
-                            'current_price':  st.column_config.NumberColumn('Current Price', format='%.4f'),
-                            'hist_price':     st.column_config.NumberColumn('Hist. Close',   format='%.4f',
-                                              help='Historical close price on that date'),
-                            'new_qty':        st.column_config.NumberColumn('New Qty',       format='%.6f',
-                                              help='Buys: total/hist_price  •  Sells: proportional from buy qty'),
-                            'new_price':      st.column_config.NumberColumn('New Price',      format='%.4f',
-                                              help='Buys: hist close  •  Sells: effective realised price'),
-                        },
-                        hide_index=True, width="stretch",
-                    )
-                    copy_df_button(df_dummy_disp, key=f"mkt_dl_dummy_{inv_sec_id}")
-                    st.caption(
-                        "**Buys**: Price ← hist close, Qty ← Total ÷ hist close.  "
-                        "**Sells**: Qty is distributed from the total buy quantity so the position "
-                        "closes; Price is the effective realised price (Total ÷ Qty)."
-                    )
-
-                    _norm_ck = f"mkt_ni_norm_confirm_{inv_sec_id}"
-                    col_norm, col_info = st.columns([1, 4])
-                    with col_norm:
-                        if st.button(
-                                f"⚖ Normalize ({len(df_dummy):,})", type="primary",
-                                width="stretch", key=f"mkt_ni_norm_btn_{inv_sec_id}"):
-                            st.session_state[_norm_ck] = True
-                    with col_info:
-                        st.caption("Normalizes only the rows shown above (for this security).")
-
-                    if st.session_state.get(_norm_ck):
-                        st.warning(
-                            f"⚠️ This will overwrite prices and quantities for "
-                            f"**{len(df_dummy):,}** investment row(s). This cannot be undone."
-                        )
-                        _cn, _cy, _ = st.columns([1, 1, 3])
-                        with _cn:
-                            if st.button("✖ Cancel", key=f"mkt_ni_norm_cancel_{inv_sec_id}",
-                                         width="stretch"):
-                                st.session_state[_norm_ck] = False
-                                st.rerun()
-                        with _cy:
-                            if st.button("✔ Yes, normalize", type="primary",
-                                         key=f"mkt_ni_norm_yes_{inv_sec_id}", width="stretch"):
-                                ids     = df_dummy['investments_id'].tolist()
-                                updated = normalize_investment_prices(ids)
-                                get_investments_with_dummy_prices.clear()
-                                st.session_state[_norm_ck] = False
-                                st.success(f"Updated {updated} investment row(s).")
-                                st.rerun()
-
-                    st.divider()
-                    col_rh, col_rh_info = st.columns([1, 4])
-                    with col_rh:
-                        if st.button(
-                                "🔄 Refresh Holdings", width="stretch",
-                                key=f"mkt_ni_refresh_holdings_{inv_sec_id}"):
-                            from database.crud import update_holdings as _update_holdings
-                            _update_holdings()
-                            st.success("Holdings recalculated.")
-                    with col_rh_info:
-                        st.caption(
-                            "Recalculates the Holdings table from Investments data. "
-                            "Run this after normalization to update portfolio quantities and P&L."
-                        )
-
             # ─────────────────────────────────────────────────────────────────
             # SUB-TAB: Dividends
             # ─────────────────────────────────────────────────────────────────

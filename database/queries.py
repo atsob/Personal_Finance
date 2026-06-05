@@ -535,9 +535,10 @@ def get_price_anomalies(threshold_pct: float = 100.0, securities_ids: tuple = No
     """
     Detect Historical_Prices rows that are outliers via two independent signals:
       1. Day-to-day spike: price ratio vs previous OR next trading day >= threshold.
-      2. Transaction divergence: price deviates from the nearest buy/sell within 90 days
-         by >= threshold — catches whole blocks of systematically wrong prices (e.g.
-         pre-split prices in wrong units) that look internally consistent.
+      2. Transaction divergence: price deviates from the nearest buy/sell within 7 days
+         by >= threshold — catches prices that clearly mismatch a same-week transaction.
+         The window is intentionally short (7 days) to avoid false positives from
+         cost-basis dummy entries created for corporate restructuring events.
     A LATERAL join fetches the nearest transaction once per price row efficiently.
     """
     conn = get_connection()
@@ -550,6 +551,7 @@ def get_price_anomalies(threshold_pct: float = 100.0, securities_ids: tuple = No
 
     query = f"""
     WITH price_neighbors AS (
+        -- Step 1: compute LAG/LEAD for all price rows (sequential scan, unavoidable).
         SELECT
             hp.Securities_Id,
             s.Securities_Name AS security_name,
@@ -564,7 +566,29 @@ def get_price_anomalies(threshold_pct: float = 100.0, securities_ids: tuple = No
         WHERE hp.Close > 0
           {sec_filter}
     ),
+    tx_nearby AS (
+        -- Step 2: cheap set — which (Securities_Id, Date) pairs are within 7 days
+        -- of ANY qualifying transaction.  Uses the small Investments table only.
+        SELECT DISTINCT hp.Securities_Id, hp.Date
+        FROM Investments i
+        JOIN Historical_Prices hp
+          ON  hp.Securities_Id = i.Securities_Id
+          AND hp.Date BETWEEN i.Date - 7 AND i.Date + 7
+        WHERE i.Action IN ('Buy','Sell','Reinvest','ShrIn','ShrOut')
+          AND i.Quantity > 0
+          {sec_filter.replace('hp.', 'i.')}
+    ),
+    candidates AS (
+        -- Step 3: union of Signal-1 hits and near-transaction rows.
+        -- The LATERAL join will run ONLY on these rows, not on all price rows.
+        SELECT Securities_Id, Date FROM price_neighbors
+        WHERE (prev_close > 0 AND (Close/prev_close >= {ratio} OR prev_close/Close >= {ratio}))
+           OR (next_close > 0 AND (Close/next_close >= {ratio} OR next_close/Close >= {ratio}))
+        UNION
+        SELECT Securities_Id, Date FROM tx_nearby
+    ),
     enriched AS (
+        -- Step 4: LATERAL join scoped to candidates only.
         SELECT
             pn.*,
             CASE WHEN pn.prev_close > 0
@@ -576,9 +600,10 @@ def get_price_anomalies(threshold_pct: float = 100.0, securities_ids: tuple = No
             tx.tx_price,
             tx.days_diff
         FROM price_neighbors pn
+        JOIN candidates c ON c.Securities_Id = pn.Securities_Id AND c.Date = pn.Date
         LEFT JOIN LATERAL (
             SELECT
-                i.Date  AS tx_date,
+                i.Date   AS tx_date,
                 i.Action AS tx_action,
                 ROUND((i.Total_Amount_AccCur / NULLIF(i.Quantity, 0))::numeric, 4) AS tx_price,
                 ABS(pn.Date - i.Date) AS days_diff
@@ -586,7 +611,7 @@ def get_price_anomalies(threshold_pct: float = 100.0, securities_ids: tuple = No
             WHERE i.Securities_Id = pn.Securities_Id
               AND i.Action IN ('Buy','Sell','Reinvest','ShrIn','ShrOut')
               AND i.Quantity > 0
-              AND ABS(pn.Date - i.Date) <= 90
+              AND ABS(pn.Date - i.Date) <= 7
             ORDER BY ABS(pn.Date - i.Date)
             LIMIT 1
         ) tx ON TRUE
@@ -606,16 +631,14 @@ def get_price_anomalies(threshold_pct: float = 100.0, securities_ids: tuple = No
         days_diff,
         CASE WHEN tx_price > 0
              THEN ROUND(((Close / tx_price) - 1) * 100, 1)
-        END AS pct_vs_tx,
+        END           AS pct_vs_tx,
         Source        AS source,
         Downloaded_At AS downloaded_at
     FROM enriched
     WHERE
-        -- Signal 1: day-to-day spike
         (prev_close > 0 AND (Close / prev_close >= {ratio} OR prev_close / Close >= {ratio}))
         OR
         (next_close > 0 AND (Close / next_close >= {ratio} OR next_close / Close >= {ratio}))
-        -- Signal 2: systematic offset vs nearest transaction
         OR
         (tx_price > 0 AND (Close / tx_price >= {ratio} OR tx_price / Close >= {ratio}))
     ORDER BY security_name, date
@@ -1910,9 +1933,9 @@ def get_income_expense_data(start_date, end_date, category_id=None, cash_account
         JOIN Currencies curr ON a.currencies_id = curr.currencies_id
         LEFT JOIN Payees p ON t.payees_id = p.payees_id
         WHERE t.date BETWEEN (SELECT start_date FROM DateRange) AND (SELECT end_date FROM DateRange)
-    --      AND a.accounts_type NOT IN ('Brokerage', 'Pension', 'Other Investment', 'Margin')
           AND a.accounts_type IN %s
           AND s.amount != 0
+          AND t.Transfers_Id IS NULL   -- exclude transfers even when they have categorised splits
     ),
     InvestmentTransactionData AS (
         SELECT 
@@ -3918,6 +3941,19 @@ def get_expense_categories():
 # A11. CUSTOM REPORT PRESETS
 # ======================================================
 
+@st.cache_data(ttl=600)
+def get_all_securities_for_filter() -> pd.DataFrame:
+    """Return all securities (Id + Name) for the Custom Reports securities filter."""
+    conn = get_connection()
+    df = pd.read_sql(
+        "SELECT Securities_Id AS securities_id, Securities_Name AS securities_name "
+        "FROM Securities ORDER BY Securities_Name",
+        conn,
+    )
+    conn.close()
+    return df
+
+
 def _ensure_custom_reports_table(conn):
     with conn.cursor() as cur:
         cur.execute("""
@@ -3980,8 +4016,19 @@ def get_all_payees():
 
 
 def get_custom_report_data(date_from, date_to, grouping: str,
-                           account_ids=None, category_ids=None, payee_names=None):
-    """Execute a custom spending report query and return a flat (period, category, amount) frame."""
+                           account_ids=None, category_ids=None, payee_names=None,
+                           include_transfers=False, security_ids=None,
+                           use_account_currency=False):
+    """Execute a custom spending report query and return a flat (period, category, amount) frame.
+
+    Parameters
+    ----------
+    include_transfers   : include transactions that are internal transfers (Transfers_Id IS NOT NULL).
+    security_ids        : restrict to transactions linked (via Investments) to these securities.
+    use_account_currency: report amounts in each account's own currency instead of converting to EUR.
+                          When True the result column is named 'amount' and may mix currencies if
+                          multiple account currencies are involved.
+    """
     conn = get_connection()
 
     if grouping == 'year':
@@ -4018,6 +4065,50 @@ def get_custom_report_data(date_from, date_to, grouping: str,
             "('Income','Transfer','Trading','Investment','Interest','Dividend')"
         )
 
+    # Transfer filter
+    transfer_filter = "" if include_transfers else "AND t.Transfers_Id IS NULL"
+
+    # Securities filter — join to Investments table (which links cash txn → investment → security)
+    if security_ids:
+        sec_id_list    = ','.join(str(int(i)) for i in security_ids)
+        sec_join       = "LEFT JOIN Investments inv ON inv.Transactions_Id = t.Transactions_Id"
+        sec_filter     = f"AND inv.Securities_Id IN ({sec_id_list})"
+    else:
+        sec_join   = ""
+        sec_filter = ""
+
+    # Amount expression: EUR using period-end FX rate, or account native currency.
+    # For each grouping period we cap the FX lookup at the last day of that period
+    # (capped at CURRENT_DATE so future periods use the latest available rate).
+    # e.g. yearly grouping → Dec 31 rate; monthly → last day of the month.
+    if grouping == 'year':
+        period_end_expr = "LEAST((DATE_TRUNC('year', t.Date) + INTERVAL '1 year') - INTERVAL '1 day', CURRENT_DATE)"
+    elif grouping == 'quarter':
+        period_end_expr = "LEAST((DATE_TRUNC('quarter', t.Date) + INTERVAL '3 months') - INTERVAL '1 day', CURRENT_DATE)"
+    else:
+        period_end_expr = "LEAST((DATE_TRUNC('month', t.Date) + INTERVAL '1 month') - INTERVAL '1 day', CURRENT_DATE)"
+
+    if use_account_currency:
+        amount_expr  = "SUM(s.Amount)"
+        amount_alias = "amount_eur"   # keep same column name for result processing
+        fx_cte       = ""
+        fx_join      = ""
+    else:
+        amount_expr  = (
+            "SUM(s.Amount * "
+            "    CASE WHEN cur.Currencies_ShortName = 'EUR' THEN 1 "
+            "         ELSE COALESCE("
+            f"             (SELECT hfx.FX_Rate FROM Historical_FX hfx"
+            "              WHERE hfx.Currencies_Id_1 = a.Currencies_Id"
+            f"               AND hfx.Date <= {period_end_expr}"
+            "              ORDER BY hfx.Date DESC LIMIT 1),"
+            "             1) "
+            "    END)"
+        )
+        amount_alias = "amount_eur"
+        fx_cte       = ""
+        fx_join      = ""
+
     params: dict = {"date_from": date_from, "date_to": date_to}
     payee_filter = ""
     if payee_names:
@@ -4029,10 +4120,7 @@ def get_custom_report_data(date_from, date_to, grouping: str,
     query = f"""
         WITH RECURSIVE
         {expanded_cats_cte}
-        fx AS (
-            SELECT DISTINCT ON (Currencies_Id_1) Currencies_Id_1, FX_Rate
-            FROM Historical_FX ORDER BY Currencies_Id_1, Date DESC
-        ),
+        {fx_cte}
         cat_path AS (
             SELECT Categories_Id, Categories_Name::TEXT AS full_path, Categories_Type
             FROM Categories WHERE Categories_Id_Parent IS NULL
@@ -4043,25 +4131,25 @@ def get_custom_report_data(date_from, date_to, grouping: str,
             FROM Categories c JOIN cat_path cp ON c.Categories_Id_Parent = cp.Categories_Id
         )
         SELECT
-            {period_sql}   AS period,
-            {period_order} AS period_order,
-            cp.full_path   AS category,
-            SUM(s.Amount *
-                CASE WHEN cur.Currencies_ShortName = 'EUR' THEN 1
-                     ELSE COALESCE(fx.FX_Rate, 1) END) AS amount_eur
+            {period_sql}       AS period,
+            {period_order}     AS period_order,
+            cp.full_path       AS category,
+            {amount_expr}      AS {amount_alias}
         FROM Splits s
         JOIN Transactions t ON t.Transactions_Id = s.Transactions_Id
         JOIN cat_path cp    ON cp.Categories_Id  = s.Categories_Id
         JOIN Accounts a     ON a.Accounts_Id     = t.Accounts_Id
         JOIN Currencies cur ON cur.Currencies_Id = a.Currencies_Id
-        LEFT JOIN fx        ON fx.Currencies_Id_1 = a.Currencies_Id
-        LEFT JOIN Payees py ON py.Payees_Id       = t.Payees_Id
-        WHERE t.Transfers_Id IS NULL
-          AND t.Date >= %(date_from)s
+        {fx_join}
+        LEFT JOIN Payees py ON py.Payees_Id = t.Payees_Id
+        {sec_join}
+        WHERE t.Date >= %(date_from)s
           AND t.Date <= %(date_to)s
+          {transfer_filter}
           {acct_filter}
           {cat_filter}
           {payee_filter}
+          {sec_filter}
         GROUP BY period, period_order, cp.full_path
         ORDER BY cp.full_path, period_order
     """
@@ -4069,13 +4157,164 @@ def get_custom_report_data(date_from, date_to, grouping: str,
     df = pd.read_sql(query, conn, params=params)
     conn.close()
     if not df.empty:
-        # DATE_TRUNC returns timestamptz in PostgreSQL → always parse as UTC
         df["period_order"] = pd.to_datetime(df["period_order"], utc=True)
     return df
 
 
+def get_custom_report_investment_data(date_from, date_to, grouping: str,
+                                       security_ids, account_ids=None,
+                                       use_account_currency=False):
+    """Investment-based custom report: group by period × security.
+
+    Used when the user selects securities but no expense categories.
+    Returns the same column shape as get_custom_report_data so the display
+    code works unchanged: period, period_order, category (= security name),
+    amount_eur.
+
+    Amounts are the net cash amount per investment action, converted to EUR
+    using the period-end FX rate (same convention as get_custom_report_data).
+    Sign: positive = cash IN to you (Sell, Dividend, IntInc, RtrnCap, CashOut);
+          negative = cash OUT from you (Buy, CashIn, MiscExp).
+    """
+    conn = get_connection()
+
+    if grouping == 'year':
+        period_sql      = "TO_CHAR(i.Date, 'YYYY')"
+        period_order    = "DATE_TRUNC('year',    i.Date)"
+        period_end_expr = "LEAST((DATE_TRUNC('year',    i.Date) + INTERVAL '1 year')    - INTERVAL '1 day', CURRENT_DATE)"
+    elif grouping == 'quarter':
+        period_sql      = "TO_CHAR(i.Date, 'YYYY') || ' Q' || EXTRACT(QUARTER FROM i.Date)::int::text"
+        period_order    = "DATE_TRUNC('quarter', i.Date)"
+        period_end_expr = "LEAST((DATE_TRUNC('quarter', i.Date) + INTERVAL '3 months') - INTERVAL '1 day', CURRENT_DATE)"
+    else:
+        period_sql      = "TO_CHAR(i.Date, 'YYYY-MM')"
+        period_order    = "DATE_TRUNC('month',   i.Date)"
+        period_end_expr = "LEAST((DATE_TRUNC('month',   i.Date) + INTERVAL '1 month')  - INTERVAL '1 day', CURRENT_DATE)"
+
+    sec_filter = (
+        f"AND i.Securities_Id IN ({','.join(str(int(x)) for x in security_ids)})"
+        if security_ids else ""
+    )
+    acct_filter = (
+        f"AND i.Accounts_Id IN ({','.join(str(int(x)) for x in account_ids)})"
+        if account_ids else ""
+    )
+
+    if use_account_currency:
+        amount_expr = (
+            "SUM(CASE WHEN i.Action IN ('Buy','CashIn','MiscExp') THEN -1 ELSE 1 END"
+            "    * ABS(i.Total_Amount_AccCur))"
+        )
+    else:
+        amount_expr = (
+            "SUM(CASE WHEN i.Action IN ('Buy','CashIn','MiscExp') THEN -1 ELSE 1 END"
+            "    * ABS(i.Total_Amount_AccCur)"
+            "    * CASE WHEN cur.Currencies_ShortName = 'EUR' THEN 1"
+            "           ELSE COALESCE("
+            f"               (SELECT hfx.FX_Rate FROM Historical_FX hfx"
+            "                WHERE hfx.Currencies_Id_1 = cur.Currencies_Id"
+            f"                  AND hfx.Date <= {period_end_expr}"
+            "                ORDER BY hfx.Date DESC LIMIT 1), 1)"
+            "    END)"
+        )
+
+    query = f"""
+        SELECT
+            {period_sql}    AS period,
+            {period_order}  AS period_order,
+            s.Securities_Name AS category,
+            {amount_expr}   AS amount_eur
+        FROM Investments i
+        JOIN Securities s  ON s.Securities_Id = i.Securities_Id
+        JOIN Currencies cur ON cur.Currencies_Id = s.Currencies_Id
+        WHERE i.Date >= %(date_from)s
+          AND i.Date <= %(date_to)s
+          AND i.Action IN ('Buy','Sell','Dividend','IntInc','RtrnCap','CashIn','CashOut','MiscExp','Reinvest')
+          AND i.Total_Amount_AccCur IS NOT NULL
+          {sec_filter}
+          {acct_filter}
+        GROUP BY period, period_order, s.Securities_Name
+        ORDER BY s.Securities_Name, period_order
+    """
+
+    df = pd.read_sql(query, conn, params={"date_from": date_from, "date_to": date_to})
+    conn.close()
+    if not df.empty:
+        df["period_order"] = pd.to_datetime(df["period_order"], utc=True)
+    return df
+
+
+def get_custom_report_investment_drill_down(date_from, date_to,
+                                             security_name=None, account_ids=None,
+                                             use_account_currency=False):
+    """Individual investment rows for the investment-mode drill-down.
+
+    Returns one row per Investments entry with columns:
+      investments_id, date, security, action, quantity, price, amount, amount_eur, account
+    """
+    conn = get_connection()
+
+    sec_filter  = "AND s.Securities_Name = %(security_name)s" if security_name else ""
+    acct_filter = (
+        f"AND i.Accounts_Id IN ({','.join(str(int(x)) for x in account_ids)})"
+        if account_ids else ""
+    )
+
+    if use_account_currency:
+        amount_eur_expr = "ABS(i.Total_Amount_AccCur)"
+    else:
+        amount_eur_expr = (
+            "ABS(i.Total_Amount_AccCur)"
+            " * CASE WHEN cur.Currencies_ShortName = 'EUR' THEN 1"
+            "        ELSE COALESCE("
+            "            (SELECT hfx.FX_Rate FROM Historical_FX hfx"
+            "             WHERE hfx.Currencies_Id_1 = cur.Currencies_Id"
+            "               AND hfx.Date <= i.Date"
+            "             ORDER BY hfx.Date DESC LIMIT 1), 1)"
+            " END"
+        )
+
+    query = f"""
+        SELECT
+            i.Investments_Id                        AS investments_id,
+            i.Date                                  AS date,
+            s.Securities_Name                       AS security,
+            i.Action::text                          AS action,
+            i.Quantity                              AS quantity,
+            i.Price_Per_Share                       AS price,
+            i.Total_Amount_AccCur                   AS amount,
+            CASE WHEN i.Action IN ('Buy','CashIn','MiscExp') THEN -1 ELSE 1 END
+                * {amount_eur_expr}                 AS amount_eur,
+            a.Accounts_Name                         AS account,
+            cur.Currencies_ShortName                AS currency
+        FROM Investments i
+        JOIN Securities s   ON s.Securities_Id  = i.Securities_Id
+        JOIN Accounts a     ON a.Accounts_Id    = i.Accounts_Id
+        JOIN Currencies cur ON cur.Currencies_Id = s.Currencies_Id
+        WHERE i.Date >= %(date_from)s
+          AND i.Date <= %(date_to)s
+          AND i.Action IN ('Buy','Sell','Dividend','IntInc','RtrnCap','CashIn','CashOut','MiscExp','Reinvest')
+          AND i.Total_Amount_AccCur IS NOT NULL
+          {sec_filter}
+          {acct_filter}
+        ORDER BY i.Date DESC
+    """
+
+    params: dict = {"date_from": date_from, "date_to": date_to}
+    if security_name:
+        params["security_name"] = security_name
+
+    df = pd.read_sql(query, conn, params=params)
+    conn.close()
+    if not df.empty:
+        df["date"] = pd.to_datetime(df["date"])
+    return df
+
+
 def get_custom_report_drill_down(date_from, date_to, category_path=None,
-                                  account_ids=None, category_ids=None, payee_names=None):
+                                  account_ids=None, category_ids=None, payee_names=None,
+                                  include_transfers=False, security_ids=None,
+                                  use_account_currency=False):
     """Individual transactions for a category (and subcategories) over a date range.
 
     category_ids restricts results to the report's own category selection (and their
@@ -4127,13 +4366,33 @@ def get_custom_report_drill_down(date_from, date_to, category_path=None,
         )
         params["payee_names"] = list(payee_names)
 
+    transfer_filter = "" if include_transfers else "AND t.Transfers_Id IS NULL"
+
+    if security_ids:
+        sec_id_list = ','.join(str(int(i)) for i in security_ids)
+        sec_join    = "LEFT JOIN Investments inv ON inv.Transactions_Id = t.Transactions_Id"
+        sec_filter  = f"AND inv.Securities_Id IN ({sec_id_list})"
+    else:
+        sec_join   = ""
+        sec_filter = ""
+
+    if use_account_currency:
+        amount_expr = "s.Amount"
+        fx_cte      = ""
+        fx_join     = ""
+    else:
+        amount_expr = ("s.Amount * CASE WHEN cur.Currencies_ShortName = 'EUR' THEN 1 "
+                       "ELSE COALESCE(fx.FX_Rate, 1) END")
+        fx_cte  = ("fx AS (\n"
+                   "    SELECT DISTINCT ON (Currencies_Id_1) Currencies_Id_1, FX_Rate\n"
+                   "    FROM Historical_FX ORDER BY Currencies_Id_1, Date DESC\n"
+                   "),\n")
+        fx_join = "LEFT JOIN fx ON fx.Currencies_Id_1 = a.Currencies_Id"
+
     query = f"""
         WITH RECURSIVE
         {expanded_cats_cte}
-        fx AS (
-            SELECT DISTINCT ON (Currencies_Id_1) Currencies_Id_1, FX_Rate
-            FROM Historical_FX ORDER BY Currencies_Id_1, Date DESC
-        ),
+        {fx_cte}
         cat_path AS (
             SELECT Categories_Id, Categories_Name::TEXT AS full_path, Categories_Type
             FROM Categories WHERE Categories_Id_Parent IS NULL
@@ -4150,23 +4409,25 @@ def get_custom_report_drill_down(date_from, date_to, category_path=None,
             COALESCE(py.Payees_Name, '(No Payee)')                   AS payee,
             cp.full_path                                              AS category,
             s.Categories_Id                                           AS categories_id,
-            s.Amount * CASE WHEN cur.Currencies_ShortName = 'EUR' THEN 1
-                            ELSE COALESCE(fx.FX_Rate, 1) END         AS amount_eur,
+            {amount_expr}                                             AS amount_eur,
+            cur.Currencies_ShortName                                  AS currency,
             COALESCE(s.Memo, t.Description)                          AS notes
         FROM Splits s
         JOIN Transactions t ON t.Transactions_Id = s.Transactions_Id
         JOIN cat_path cp    ON cp.Categories_Id  = s.Categories_Id
         JOIN Accounts a     ON a.Accounts_Id     = t.Accounts_Id
         JOIN Currencies cur ON cur.Currencies_Id = a.Currencies_Id
-        LEFT JOIN fx        ON fx.Currencies_Id_1 = a.Currencies_Id
-        LEFT JOIN Payees py ON py.Payees_Id       = t.Payees_Id
-        WHERE t.Transfers_Id IS NULL
-          AND t.Date >= %(date_from)s
+        {fx_join}
+        LEFT JOIN Payees py ON py.Payees_Id = t.Payees_Id
+        {sec_join}
+        WHERE t.Date >= %(date_from)s
           AND t.Date <= %(date_to)s
+          {transfer_filter}
           {acct_filter}
           {cat_id_filter}
           {cat_path_filter}
           {payee_filter}
+          {sec_filter}
         ORDER BY t.Date DESC, t.Transactions_Id
     """
 

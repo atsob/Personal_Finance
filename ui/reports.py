@@ -40,7 +40,10 @@ from database.queries import (
     delete_custom_report_preset,
     get_all_payees,
     get_custom_report_data,
+    get_custom_report_investment_data,
+    get_custom_report_investment_drill_down,
     get_custom_report_drill_down,
+    get_all_securities_for_filter,
 )
 from data.downloaders import download_historical_fx, download_historical_prices_from_tradingview, download_historical_prices_from_yahoo, download_bond_prices_from_solidus, download_securities_info_from_yahoo, download_securities_info_from_tradingview
 from ui.components import color_negative_red, color_value, custom_metric, get_color, copy_df_button, pf_plotly_chart
@@ -237,7 +240,7 @@ def render_custom_reports():
         use_all_accts = st.radio(
             "Accounts to include", ["All Accounts", "Selected Accounts"],
             horizontal=True, key=f"cr_acct_mode_{sel_preset}",
-            index=0 if not saved_acct_ids else 1,
+            index=1 if loaded_cfg.get("use_all_accts") == "Selected Accounts" else (1 if saved_acct_ids else 0),
         )
         account_ids: list = []
         if use_all_accts == "Selected Accounts":
@@ -247,7 +250,7 @@ def render_custom_reports():
             account_ids = [acct_name_to_id[n] for n in sel_acct_names if n in acct_name_to_id]
 
     # ── Category filter ───────────────────────────────────────────────────────
-    with st.expander("\U0001f3f7️ Categories", expanded=bool(loaded_cfg.get("category_ids"))):
+    with st.expander("\U0001f3f7️ Categories", expanded=bool(loaded_cfg.get("category_ids") or loaded_cfg.get("use_all_cats") == "Selected Categories")):
         cat_hier_df = get_category_hierarchy()
         EXCLUDED_TYPES = {"Income", "Transfer", "Trading", "Investment", "Interest", "Dividend"}
         exp_cats = cat_hier_df[~cat_hier_df["categories_type"].isin(EXCLUDED_TYPES)].copy()
@@ -259,7 +262,7 @@ def render_custom_reports():
         use_all_cats = st.radio(
             "Categories to include", ["All Expense Categories", "Selected Categories"],
             horizontal=True, key=f"cr_cat_mode_{sel_preset}",
-            index=0 if not saved_cat_ids else 1,
+            index=1 if loaded_cfg.get("use_all_cats") == "Selected Categories" else (1 if saved_cat_ids else 0),
         )
         category_ids: list = []
         if use_all_cats == "Selected Categories":
@@ -280,7 +283,7 @@ def render_custom_reports():
         use_all_payees = st.radio(
             "Payees to include", ["All Payees", "Selected Payees"],
             horizontal=True, key=f"cr_payee_mode_{sel_preset}",
-            index=0 if not saved_payees else 1,
+            index=1 if loaded_cfg.get("use_all_payees") == "Selected Payees" else (1 if saved_payees else 0),
         )
         payee_names: list = []
         if use_all_payees == "Selected Payees":
@@ -290,6 +293,65 @@ def render_custom_reports():
             )
             payee_names = sel_payees
 
+    # ── Securities filter ─────────────────────────────────────────────────────
+    saved_sec_ids = loaded_cfg.get("security_ids") or []
+    with st.expander("📈 Securities", expanded=bool(saved_sec_ids or loaded_cfg.get("use_all_secs") == "Selected Securities")):
+        st.caption(
+            "Filter to transactions linked to specific securities "
+            "(e.g. dividend income, interest, or fees associated with an investment). "
+            "Leave empty to include all transactions regardless of security."
+        )
+        all_sec_df  = get_all_securities_for_filter()
+        sec_id_to_name = dict(zip(all_sec_df["securities_id"], all_sec_df["securities_name"]))
+        sec_name_to_id = {v: k for k, v in sec_id_to_name.items()}
+        all_sec_names  = sorted(all_sec_df["securities_name"].tolist())
+
+        use_all_secs = st.radio(
+            "Securities to include", ["All Securities", "Selected Securities"],
+            horizontal=True, key=f"cr_sec_mode_{sel_preset}",
+            index=1 if loaded_cfg.get("use_all_secs") == "Selected Securities" else (1 if saved_sec_ids else 0),
+        )
+        security_ids: list = []
+        if use_all_secs == "Selected Securities":
+            def_secs = [sec_id_to_name[i] for i in saved_sec_ids if i in sec_id_to_name]
+            sel_sec_names = st.multiselect(
+                "Securities", all_sec_names, default=def_secs,
+                key=f"cr_secs_{sel_preset}",
+            )
+            security_ids = [int(sec_name_to_id[n]) for n in sel_sec_names if n in sec_name_to_id]
+
+    # ── Additional options ────────────────────────────────────────────────────
+    with st.expander("⚙️ Additional Options", expanded=bool(
+            loaded_cfg.get("include_transfers") or loaded_cfg.get("use_account_currency"))):
+        opt1, opt2 = st.columns(2)
+
+        with opt1:
+            st.markdown("**Transfer transactions**")
+            include_transfers = st.toggle(
+                "Include transfer transactions",
+                value=bool(loaded_cfg.get("include_transfers", False)),
+                key=f"cr_inc_transfers_{sel_preset}",
+                help=(
+                    "By default, transactions marked as internal transfers are excluded. "
+                    "Enable this only if you want to see transfer flows in the report."
+                ),
+            )
+
+        with opt2:
+            st.markdown("**Reporting currency**")
+            use_account_currency = st.toggle(
+                "Use account native currency (no EUR conversion)",
+                value=bool(loaded_cfg.get("use_account_currency", False)),
+                key=f"cr_acct_ccy_{sel_preset}",
+                help=(
+                    "When ON: amounts are reported in each account's own currency without FX conversion. "
+                    "Useful when all selected accounts share the same currency. "
+                    "When OFF (default): all amounts are converted to EUR using the last available FX rate of each reporting period (e.g. Dec 31 rate for yearly grouping)."
+                ),
+            )
+            if use_account_currency:
+                st.caption("⚠️ Totals may mix currencies if multiple account currencies are selected.")
+
     # ── Save / Delete ─────────────────────────────────────────────────────────
     if save_btn:
         pname = preset_name_input.strip()
@@ -297,15 +359,22 @@ def render_custom_reports():
             st.warning("Enter a preset name before saving.")
         else:
             cfg = {
-                "date_range_type":    date_range_type,
-                "date_from":          str(date_from),
-                "date_to":            str(date_to),
-                "date_from_is_today": date_from_is_today,
-                "date_to_is_today":   date_to_is_today,
-                "column_grouping":    grouping,
-                "account_ids":        account_ids,
-                "category_ids":       category_ids,
-                "payee_names":        payee_names,
+                "date_range_type":      date_range_type,
+                "date_from":            str(date_from),
+                "date_to":              str(date_to),
+                "date_from_is_today":   date_from_is_today,
+                "date_to_is_today":     date_to_is_today,
+                "column_grouping":      grouping,
+                "use_all_accts":        use_all_accts,
+                "account_ids":          account_ids,
+                "use_all_cats":         use_all_cats,
+                "category_ids":         category_ids,
+                "use_all_payees":       use_all_payees,
+                "payee_names":          payee_names,
+                "use_all_secs":         use_all_secs,
+                "security_ids":         security_ids,
+                "include_transfers":    include_transfers,
+                "use_account_currency": use_account_currency,
             }
             upsert_custom_report_preset(pname, cfg)
             get_custom_report_presets.clear()
@@ -336,27 +405,43 @@ def render_custom_reports():
     run_col, _ = st.columns([1, 4])
     if run_col.button("▶️ Run Report", type="primary", key="cr_run",
                       width="stretch"):
-        if use_all_cats == "Selected Categories" and not category_ids:
+        _investment_mode = use_all_cats == "Selected Categories" and not category_ids
+        if not _investment_mode and use_all_cats == "Selected Categories" and not category_ids:
             st.warning("Select at least one category or switch to 'All Expense Categories'.")
         elif use_all_accts == "Selected Accounts" and not account_ids:
             st.warning("Select at least one account or switch to 'All Accounts'.")
         else:
             with st.spinner("Running report…"):
-                _df = get_custom_report_data(
-                    date_from, date_to, grouping,
-                    account_ids=account_ids or None,
-                    category_ids=category_ids or None,
-                    payee_names=payee_names or None,
-                )
+                if _investment_mode:
+                    _df = get_custom_report_investment_data(
+                        date_from, date_to, grouping,
+                        security_ids=security_ids,
+                        account_ids=account_ids or None,
+                        use_account_currency=use_account_currency,
+                    )
+                else:
+                    _df = get_custom_report_data(
+                        date_from, date_to, grouping,
+                        account_ids=account_ids or None,
+                        category_ids=category_ids or None,
+                        payee_names=payee_names or None,
+                        security_ids=security_ids or None,
+                        include_transfers=include_transfers,
+                        use_account_currency=use_account_currency,
+                    )
             st.session_state["cr_result_df"] = _df
             st.session_state["cr_result_params"] = {
-                "date_from":    date_from,
-                "date_to":      date_to,
-                "grouping":     grouping,
-                "grouping_str": grouping_str,
-                "account_ids":  account_ids or None,
-                "category_ids": category_ids or None,
-                "payee_names":  payee_names or None,
+                "date_from":            date_from,
+                "date_to":              date_to,
+                "grouping":             grouping,
+                "grouping_str":         grouping_str,
+                "account_ids":          account_ids or None,
+                "category_ids":         category_ids or None,
+                "payee_names":          payee_names or None,
+                "security_ids":         security_ids or None,
+                "include_transfers":    include_transfers,
+                "use_account_currency": use_account_currency,
+                "investment_mode":      _investment_mode,
             }
 
     # ── Display results (persist across interactions) ─────────────────────────
@@ -365,11 +450,13 @@ def render_custom_reports():
 
     df     = st.session_state["cr_result_df"]
     params = st.session_state["cr_result_params"]
-    grouping     = params["grouping"]
-    grouping_str = params["grouping_str"]
+    grouping      = params["grouping"]
+    grouping_str  = params["grouping_str"]
+    investment_mode = params.get("investment_mode", False)
+    cat_label     = "Securities" if investment_mode else "Categories"
 
     if df.empty:
-        st.info("No spending data found for the selected filters and date range.")
+        st.info("No data found for the selected filters and date range.")
         return
 
     # ── Summary metrics ───────────────────────────────────────────────────────
@@ -380,12 +467,13 @@ def render_custom_reports():
     m1, m2, m3 = st.columns(3)
     m1.metric("Grand Total",  f"€ {total_all:,.2f}")
     m2.metric("Periods",      str(len(df_by_period)))
-    m3.metric("Categories",   str(df["category"].nunique()))
+    m3.metric(cat_label,      str(df["category"].nunique()))
 
     # ── Bar chart ─────────────────────────────────────────────────────────────
+    chart_title = f"<b>Total {'Cashflow' if investment_mode else 'Spending'} by {grouping_str}</b>"
     fig = px.bar(
         df_by_period, x="period", y="amount_eur",
-        title=f"<b>Total Spending by {grouping_str}</b>",
+        title=chart_title,
         template="plotly_dark",
         labels={"amount_eur": "Amount (€)", "period": grouping_str},
         text="amount_eur",
@@ -395,7 +483,7 @@ def render_custom_reports():
     pf_plotly_chart(fig)
 
     # ── Hierarchical pivot table ──────────────────────────────────────────────
-    st.markdown("#### Spending by Category")
+    st.markdown(f"#### {'Cashflow by Security' if investment_mode else 'Spending by Category'}")
 
     period_order_map = df.groupby("period")["period_order"].min().sort_values()
     periods = period_order_map.index.tolist()
@@ -440,106 +528,156 @@ def render_custom_reports():
     )
     copy_df_button(df_display, key="dl_cr_report")
 
-    # ── Transaction drill-down ────────────────────────────────────────────────
-    st.markdown("#### \U0001f50d Transaction Drill-Down")
-    st.caption("Select a category and period to view and edit the underlying transactions.")
+    # Drill-down
+    _ALL_ITEMS   = '— All Securities —' if investment_mode else '— All Categories —'
+    _ALL_PERIODS = '— All Periods —'
 
-    # Build hierarchical category list for the selectbox
-    drill_paths: set = set(df["category"].unique())
-    for _p in list(drill_paths):
-        parts = _p.split(" : ")
-        for i in range(1, len(parts)):
-            drill_paths.add(" : ".join(parts[:i]))
-    drill_paths_sorted = sorted(drill_paths, key=lambda p: (p.split(" : ")[0].lower(), p.lower()))
-
-    _ALL_CATS    = "— All Categories —"
-    _ALL_PERIODS = "— All Periods —"
-
-    path_to_label: dict = {_ALL_CATS: _ALL_CATS}
-    for _p in drill_paths_sorted:
-        lvl = _p.count(" : ")
-        path_to_label[_p] = " " * (lvl * 4) + _p.split(" : ")[-1]
+    all_items_sorted = sorted(df['category'].unique().tolist())
 
     dd_col1, dd_col2 = st.columns(2)
-    sel_cat = dd_col1.selectbox(
-        "Category", options=[_ALL_CATS] + drill_paths_sorted,
-        format_func=lambda p: path_to_label.get(p, p),
-        key="cr_dd_cat",
+    sel_item = dd_col1.selectbox(
+        'Security' if investment_mode else 'Category',
+        options=[_ALL_ITEMS] + all_items_sorted,
+        key='cr_dd_cat',
     )
     sel_period = dd_col2.selectbox(
-        "Period", options=[_ALL_PERIODS] + periods,
-        key="cr_dd_period",
+        'Period', options=[_ALL_PERIODS] + periods,
+        key='cr_dd_period',
     )
 
     if sel_period == _ALL_PERIODS:
-        dd_from, dd_to = params["date_from"], params["date_to"]
+        dd_from, dd_to = params['date_from'], params['date_to']
     else:
         dd_from, dd_to = _period_to_dates(sel_period, grouping)
 
-    cat_path_arg = None if sel_cat == _ALL_CATS else sel_cat
+    _use_acct_ccy = params.get('use_account_currency', False)
+    _amt_label    = 'Amount (native)' if _use_acct_ccy else 'Amount (€)'
 
-    df_txn = get_custom_report_drill_down(
-        dd_from, dd_to,
-        category_path=cat_path_arg,
-        account_ids=params["account_ids"],
-        category_ids=params.get("category_ids"),
-        payee_names=params["payee_names"],
-    )
+    if investment_mode:
+        st.markdown('#### 🔍 Investment Drill-Down')
+        st.caption('Select a security and period to view the underlying investment entries.')
 
-    if df_txn.empty:
-        st.info("No transactions found for the selected category and period.")
-    else:
-        dd_total = df_txn["amount_eur"].sum()
-        st.caption(f"{len(df_txn)} transaction(s) · net total € {dd_total:,.2f}")
-
-        df_cats   = get_expense_categories()
-        cat_opts  = df_cats["full_path"].tolist()
-        cat_id_map = dict(zip(df_cats["full_path"], df_cats["categories_id"]))
-
-        df_edit = df_txn[["splits_id", "date", "payee", "category", "amount_eur", "notes"]].copy()
-        df_edit["date"] = df_edit["date"].dt.strftime("%Y-%m-%d")
-
-        edited = st.data_editor(
-            df_edit,
-            disabled=["splits_id", "date", "payee", "amount_eur"],
-            column_config={
-                "splits_id":  st.column_config.NumberColumn("ID",         format="%d"),
-                "date":       st.column_config.TextColumn("Date"),
-                "payee":      st.column_config.TextColumn("Payee"),
-                "category":   st.column_config.SelectboxColumn("Category", options=cat_opts, required=True),
-                "amount_eur": st.column_config.NumberColumn("Amount (€)", format="€ %,.2f"),
-                "notes":      st.column_config.TextColumn("Notes"),
-            },
-            hide_index=True,
-            width="stretch",
-            key=f"cr_dd_editor_{sel_cat}_{sel_period}",
+        sec_name_arg = None if sel_item == _ALL_ITEMS else sel_item
+        df_inv = get_custom_report_investment_drill_down(
+            dd_from, dd_to,
+            security_name=sec_name_arg,
+            account_ids=params['account_ids'],
+            use_account_currency=_use_acct_ccy,
         )
 
-        # Enable Save only when the user has actually edited something.
-        _cats_changed  = not edited["category"].equals(df_edit["category"])
-        _notes_changed = not edited["notes"].fillna("").equals(df_edit["notes"].fillna(""))
-        _has_changes   = _cats_changed or _notes_changed
+        if df_inv.empty:
+            st.info('No investment entries found for the selected security and period.')
+        else:
+            dd_total = df_inv['amount_eur'].sum()
+            st.caption(f'{len(df_inv)} entry(ies) · net total € {dd_total:,.2f}')
+            _inv_cols = ['date', 'security', 'action', 'quantity', 'price', 'amount', 'amount_eur', 'account']
+            if _use_acct_ccy:
+                _inv_cols.insert(_inv_cols.index('amount') + 1, 'currency')
+            df_inv_show = df_inv[_inv_cols].copy()
+            df_inv_show['date'] = df_inv_show['date'].dt.strftime('%Y-%m-%d')
+            st.dataframe(
+                df_inv_show,
+                column_config={
+                    'date':       st.column_config.TextColumn('Date'),
+                    'security':   st.column_config.TextColumn('Security'),
+                    'action':     st.column_config.TextColumn('Action',   width='small'),
+                    'quantity':   st.column_config.NumberColumn('Qty',     format='%,.4f'),
+                    'price':      st.column_config.NumberColumn('Price',   format='%,.4f'),
+                    'amount':     st.column_config.NumberColumn('Amount',  format='%,.2f'),
+                    'currency':   st.column_config.TextColumn('CCY',       width='small'),
+                    'amount_eur': st.column_config.NumberColumn(_amt_label, format='%+,.2f'),
+                    'account':    st.column_config.TextColumn('Account'),
+                },
+                hide_index=True,
+                use_container_width=True,
+            )
+            copy_df_button(df_inv_show, key='dl_cr_inv_dd')
+    else:
+        st.markdown('#### 🔍 Transaction Drill-Down')
+        st.caption('Select a category and period to view and edit the underlying transactions.')
 
-        if st.button("\U0001f4be Save Changes", key="cr_dd_save", disabled=not _has_changes):
-            changes, errors = 0, []
-            for i, row in edited.iterrows():
-                orig        = df_txn.iloc[i]
-                new_cat_id  = cat_id_map.get(row["category"])
-                orig_notes  = orig["notes"] or ""
-                new_notes   = row["notes"] or ""
-                if new_cat_id is None:
-                    errors.append(f"Row {i+1}: unknown category '{row['category']}'")
-                    continue
-                if new_cat_id != int(orig["categories_id"]) or new_notes != orig_notes:
-                    update_split(int(row["splits_id"]), new_cat_id, new_notes or None)
-                    changes += 1
-            for e in errors:
-                st.error(e)
-            if changes:
-                st.session_state.pop("cr_result_df", None)
-                st.success(f"Saved {changes} change(s). Re-run the report to refresh the table.")
-            elif not errors:
-                st.info("No changes detected.")
+        drill_paths: set = set(df['category'].unique())
+        for _p in list(drill_paths):
+            parts = _p.split(' : ')
+            for i in range(1, len(parts)):
+                drill_paths.add(' : '.join(parts[:i]))
+        drill_paths_sorted = sorted(drill_paths, key=lambda p: (p.split(' : ')[0].lower(), p.lower()))
+
+        path_to_label: dict = {_ALL_ITEMS: _ALL_ITEMS}
+        for _p in drill_paths_sorted:
+            lvl = _p.count(' : ')
+            path_to_label[_p] = ' ' * (lvl * 4) + _p.split(' : ')[-1]
+
+        cat_path_arg = None if sel_item == _ALL_ITEMS else sel_item
+
+        df_txn = get_custom_report_drill_down(
+            dd_from, dd_to,
+            category_path=cat_path_arg,
+            account_ids=params['account_ids'],
+            category_ids=params.get('category_ids'),
+            payee_names=params['payee_names'],
+            security_ids=params.get('security_ids'),
+            include_transfers=params.get('include_transfers', False),
+            use_account_currency=_use_acct_ccy,
+        )
+
+        if df_txn.empty:
+            st.info('No transactions found for the selected category and period.')
+        else:
+            dd_total = df_txn['amount_eur'].sum()
+            st.caption(f'{len(df_txn)} transaction(s) · net total € {dd_total:,.2f}')
+
+            df_cats   = get_expense_categories()
+            cat_opts  = df_cats['full_path'].tolist()
+            cat_id_map = dict(zip(df_cats['full_path'], df_cats['categories_id']))
+
+            _dd_cols = ['splits_id', 'date', 'payee', 'category', 'amount_eur', 'notes']
+            if _use_acct_ccy and 'currency' in df_txn.columns:
+                _dd_cols = ['splits_id', 'date', 'payee', 'category', 'currency', 'amount_eur', 'notes']
+            df_edit = df_txn[_dd_cols].copy()
+            df_edit['date'] = df_edit['date'].dt.strftime('%Y-%m-%d')
+
+            edited = st.data_editor(
+                df_edit,
+                disabled=['splits_id', 'date', 'payee', 'amount_eur'] + (['currency'] if _use_acct_ccy else []),
+                column_config={
+                    'splits_id':  st.column_config.NumberColumn('ID',         format='%d'),
+                    'date':       st.column_config.TextColumn('Date'),
+                    'payee':      st.column_config.TextColumn('Payee'),
+                    'currency':   st.column_config.TextColumn('CCY',          width='small'),
+                    'category':   st.column_config.SelectboxColumn('Category', options=cat_opts, required=True),
+                    'amount_eur': st.column_config.NumberColumn(_amt_label,   format='%,.2f'),
+                    'notes':      st.column_config.TextColumn('Notes'),
+                },
+                hide_index=True,
+                width='stretch',
+                key=f'cr_dd_editor_{sel_item}_{sel_period}',
+            )
+
+            _cats_changed  = not edited['category'].equals(df_edit['category'])
+            _notes_changed = not edited['notes'].fillna('').equals(df_edit['notes'].fillna(''))
+            _has_changes   = _cats_changed or _notes_changed
+
+            if st.button('💾 Save Changes', key='cr_dd_save', disabled=not _has_changes):
+                changes, errors = 0, []
+                for i, row in edited.iterrows():
+                    orig        = df_txn.iloc[i]
+                    new_cat_id  = cat_id_map.get(row['category'])
+                    orig_notes  = orig['notes'] or ''
+                    new_notes   = row['notes'] or ''
+                    if new_cat_id is None:
+                        errors.append(f"Row {i+1}: unknown category '{row['category']}'")
+                        continue
+                    if new_cat_id != int(orig['categories_id']) or new_notes != orig_notes:
+                        update_split(int(row['splits_id']), new_cat_id, new_notes or None)
+                        changes += 1
+                for e in errors:
+                    st.error(e)
+                if changes:
+                    st.session_state.pop('cr_result_df', None)
+                    st.success(f'Saved {changes} change(s). Re-run the report to refresh the table.')
+                elif not errors:
+                    st.info('No changes detected.')
 
 
 def render_reports():

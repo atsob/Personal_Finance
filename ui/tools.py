@@ -481,8 +481,8 @@ def _render_price_quality():
         return
 
     # ── Security filter — only securities that actually have issues ────────
-    sec_counts = df_all.groupby('security_name').size().to_dict()
-    sec_names  = sorted(sec_counts.keys())
+    sec_counts    = df_all.groupby('security_name').size().to_dict()
+    sec_names     = sorted(sec_counts.keys())
     selected_secs = st.multiselect(
         "Filter by security (showing only securities with issues):",
         options=sec_names,

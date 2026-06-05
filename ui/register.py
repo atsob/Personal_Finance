@@ -2674,10 +2674,10 @@ def render_register():
         with t_view:
             _render_transaction_table(acc_id, payee_options, acc_options, cat_options, "bank", acc_balance)
     else:
-        tab_inv_new, tab_inv_edit, tab_inv_view, tab_view_hold, tab_edit_hold, cash_view = st.tabs([
+        tab_inv_new, tab_inv_edit, tab_inv_view, tab_edit_hold, cash_view = st.tabs([
             "➕ New Investment Transaction", "✏️ Edit Investment",
-            "📓 Investment Register", "📊 Current Holdings",
-            "✏️ Edit Holdings", "👁️ Cash Transaction Register",
+            "📓 Investment Register", "✏️ Review Holdings",
+            "👁️ Cash Transaction Register",
         ])
         with cash_view:
             _render_transaction_table(acc_id, payee_options, acc_options, cat_options, "cash", acc_balance)
@@ -3270,52 +3270,6 @@ def render_register():
                                 except Exception as _link_err:
                                     st.error(f"Error creating link: {_link_err}")
 
-
-        with tab_view_hold:
-            with get_db() as conn:
-                df_h = pd.read_sql(f"SELECT Holdings_Id, Accounts_Id, Securities_Id, Quantity, Simple_Avg_Price, Fifo_Avg_Price FROM Holdings WHERE Accounts_Id = {acc_id}", conn)
-            
-            # 1. Function to colorize the lines
-            def highlight_rows(row):
-                color = ''
-                if row['quantity'] == 0:
-                    color = 'color: blue;'
-                elif row['quantity'] < 0:
-                    color = 'color: red;'
-                return [color] * len(row)
-
-            # 2. Εφαρμογή του στυλ
-            styled_df = df_h.style.apply(highlight_rows, axis=1).format({
-                "quantity": "{:.8f}",
-                "simple_avg_price": "{:.4f}",
-                "fifo_avg_price": "{:.4f}"
-            })
-
-            # 3. Display the date (Caution: st.dataframe is not editable)
-            st.dataframe(
-                styled_df,
-                width='stretch',
-                hide_index=True,
-                column_config={
-                    "holdings_id": None,
-                    "accounts_id": None,                
-                    "securities_id": st.column_config.SelectboxColumn(
-                        "Security",
-                        options=list(sec_options.keys()),
-                        format_func=lambda x: sec_options.get(x, "NO SECURITY"),
-                        width="large"
-                    ),
-                    "quantity": st.column_config.NumberColumn("Quantity", format="%,.8f"),
-                    "simple_avg_price": st.column_config.NumberColumn("Simple Avg Price", format="%,.4f"),
-                    "fifo_avg_price": st.column_config.NumberColumn("FIFO Avg Price", format="%,.4f")
-                }
-            )
-            _copy_h = df_h.drop(columns=["holdings_id", "accounts_id"], errors="ignore").copy()
-            _copy_h["securities_id"] = _copy_h["securities_id"].map(sec_options).fillna("")
-            _copy_h = _copy_h.rename(columns={"securities_id": "Security"})
-            copy_df_button(_copy_h, key=f"dl_reg_holdings_view_{acc_id}")
-
-            _render_security_transactions(acc_id, sec_options, "view")
 
         with tab_edit_hold:
          #   st.subheader(f"Current Holdings: {selected_inv_acc['accounts_name']}")
