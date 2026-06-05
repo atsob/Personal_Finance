@@ -717,81 +717,97 @@ def update_holdings():
             );
 
             WITH TransactionFlow AS (
-                SELECT 
-                    Accounts_Id, 
-                    Securities_Id,
-                    Date,
-                    Investments_Id,
-                    Action,
-                    Quantity,
-                    Price_Per_Share,
+                SELECT
+                    i.Accounts_Id,
+                    i.Securities_Id,
+                    i.Date,
+                    i.Investments_Id,
+                    i.Action,
+                    i.Quantity,
+                    i.Price_Per_Share,
+                    -- EUR cost per share at transaction date FX (security currency → EUR)
+                    COALESCE(
+                        NULLIF(i.Total_Amount_SecCur, 0) / NULLIF(i.Quantity, 0),
+                        i.Price_Per_Share
+                    ) * COALESCE(hfx_sec.FX_Rate, 1) AS price_eur,
                     -- 1. Historical Average (Simple Average) of all purchases up to today
-                    AVG(Price_Per_Share) FILTER (WHERE Action IN ('Buy', 'Reinvest', 'ShrIn')) 
-                        OVER (PARTITION BY Accounts_Id, Securities_Id) as simple_avg_cost,
+                    AVG(i.Price_Per_Share) FILTER (WHERE i.Action IN ('Buy', 'Reinvest', 'ShrIn'))
+                        OVER (PARTITION BY i.Accounts_Id, i.Securities_Id) as simple_avg_cost,
                     -- Cumulative Purchases & Sales
-                    SUM(CASE WHEN Action IN ('Buy', 'Reinvest', 'ShrIn') THEN Quantity ELSE 0 END) 
-                        OVER (PARTITION BY Accounts_Id, Securities_Id ORDER BY Date, Investments_Id) as running_buys,
-                    SUM(CASE WHEN Action IN ('Sell', 'ShrOut') THEN Quantity ELSE 0 END) 
-                        OVER (PARTITION BY Accounts_Id, Securities_Id ORDER BY Date, Investments_Id) as running_sells,
+                    SUM(CASE WHEN i.Action IN ('Buy', 'Reinvest', 'ShrIn') THEN i.Quantity ELSE 0 END)
+                        OVER (PARTITION BY i.Accounts_Id, i.Securities_Id ORDER BY i.Date, i.Investments_Id) as running_buys,
+                    SUM(CASE WHEN i.Action IN ('Sell', 'ShrOut') THEN i.Quantity ELSE 0 END)
+                        OVER (PARTITION BY i.Accounts_Id, i.Securities_Id ORDER BY i.Date, i.Investments_Id) as running_sells,
                     -- Total Amounts
-                    SUM(CASE WHEN Action IN ('Buy', 'Reinvest', 'ShrIn') THEN Quantity ELSE 0 END) 
-                        OVER (PARTITION BY Accounts_Id, Securities_Id) as total_buys,
-                    SUM(CASE WHEN Action IN ('Sell', 'ShrOut') THEN Quantity ELSE 0 END) 
-                        OVER (PARTITION BY Accounts_Id, Securities_Id) as total_sells
-                FROM Investments
-                WHERE Action IN ('Buy', 'Reinvest', 'ShrIn', 'Sell', 'ShrOut')
+                    SUM(CASE WHEN i.Action IN ('Buy', 'Reinvest', 'ShrIn') THEN i.Quantity ELSE 0 END)
+                        OVER (PARTITION BY i.Accounts_Id, i.Securities_Id) as total_buys,
+                    SUM(CASE WHEN i.Action IN ('Sell', 'ShrOut') THEN i.Quantity ELSE 0 END)
+                        OVER (PARTITION BY i.Accounts_Id, i.Securities_Id) as total_sells
+                FROM Investments i
+                JOIN Securities s ON i.Securities_Id = s.Securities_Id
+                LEFT JOIN Historical_FX hfx_sec
+                       ON hfx_sec.Currencies_Id_1 = s.Currencies_Id
+                      AND hfx_sec.Date = i.Date
+                WHERE i.Action IN ('Buy', 'Reinvest', 'ShrIn', 'Sell', 'ShrOut')
             ),
             FIFO_Positions AS (
-                SELECT 
-                    Accounts_Id, 
+                SELECT
+                    Accounts_Id,
                     Securities_Id,
-                    simple_avg_cost, -- Transfer of the price to the next level
-                    CASE 
-                        WHEN total_buys >= total_sells THEN 
-                            CASE 
+                    simple_avg_cost,
+                    CASE
+                        WHEN total_buys >= total_sells THEN
+                            CASE
                                 WHEN Action IN ('Buy', 'Reinvest', 'ShrIn') THEN
-                                    CASE 
+                                    CASE
                                         WHEN running_buys <= total_sells THEN 0
                                         WHEN running_buys - Quantity < total_sells THEN running_buys - total_sells
-                                        ELSE Quantity 
+                                        ELSE Quantity
                                     END
-                                ELSE 0 
+                                ELSE 0
                             END
                         ELSE -- SHORT CASE
-                            CASE 
+                            CASE
                                 WHEN Action IN ('Sell', 'ShrOut') THEN
-                                    CASE 
+                                    CASE
                                         WHEN running_sells <= total_buys THEN 0
                                         WHEN running_sells - Quantity < total_buys THEN -(running_sells - total_buys)
-                                        ELSE -Quantity 
+                                        ELSE -Quantity
                                     END
-                                ELSE 0 
+                                ELSE 0
                             END
                     END as remaining_qty,
-                    Price_Per_Share
+                    Price_Per_Share,
+                    price_eur
                 FROM TransactionFlow
             )
-            INSERT INTO Holdings (Accounts_Id, Securities_Id, Quantity, Simple_Avg_Price, Fifo_Avg_Price)
-            SELECT 
-                Accounts_Id, 
-                Securities_Id, 
+            INSERT INTO Holdings (Accounts_Id, Securities_Id, Quantity, Simple_Avg_Price, Fifo_Avg_Price, Fifo_Avg_Cost_EUR)
+            SELECT
+                Accounts_Id,
+                Securities_Id,
                 SUM(remaining_qty) as Current_Quantity,
-                -- 2. Simple Average Price (historical average of all purchases) - This is the same as simple_avg_cost but we take the max to get the final value for the holding
                 MAX(simple_avg_cost) as Simple_Avg_Price,
-                -- 3. FIFO Average Price (only for open positions)
-                CASE 
-                    WHEN ABS(SUM(remaining_qty)) > 0 
-                    THEN SUM(ABS(remaining_qty) * Price_Per_Share) / SUM(ABS(remaining_qty)) 
-                    ELSE 0 
-                END as FIFO_Avg_Price
+                -- FIFO average price in security currency
+                CASE
+                    WHEN ABS(SUM(remaining_qty)) > 0
+                    THEN SUM(ABS(remaining_qty) * Price_Per_Share) / SUM(ABS(remaining_qty))
+                    ELSE 0
+                END as FIFO_Avg_Price,
+                -- FIFO average EUR cost per share using historical FX at each purchase date
+                CASE
+                    WHEN ABS(SUM(remaining_qty)) > 0
+                    THEN SUM(ABS(remaining_qty) * price_eur) / SUM(ABS(remaining_qty))
+                    ELSE 0
+                END as Fifo_Avg_Cost_EUR
             FROM FIFO_Positions
             GROUP BY Accounts_Id, Securities_Id
         --    HAVING SUM(remaining_qty) <> 0        -- Excluding closed positions has impact on the Total P&L calculation, so we keep them with zero quantity
-            ON CONFLICT (Accounts_Id, Securities_Id) 
-            DO UPDATE SET 
+            ON CONFLICT (Accounts_Id, Securities_Id)
+            DO UPDATE SET
                 Quantity = EXCLUDED.Quantity,
-                Simple_Avg_Price = EXCLUDED.Simple_Avg_Price, 
-                Fifo_Avg_Price = EXCLUDED.Fifo_Avg_Price, -- Update and the new column
+                Simple_Avg_Price = EXCLUDED.Simple_Avg_Price,
+                Fifo_Avg_Price = EXCLUDED.Fifo_Avg_Price,
+                Fifo_Avg_Cost_EUR = EXCLUDED.Fifo_Avg_Cost_EUR,
                 Last_Update = CURRENT_TIMESTAMP;
 
             -- Remove zero-quantity Holdings rows that have no remaining investments

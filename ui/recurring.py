@@ -454,6 +454,8 @@ def _render_pending_tab():
                 st.error(f"Some confirmations failed: {'; '.join(errors)}")
             else:
                 st.success(f"All {len(df)} drafts confirmed.")
+            st.cache_data.clear()
+            st.session_state.pop('df_accs', None)
             st.rerun()
 
     st.markdown(f"**{len(df)} pending draft(s)**")
@@ -508,6 +510,8 @@ def _render_pending_tab():
                 if st.button("✅ Confirm", key=f"pd_confirm_{tx_id}", type="primary", use_container_width=True):
                     try:
                         confirm_draft_transaction(tx_id)
+                        st.cache_data.clear()
+                        st.session_state.pop('df_accs', None)
                         st.success("Transaction confirmed.")
                         st.rerun()
                     except Exception as exc:

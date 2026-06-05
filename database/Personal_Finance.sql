@@ -185,8 +185,9 @@ CREATE TABLE Holdings (
     Accounts_Id      INTEGER NOT NULL REFERENCES Accounts(Accounts_Id) ON DELETE CASCADE,
     Securities_Id    INTEGER NOT NULL REFERENCES Securities(Securities_Id),
     Quantity         NUMERIC(28, 18) NOT NULL DEFAULT 0,
-    Simple_Avg_Price NUMERIC(20, 8),
-    Fifo_Avg_Price   NUMERIC(20, 8),
+    Simple_Avg_Price  NUMERIC(20, 8),
+    Fifo_Avg_Price    NUMERIC(20, 8),
+    Fifo_Avg_Cost_EUR NUMERIC(20, 8),  -- weighted-avg EUR cost per share at historical FX (for unrealized P&L)
     Last_Update      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     Staking          BOOLEAN DEFAULT FALSE,  -- if TRUE, these holdings are currently staked/locked up and not available for trading
     embedding        vector(768),

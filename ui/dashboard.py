@@ -61,6 +61,19 @@ def render_ai_monthly_summaries_ui(conn):
                     st.error(f"Error: {e}")
 
 
+def _invalidate_balance_caches():
+    """Clear every layer that caches account balances.
+
+    Two layers need to be purged after a balance-changing action:
+      1. @st.cache_data  — used by queries.py (Net Worth, reports, etc.)
+      2. st.session_state.df_accs — used by register.py to display account
+         balances in the account selector; it is populated on demand and
+         will be re-fetched from the DB on the next Register page load.
+    """
+    st.cache_data.clear()
+    st.session_state.pop('df_accs', None)
+
+
 def _render_pending_review_banner():
     """Show pending draft transactions at the top of the dashboard with inline actions."""
     df = get_draft_transactions()
@@ -88,6 +101,7 @@ def _render_pending_review_banner():
                     st.error(f"Some confirmations failed: {'; '.join(errors)}")
                 else:
                     st.success(f"All {n} drafts confirmed.")
+                _invalidate_balance_caches()
                 st.rerun()
         with col_info:
             st.caption("Review and confirm or discard each pending transaction below, or confirm all at once.")
@@ -142,6 +156,7 @@ def _render_pending_review_banner():
                     finally:
                         conn2.close()
                     confirm_draft_transaction(tx_id)
+                    _invalidate_balance_caches()
                     st.rerun()
             with c_discard:
                 if st.button("🗑️", key=f"dash_del_{tx_id}", help="Discard draft", use_container_width=True):
@@ -157,6 +172,7 @@ def _render_pending_review_banner():
                         conn2.commit()
                     finally:
                         conn2.close()
+                    _invalidate_balance_caches()
                     st.rerun()
 
 

@@ -1340,87 +1340,91 @@ def get_pnl_report_data(start_date: str = '1900-01-01', end_date: str = None):
                 i.Accounts_Id, i.Securities_Id,
                 -- DTD CF
                 SUM(CASE WHEN i.Date > (SELECT dtd_start FROM periods) THEN
-                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share)
-                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share)
+                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share + COALESCE(i.Commission, 0))
+                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share - COALESCE(i.Commission, 0))
                           ELSE 0 END) ELSE 0 END) AS cf_dtd,
                 -- DTD CF EUR
                 SUM(CASE WHEN i.Date > (SELECT dtd_start FROM periods) THEN
-                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
-                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
+                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount_SecCur, 0), i.Quantity * i.Price_Per_Share + COALESCE(i.Commission, 0)) * COALESCE(hfx_sec.FX_Rate, 1)
+                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount_SecCur, 0), i.Quantity * i.Price_Per_Share - COALESCE(i.Commission, 0)) * COALESCE(hfx_sec.FX_Rate, 1)
                           ELSE 0 END) ELSE 0 END) AS cf_dtd_eur,
                 -- WTD CF
                 SUM(CASE WHEN i.Date > (SELECT wtd_start FROM periods) THEN
-                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share)
-                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share)
+                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share + COALESCE(i.Commission, 0))
+                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share - COALESCE(i.Commission, 0))
                           ELSE 0 END) ELSE 0 END) AS cf_wtd,
                 -- WTD CF EUR
                 SUM(CASE WHEN i.Date > (SELECT wtd_start FROM periods) THEN
-                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
-                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
-                          ELSE 0 END) ELSE 0 END) AS cf_wtd_eur,                      
+                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount_SecCur, 0), i.Quantity * i.Price_Per_Share + COALESCE(i.Commission, 0)) * COALESCE(hfx_sec.FX_Rate, 1)
+                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount_SecCur, 0), i.Quantity * i.Price_Per_Share - COALESCE(i.Commission, 0)) * COALESCE(hfx_sec.FX_Rate, 1)
+                          ELSE 0 END) ELSE 0 END) AS cf_wtd_eur,
                 -- MTD CF
                 SUM(CASE WHEN i.Date > (SELECT mtd_start FROM periods) THEN
-                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share)
-                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share)
+                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share + COALESCE(i.Commission, 0))
+                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share - COALESCE(i.Commission, 0))
                           ELSE 0 END) ELSE 0 END) AS cf_mtd,
                 -- MTD CF EUR
                 SUM(CASE WHEN i.Date > (SELECT mtd_start FROM periods) THEN
-                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
-                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
+                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount_SecCur, 0), i.Quantity * i.Price_Per_Share + COALESCE(i.Commission, 0)) * COALESCE(hfx_sec.FX_Rate, 1)
+                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount_SecCur, 0), i.Quantity * i.Price_Per_Share - COALESCE(i.Commission, 0)) * COALESCE(hfx_sec.FX_Rate, 1)
                           ELSE 0 END) ELSE 0 END) AS cf_mtd_eur,
                 -- QTD CF
                 SUM(CASE WHEN i.Date > (SELECT qtd_start FROM periods) THEN
-                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share)
-                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share)
+                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share + COALESCE(i.Commission, 0))
+                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share - COALESCE(i.Commission, 0))
                           ELSE 0 END) ELSE 0 END) AS cf_qtd,
                 -- QTD CF EUR
                 SUM(CASE WHEN i.Date > (SELECT qtd_start FROM periods) THEN
-                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
-                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
+                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount_SecCur, 0), i.Quantity * i.Price_Per_Share + COALESCE(i.Commission, 0)) * COALESCE(hfx_sec.FX_Rate, 1)
+                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount_SecCur, 0), i.Quantity * i.Price_Per_Share - COALESCE(i.Commission, 0)) * COALESCE(hfx_sec.FX_Rate, 1)
                           ELSE 0 END) ELSE 0 END) AS cf_qtd_eur,
                 -- YTD CF
                 SUM(CASE WHEN i.Date > (SELECT ytd_start FROM periods) THEN
-                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share)
-                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share)
+                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share + COALESCE(i.Commission, 0))
+                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share - COALESCE(i.Commission, 0))
                           ELSE 0 END) ELSE 0 END) AS cf_ytd,
                     -- YTD CF EUR
                 SUM(CASE WHEN i.Date > (SELECT ytd_start FROM periods) THEN
-                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
-                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
+                    (CASE WHEN i.Action IN ('Buy', 'MiscExp') THEN COALESCE(NULLIF(i.Total_Amount_SecCur, 0), i.Quantity * i.Price_Per_Share + COALESCE(i.Commission, 0)) * COALESCE(hfx_sec.FX_Rate, 1)
+                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'Reinvest', 'RtrnCap') THEN -COALESCE(NULLIF(i.Total_Amount_SecCur, 0), i.Quantity * i.Price_Per_Share - COALESCE(i.Commission, 0)) * COALESCE(hfx_sec.FX_Rate, 1)
                           ELSE 0 END) ELSE 0 END) AS cf_ytd_eur,
                 -- net_invested_ytd_eur: JOIN replaces per-row correlated subqueries
                 SUM(CASE WHEN i.Date > (SELECT ytd_start FROM periods) THEN
                     CASE WHEN i.Action IN ('Buy', 'CashOut', 'MiscExp')
-                            THEN i.Total_Amount_AccCur * COALESCE(hfx.FX_Rate, 1)
+                            THEN COALESCE(NULLIF(i.Total_Amount_SecCur, 0), i.Quantity * i.Price_Per_Share + COALESCE(i.Commission, 0)) * COALESCE(hfx_sec.FX_Rate, 1)
                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'CashIn', 'RtrnCap')
-                            THEN -i.Total_Amount_AccCur * COALESCE(hfx.FX_Rate, 1)
+                            THEN -COALESCE(NULLIF(i.Total_Amount_SecCur, 0), i.Quantity * i.Price_Per_Share - COALESCE(i.Commission, 0)) * COALESCE(hfx_sec.FX_Rate, 1)
                          ELSE 0 END
                 ELSE 0 END) AS net_invested_ytd_eur,
                 -- Συνολικό CF (για Realized P&L)
-                SUM(CASE WHEN i.Action IN ('Buy', 'MiscExp', 'Reinvest', 'Exercise', 'ShrIn') THEN COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share)
-                         WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'RtrnCap', 'ShrOut') THEN -COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share)
+                SUM(CASE WHEN i.Action IN ('Buy', 'MiscExp', 'Reinvest', 'Exercise', 'ShrIn') THEN COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share + COALESCE(i.Commission, 0))
+                         WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'RtrnCap', 'ShrOut') THEN -COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share - COALESCE(i.Commission, 0))
                          ELSE 0 END) AS cf_all_time,
                 -- Συνολικό CF (για Realized P&L)
-                SUM(CASE WHEN i.Action IN ('Buy', 'MiscExp', 'Reinvest', 'Exercise', 'ShrIn') THEN COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
-                         WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'RtrnCap', 'ShrOut') THEN -COALESCE(NULLIF(i.Total_Amount_AccCur, 0), i.Quantity * i.Price_Per_Share) * COALESCE(hfx.FX_Rate, 1)
+                SUM(CASE WHEN i.Action IN ('Buy', 'MiscExp', 'Reinvest', 'Exercise', 'ShrIn') THEN COALESCE(NULLIF(i.Total_Amount_SecCur, 0), i.Quantity * i.Price_Per_Share + COALESCE(i.Commission, 0)) * COALESCE(hfx_sec.FX_Rate, 1)
+                         WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'RtrnCap', 'ShrOut') THEN -COALESCE(NULLIF(i.Total_Amount_SecCur, 0), i.Quantity * i.Price_Per_Share - COALESCE(i.Commission, 0)) * COALESCE(hfx_sec.FX_Rate, 1)
                          ELSE 0 END) AS cf_all_time_eur,
                 -- net_invested_all_time_eur: JOIN replaces per-row correlated subqueries
                 SUM(CASE WHEN i.Action IN ('Buy', 'CashOut', 'MiscExp')
-                            THEN i.Total_Amount_AccCur * COALESCE(hfx.FX_Rate, 1)
+                            THEN COALESCE(NULLIF(i.Total_Amount_SecCur, 0), i.Quantity * i.Price_Per_Share + COALESCE(i.Commission, 0)) * COALESCE(hfx_sec.FX_Rate, 1)
                          WHEN i.Action IN ('Sell', 'Dividend', 'IntInc', 'CashIn', 'RtrnCap')
-                            THEN -i.Total_Amount_AccCur * COALESCE(hfx.FX_Rate, 1)
+                            THEN -COALESCE(NULLIF(i.Total_Amount_SecCur, 0), i.Quantity * i.Price_Per_Share - COALESCE(i.Commission, 0)) * COALESCE(hfx_sec.FX_Rate, 1)
                          ELSE 0 END) AS net_invested_all_time_eur,
                 -- gross_invested_all_time_eur: total cost of all buys (correct denominator for % return)
                 -- Using net_invested as denominator is wrong for closed/profitable positions because
                 -- proceeds from sells make it negative, flipping the sign of the percentage.
                 SUM(CASE WHEN i.Action IN ('Buy', 'CashOut', 'MiscExp')
-                            THEN i.Total_Amount_AccCur * COALESCE(hfx.FX_Rate, 1)
+                            THEN COALESCE(NULLIF(i.Total_Amount_SecCur, 0), i.Quantity * i.Price_Per_Share + COALESCE(i.Commission, 0)) * COALESCE(hfx_sec.FX_Rate, 1)
                          ELSE 0 END) AS gross_invested_all_time_eur
             FROM Investments i
             JOIN Accounts a ON i.Accounts_Id = a.Accounts_Id
+            JOIN Securities s ON i.Securities_Id = s.Securities_Id
             LEFT JOIN Historical_FX hfx
                    ON hfx.Currencies_Id_1 = a.Currencies_Id
                   AND hfx.Date = i.Date
+            LEFT JOIN Historical_FX hfx_sec
+                   ON hfx_sec.Currencies_Id_1 = s.Currencies_Id
+                  AND hfx_sec.Date = i.Date
             GROUP BY i.Accounts_Id, i.Securities_Id
         ),
         dividend_yoc AS (
@@ -1542,9 +1546,9 @@ def get_pnl_report_data(start_date: str = '1900-01-01', end_date: str = None):
 				 ELSE COALESCE((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)), 0) - COALESCE((pf.qty_ytd * pf.price_ytd * COALESCE(pf.fx_ytd, 1)),0) -- this is required for outstanding positions
 			END   - COALESCE(cf.cf_ytd_eur, 0)  -- this is required for positions closed within the year and by today
 			-
-			CASE WHEN pf.qty_today <> 0 AND pf.qty_ytd = 0 THEN COALESCE((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)), 0) - COALESCE(cf.cf_ytd, 0) * COALESCE(pf.fx_today, 1) 
+			CASE WHEN pf.qty_today <> 0 AND pf.qty_ytd = 0 THEN COALESCE((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)), 0) - COALESCE(cf.cf_ytd_eur, 0)
 				 WHEN pf.qty_today <> 0 AND pf.qty_ytd <> 0 AND pf.qty_today >= pf.qty_ytd AND COALESCE(cf.net_invested_ytd_eur, 0) >= 0 THEN COALESCE((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)), 0) - COALESCE((pf.qty_ytd * pf.price_ytd * COALESCE(pf.fx_ytd, 1)), 0) - COALESCE(cf.net_invested_ytd_eur, 0)
-				 WHEN pf.qty_today <> 0 AND pf.qty_ytd <> 0 AND pf.qty_today >= pf.qty_ytd AND COALESCE(cf.net_invested_ytd_eur, 0) < 0 THEN COALESCE((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)), 0) - COALESCE((pf.qty_ytd * pf.price_ytd * COALESCE(pf.fx_ytd, 1)), 0) 
+				 WHEN pf.qty_today <> 0 AND pf.qty_ytd <> 0 AND pf.qty_today >= pf.qty_ytd AND COALESCE(cf.net_invested_ytd_eur, 0) < 0 THEN COALESCE((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)), 0) - COALESCE((pf.qty_ytd * pf.price_ytd * COALESCE(pf.fx_ytd, 1)), 0)
 			 ELSE 0
 			END realized_pnl_ytd_eur,
 
@@ -1567,12 +1571,12 @@ def get_pnl_report_data(start_date: str = '1900-01-01', end_date: str = None):
             COALESCE(adf.direct_cashin_eur, 0) AS direct_cashin_eur,
             COALESCE(alf.linked_cashin_eur, 0) AS linked_cashin_eur,
 
-            -- Unrealized P&L (FIFO based)
-            h.Quantity * (pf.price_today - h.Fifo_Avg_Price) * COALESCE(pf.fx_today, 1) AS unrealized_pnl_eur,
+            -- Unrealized P&L: current value minus FIFO cost at historical EUR FX rates
+            h.Quantity * pf.price_today * COALESCE(pf.fx_today, 1) - h.Quantity * COALESCE(h.Fifo_Avg_Cost_EUR, h.Fifo_Avg_Price * COALESCE(pf.fx_today, 1)) AS unrealized_pnl_eur,
 
             -- Realized P&L (Total - Unrealized)
             COALESCE((pf.qty_today * pf.price_today * COALESCE(pf.fx_today, 1)), 0) - COALESCE(cf.net_invested_all_time_eur, 0)
-            - COALESCE(h.Quantity * (pf.price_today - h.Fifo_Avg_Price) * COALESCE(pf.fx_today, 1), 0) AS realized_pnl_eur,
+            - (h.Quantity * pf.price_today * COALESCE(pf.fx_today, 1) - h.Quantity * COALESCE(h.Fifo_Avg_Cost_EUR, h.Fifo_Avg_Price * COALESCE(pf.fx_today, 1))) AS realized_pnl_eur,
 
             -- Annual YOC %
             ROUND(
