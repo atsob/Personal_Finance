@@ -680,6 +680,210 @@ def render_custom_reports():
                     st.info('No changes detected.')
 
 
+def render_investment_consistency_check():
+    """Investment data consistency / anomaly checker with inline edit & save."""
+    from database.queries import get_investment_consistency_data, update_investment_row
+
+    st.subheader("🔍 Investment Data Consistency Check")
+    st.caption(
+        "Detects anomalies in Quantity × Price, Commission, Total (Acc/Sec ccy) and FX Rate. "
+        "Edit any field inline and click **Save Changes** to persist."
+    )
+
+    # ── Filters ──────────────────────────────────────────────────────────────
+    f1, f2, f3 = st.columns(3)
+
+    all_accts = get_all_accounts_for_nwr()
+    acct_name_to_id = dict(zip(all_accts["accounts_name"], all_accts["accounts_id"]))
+    sel_acct_names  = f1.multiselect("Accounts", sorted(acct_name_to_id), key="ic_accts")
+    account_ids     = [acct_name_to_id[n] for n in sel_acct_names] or None
+
+    all_actions = ["Buy","Sell","Dividend","IntInc","RtrnCap",
+                   "CashIn","CashOut","MiscExp","Reinvest","ShrIn","ShrOut"]
+    sel_actions = f2.multiselect("Actions", all_actions, key="ic_actions")
+
+    anomalies_only = f3.toggle("Anomalies only", value=True, key="ic_anom_only")
+
+    if st.button("🔍 Run Check", type="primary", key="ic_run"):
+        st.session_state["ic_df_raw"] = get_investment_consistency_data(account_ids)
+
+    if "ic_df_raw" not in st.session_state:
+        return
+
+    df = st.session_state["ic_df_raw"].copy()
+    if sel_actions:
+        df = df[df["action"].isin(sel_actions)]
+
+    if df.empty:
+        st.info("No investment records found.")
+        return
+
+    # ── Anomaly detection ─────────────────────────────────────────────────────
+    ATOL   = 0.10          # €/$  absolute tolerance
+    PTOL   = 0.005         # 0.5% relative tolerance
+    TRADEABLE = {"Buy", "Sell", "Reinvest", "ShrIn", "ShrOut"}
+
+    def _detect(row):
+        issues, recs = [], []
+        qty     = row["quantity"]   or 0.0
+        price   = row["price"]      or 0.0
+        comm    = row["commission"] or 0.0
+        t_acc   = row["total_acc"]
+        t_sec   = row["total_sec"]
+        fx      = row["fx_rate"]    or 1.0
+        action  = row["action"]
+        same    = row["acc_currency"] == row["sec_currency"]
+
+        notional = qty * price
+
+        # 1. Missing totals
+        if t_acc is None:
+            issues.append("NULL total_acc")
+            if t_sec is not None:
+                recs.append(f"Set total_acc = {t_sec * fx:.2f} (total_sec × fx)")
+        if t_sec is None and qty and price and action in TRADEABLE:
+            issues.append("NULL total_sec")
+            recs.append(f"Set total_sec ≈ {notional:.2f} (qty × price)")
+
+        # 2. FX rate anomalies
+        if same and abs(fx - 1.0) > 0.001:
+            issues.append(f"Same ccy but FX_Rate={fx:.4f}")
+            recs.append("Set FX_Rate = 1.0")
+        if not same and fx and abs(fx - 1.0) < 0.001:
+            issues.append(f"Cross-ccy ({row['sec_currency']}/{row['acc_currency']}) but FX_Rate=1.0")
+            recs.append("Look up correct FX rate for trade date")
+
+        # 3. FX consistency: total_acc ≈ total_sec × fx
+        if t_acc is not None and t_sec is not None and fx:
+            expected_acc = t_sec * fx
+            delta = abs(t_acc - expected_acc)
+            tol   = max(ATOL, abs(expected_acc) * PTOL)
+            if delta > tol:
+                issues.append(
+                    f"total_acc ({t_acc:.2f}) ≠ total_sec × fx ({expected_acc:.2f}), Δ={delta:.2f}"
+                )
+                recs.append(f"Set total_acc = {expected_acc:.2f}  OR  fx = {(t_acc/t_sec):.6f}")
+
+        # 4. Price/qty consistency for tradeable actions
+        if t_sec is not None and qty and price and action in TRADEABLE:
+            # Expected sec total: notional ± commission (commission may be in acc ccy)
+            # Allow ±comm + tolerance
+            diff = abs(t_sec - notional)
+            tol  = max(ATOL, comm + abs(notional) * PTOL)
+            if diff > tol:
+                issues.append(
+                    f"total_sec ({t_sec:.2f}) ≠ qty×price ({notional:.2f}), Δ={diff:.2f}"
+                )
+                expected_sec = notional + comm if action in ("Buy","ShrIn","Reinvest") \
+                               else max(0.0, notional - comm)
+                recs.append(f"Expected total_sec ≈ {expected_sec:.2f}")
+
+        # 5. Zero price or qty for tradeable
+        if action in TRADEABLE:
+            if not qty:
+                issues.append("Quantity is 0 / NULL")
+            if not price:
+                issues.append("Price is 0 / NULL")
+
+        return "; ".join(issues) if issues else "", "; ".join(recs) if recs else ""
+
+    df[["anomalies", "recommendations"]] = df.apply(
+        _detect, axis=1, result_type="expand"
+    )
+
+    df_show = df if not anomalies_only else df[df["anomalies"] != ""]
+
+    # ── Summary banner ────────────────────────────────────────────────────────
+    n_total  = len(df)
+    n_issues = (df["anomalies"] != "").sum()
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total records", n_total)
+    c2.metric("⚠️ Anomalies",  n_issues)
+    c3.metric("✅ Clean",       n_total - n_issues)
+
+    if df_show.empty:
+        st.success("No anomalies found — all investment records look consistent! 🎉")
+        return
+
+    # ── Editable table ───────────────────────────────────────────────────────
+    st.markdown(f"Showing **{len(df_show)}** record(s).")
+
+    edit_cols = ["investments_id", "date", "account", "security", "action",
+                 "quantity", "price", "commission",
+                 "total_acc", "total_sec", "fx_rate",
+                 "acc_currency", "sec_currency",
+                 "anomalies", "recommendations"]
+    df_edit = df_show[edit_cols].copy()
+    df_edit["date"] = df_edit["date"].dt.strftime("%Y-%m-%d")
+
+    edited = st.data_editor(
+        df_edit,
+        disabled=["investments_id", "date", "account", "security", "action",
+                  "acc_currency", "sec_currency", "anomalies", "recommendations"],
+        column_config={
+            "investments_id":  st.column_config.NumberColumn("ID",           format="%d", width="small"),
+            "date":            st.column_config.TextColumn("Date",           width="small"),
+            "account":         st.column_config.TextColumn("Account"),
+            "security":        st.column_config.TextColumn("Security"),
+            "action":          st.column_config.TextColumn("Action",         width="small"),
+            "quantity":        st.column_config.NumberColumn("Qty",           format="%.6f"),
+            "price":           st.column_config.NumberColumn("Price",         format="%.6f"),
+            "commission":      st.column_config.NumberColumn("Commission",    format="%.4f"),
+            "total_acc":       st.column_config.NumberColumn("Total (acc)",   format="%.4f"),
+            "total_sec":       st.column_config.NumberColumn("Total (sec)",   format="%.4f"),
+            "fx_rate":         st.column_config.NumberColumn("FX Rate",       format="%.6f"),
+            "acc_currency":    st.column_config.TextColumn("Acc Ccy",         width="small"),
+            "sec_currency":    st.column_config.TextColumn("Sec Ccy",         width="small"),
+            "anomalies":       st.column_config.TextColumn("⚠️ Anomalies",    width="large"),
+            "recommendations": st.column_config.TextColumn("💡 Recommendations", width="large"),
+        },
+        hide_index=True,
+        use_container_width=True,
+        key="ic_editor",
+        num_rows="fixed",
+    )
+
+    copy_df_button(df_edit, key="dl_ic_report")
+
+    # ── Save ─────────────────────────────────────────────────────────────────
+    _editable = ["quantity", "price", "commission", "total_acc", "total_sec", "fx_rate"]
+
+    def _has_changes():
+        for col in _editable:
+            orig = df_edit[col].fillna(0.0)
+            curr = edited[col].fillna(0.0)
+            if not orig.equals(curr):
+                return True
+        return False
+
+    if st.button("💾 Save Changes", key="ic_save", disabled=not _has_changes()):
+        saved, errors = 0, []
+        for i, row in edited.iterrows():
+            orig = df_edit.iloc[i]
+            changes = {}
+            for col in _editable:
+                ov = orig[col]
+                nv = row[col]
+                # Treat NaN == NaN as equal
+                if pd.isna(ov) and pd.isna(nv):
+                    continue
+                if pd.isna(ov) != pd.isna(nv) or (not pd.isna(ov) and abs(float(ov) - float(nv)) > 1e-9):
+                    changes[col] = None if pd.isna(nv) else float(nv)
+            if changes:
+                try:
+                    update_investment_row(int(row["investments_id"]), changes)
+                    saved += 1
+                except Exception as e:
+                    errors.append(f"Row {i+1} (ID {int(row['investments_id'])}): {e}")
+        for e in errors:
+            st.error(e)
+        if saved:
+            st.success(f"Saved {saved} row(s). Re-run the check to refresh anomaly flags.")
+            st.session_state.pop("ic_df_raw", None)
+        elif not errors:
+            st.info("No changes detected.")
+
+
 def render_reports():
     """Render the Reports page."""
     st.title("Reports")

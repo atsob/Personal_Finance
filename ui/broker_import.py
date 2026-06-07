@@ -3706,10 +3706,27 @@ def _saxo_preview_with_status(
         rows.append({**r, "status": status, "security_match": sec_label})
 
     df_inv = pd.DataFrame(rows)
-    cols   = ["status", "date", "action", "symbol", "name",
-              "quantity", "price", "commission", "total_eur",
-              "currency", "asset_category", "instrument_type", "security_match",
-              "account_id_str", "desc"]
+    # For cross-currency position instruments, total_sec_cur holds the notional
+    # in security currency (commission is always in account currency and shown
+    # separately).  For all other rows, total_eur is the account-currency total.
+    # Use pd.notna() to distinguish real values from NaN (NaN is truthy in Python).
+    if "total_sec_cur" in df_inv.columns:
+        df_inv["total_display"] = df_inv.apply(
+            lambda r: r["total_sec_cur"] if pd.notna(r.get("total_sec_cur")) else r["total_eur"],
+            axis=1,
+        )
+        df_inv["total_label"] = df_inv.apply(
+            lambda r: "sec ccy" if pd.notna(r.get("total_sec_cur")) else "acct ccy",
+            axis=1,
+        )
+    else:
+        df_inv["total_display"] = df_inv["total_eur"]
+        df_inv["total_label"]   = "acct ccy"
+
+    cols = ["status", "date", "action", "symbol", "name",
+            "quantity", "price", "commission", "total_display", "total_label",
+            "currency", "asset_category", "instrument_type", "security_match",
+            "account_id_str", "desc"]
     df_inv = df_inv[[c for c in cols if c in df_inv.columns]]
     st.dataframe(
         df_inv,
@@ -3724,7 +3741,8 @@ def _saxo_preview_with_status(
             "quantity":        st.column_config.NumberColumn("Qty",         format="%.4f"),
             "price":           st.column_config.NumberColumn("Price",       format="%.4f"),
             "commission":      st.column_config.NumberColumn("Commission",  format="%.4f"),
-            "total_eur":       st.column_config.NumberColumn("Total (acct ccy)", format="%.2f"),
+            "total_display":   st.column_config.NumberColumn("Total",       format="%.2f"),
+            "total_label":     "Total Ccy",
             "currency":        "Ccy",
             "asset_category":  "Sec Type",
             "instrument_type": "Instr Type",

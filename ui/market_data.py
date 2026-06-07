@@ -5,8 +5,9 @@ from database.connection import get_db
 from database.crud import (
     save_changes, save_changes_no_serial, save_changes_mid,
     delete_historical_prices, insert_prices_from_transactions, normalize_investment_prices,
+    apply_stock_split,
 )
-from database.queries import get_price_anomalies
+from database.queries import get_price_anomalies, get_split_preview, get_all_accounts_for_nwr, get_corporate_actions
 from ui.components import copy_df_button
 from data.downloaders import (
     download_historical_fx,
@@ -335,11 +336,12 @@ def render_market_data():
             inv_sec_id = selected_inv_sec['securities_id']
 
             # ── Inner sub-tabs ────────────────────────────────────────────────
-            st_prices, st_inv_txs, st_anomalies, st_divs = st.tabs([
+            st_prices, st_inv_txs, st_anomalies, st_divs, st_corp = st.tabs([
                 "📈 Prices",
                 "🧾 Investment Transactions",
                 "🔍 Price Anomalies",
                 "💰 Dividends",
+                "🏢 Corporate Actions",
             ])
 
             # ─────────────────────────────────────────────────────────────────
@@ -958,3 +960,160 @@ def render_market_data():
                         f"ℹ️ No Yahoo ticker defined for {selected_inv_sec['securities_name']} "
                         "— cannot fetch dividend data."
                     )
+
+            # ── Corporate Actions tab ─────────────────────────────────────────
+            with st_corp:
+                st.subheader("🏢 Corporate Actions — Stock Split / Reverse Split")
+                st.caption(
+                    "Records a split by inserting a **ShrIn** (forward split) or **ShrOut** "
+                    "(reverse split) entry for the delta shares on the effective date. "
+                    "All existing broker-imported records are left untouched. "
+                    "Holdings are refreshed automatically after applying."
+                )
+
+                # ── History ───────────────────────────────────────────────────
+                df_ca = get_corporate_actions(inv_sec_id)
+                if df_ca.empty:
+                    st.info("No corporate actions recorded for this security yet.")
+                else:
+                    st.markdown(f"**{len(df_ca)}** corporate action(s) on record:")
+                    df_ca_disp = df_ca.copy()
+                    df_ca_disp["effective_date"] = pd.to_datetime(df_ca_disp["effective_date"]).dt.strftime("%Y-%m-%d")
+                    df_ca_disp["created_at"] = pd.to_datetime(df_ca_disp["created_at"]).dt.strftime("%Y-%m-%d %H:%M")
+                    df_ca_disp["ratio"] = df_ca_disp.apply(
+                        lambda r: f"{r['ratio_new']:.4g} : {r['ratio_old']:.4g}"
+                        if r["ratio_new"] is not None else "",
+                        axis=1,
+                    )
+                    st.dataframe(
+                        df_ca_disp[["effective_date", "action_type", "ratio", "description", "created_at"]],
+                        column_config={
+                            "effective_date": st.column_config.TextColumn("Date",        width="small"),
+                            "action_type":   st.column_config.TextColumn("Type",         width="small"),
+                            "ratio":         st.column_config.TextColumn("Ratio",        width="small"),
+                            "description":   st.column_config.TextColumn("Description"),
+                            "created_at":    st.column_config.TextColumn("Recorded At",  width="medium"),
+                        },
+                        hide_index=True,
+                        use_container_width=True,
+                    )
+                st.divider()
+
+                # Account filter
+                all_accts = get_all_accounts_for_nwr()
+                acct_name_to_id = dict(zip(all_accts["accounts_name"], all_accts["accounts_id"]))
+                sel_acct_names = st.multiselect(
+                    "Limit to accounts (leave empty = all accounts holding this security)",
+                    sorted(acct_name_to_id),
+                    key=f"corp_accts_{inv_sec_id}",
+                )
+                account_ids = [acct_name_to_id[n] for n in sel_acct_names] or None
+
+                st.markdown("#### Split ratio")
+                rc1, rc2 = st.columns(2)
+                new_shares = rc1.number_input(
+                    "New shares", min_value=0.001, value=2.0, step=1.0,
+                    key=f"corp_new_{inv_sec_id}",
+                )
+                old_shares = rc2.number_input(
+                    "Old shares", min_value=0.001, value=1.0, step=1.0,
+                    key=f"corp_old_{inv_sec_id}",
+                )
+                ratio = new_shares / old_shares
+                is_forward = new_shares >= old_shares
+                split_type = "Stock Split" if is_forward else "Reverse Split"
+                action_label = "ShrIn" if is_forward else "ShrOut"
+
+                sec_name = selected_inv_sec.get("securities_name", "")
+                ticker = selected_inv_sec.get("ticker", "") or ""
+                sec_label = ticker if ticker else sec_name
+
+                # Build default description from inputs
+                if is_forward:
+                    auto_desc = f"{sec_label} {int(new_shares)}-for-{int(old_shares)} Stock Split"
+                else:
+                    auto_desc = f"{sec_label} {int(old_shares)}-for-{int(new_shares)} Reverse Split"
+
+                import datetime
+                split_date = st.date_input(
+                    "Effective date", value=datetime.date.today(),
+                    key=f"corp_date_{inv_sec_id}",
+                )
+                description = st.text_input(
+                    "Description",
+                    value=auto_desc,
+                    key=f"corp_desc_{inv_sec_id}_{int(new_shares)}_{int(old_shares)}",
+                    help="Auto-filled from the ratio above. Edit if needed.",
+                )
+
+                st.divider()
+                if st.button("Preview", key=f"corp_preview_btn_{inv_sec_id}"):
+                    df_prev = get_split_preview(inv_sec_id, split_date, account_ids)
+                    st.session_state[f"corp_preview_df_{inv_sec_id}"] = df_prev
+
+                if f"corp_preview_df_{inv_sec_id}" in st.session_state:
+                    df_prev = st.session_state[f"corp_preview_df_{inv_sec_id}"].copy()
+                    if df_prev.empty:
+                        st.warning(
+                            "No holdings found for this security before the selected date "
+                            "in the chosen accounts."
+                        )
+                    else:
+                        # Recompute delta with current ratio (inputs may have changed)
+                        if is_forward:
+                            df_prev["delta_qty"] = (df_prev["current_qty"] * (ratio - 1)).round(6)
+                        else:
+                            df_prev["delta_qty"] = (df_prev["current_qty"] * (1 - ratio)).round(6)
+                        df_prev["new_total"] = (
+                            df_prev["current_qty"] + df_prev["delta_qty"]
+                            if is_forward
+                            else df_prev["current_qty"] - df_prev["delta_qty"]
+                        )
+                        df_prev["action"] = action_label
+
+                        st.markdown(
+                            f"The following **{action_label}** entr{'ies' if len(df_prev)>1 else 'y'} "
+                            f"will be inserted on **{split_date}**:"
+                        )
+                        st.dataframe(
+                            df_prev[["account", "current_qty", "delta_qty", "new_total", "action"]],
+                            column_config={
+                                "account":     st.column_config.TextColumn("Account"),
+                                "current_qty": st.column_config.NumberColumn("Current Qty", format="%.6f"),
+                                "delta_qty":   st.column_config.NumberColumn(f"{action_label} Qty", format="%.6f"),
+                                "new_total":   st.column_config.NumberColumn("New Total Qty", format="%.6f"),
+                                "action":      st.column_config.TextColumn("Action", width="small"),
+                            },
+                            hide_index=True,
+                            use_container_width=True,
+                        )
+
+                        st.divider()
+                        confirmed = st.checkbox(
+                            "I understand this cannot be undone — apply the split",
+                            key=f"corp_confirm_{inv_sec_id}",
+                        )
+                        if st.button(
+                            "Apply", type="primary",
+                            key=f"corp_apply_{inv_sec_id}",
+                            disabled=not confirmed,
+                        ):
+                            try:
+                                holdings = df_prev[["accounts_id", "current_qty"]].to_dict("records")
+                                n = apply_stock_split(
+                                    securities_id=inv_sec_id,
+                                    split_date=split_date,
+                                    new_shares=new_shares,
+                                    old_shares=old_shares,
+                                    holdings_by_account=holdings,
+                                    description=description.strip(),
+                                )
+                                st.success(
+                                    f"Done: {n} {action_label} row(s) inserted. "
+                                    "Holdings have been refreshed."
+                                )
+                                st.session_state.pop(f"corp_preview_df_{inv_sec_id}", None)
+                                st.session_state[f"corp_confirm_{inv_sec_id}"] = False
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error applying split: {e}")

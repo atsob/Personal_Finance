@@ -1171,6 +1171,89 @@ def normalize_investment_prices(investments_ids: list) -> int:
 
 
 # =============================================================================
+# STOCK SPLIT / REVERSE SPLIT
+
+
+def apply_stock_split(
+    securities_id: int,
+    split_date,
+    new_shares: float,
+    old_shares: float,
+    holdings_by_account: list,
+    description: str = "",
+) -> int:
+    """
+    Record a stock split (or reverse split) by inserting a ShrIn / ShrOut row
+    for the *delta* shares on the split date, one row per account.
+    Historical broker records are NOT modified.
+
+    holdings_by_account: list of dicts/rows with keys accounts_id, current_qty.
+
+    Forward split (new > old): delta = current_qty * (ratio - 1)  -> ShrIn
+    Reverse split (new < old): delta = current_qty * (1 - ratio)  -> ShrOut
+
+    Returns the number of rows inserted.
+    """
+    ratio = new_shares / old_shares
+    is_forward = new_shares >= old_shares
+    action = "ShrIn" if is_forward else "ShrOut"
+    label = description or (
+        f"{int(new_shares)}:{int(old_shares)} "
+        + ("Stock Split" if is_forward else "Reverse Split")
+    )
+
+    action_type = "Split" if is_forward else "Reverse Split"
+
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        # ── 1. Insert Corporate_Actions event record ───────────────────────────
+        cur.execute("""
+            INSERT INTO Corporate_Actions
+                (Securities_Id, Action_Type, Effective_Date,
+                 Ratio_New, Ratio_Old, Description)
+            VALUES (%s, %s::corporate_action_type, %s, %s, %s, %s)
+        """, (securities_id, action_type, split_date, new_shares, old_shares, label))
+
+        # ── 2. Insert ShrIn / ShrOut per account ──────────────────────────────
+        inserted = 0
+        for row in holdings_by_account:
+            acct_id = int(row["accounts_id"])
+            current_qty = float(row["current_qty"])
+            if current_qty <= 0:
+                continue
+
+            if is_forward:
+                delta = round(current_qty * (ratio - 1), 10)
+            else:
+                delta = round(current_qty * (1 - ratio), 10)
+
+            if delta <= 0:
+                continue
+
+            cur.execute("""
+                INSERT INTO Investments
+                    (Accounts_Id, Securities_Id, Date, Action,
+                     Quantity, Price_Per_Share, Commission,
+                     Total_Amount_AccCur, Total_Amount_SecCur, FX_Rate,
+                     Description)
+                VALUES (%s, %s, %s, %s, %s, 0, 0, 0, 0, 1, %s)
+            """, (acct_id, securities_id, split_date, action, delta, label))
+            inserted += 1
+
+        conn.commit()
+        update_holdings()
+        return inserted
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+
+# =============================================================================
 # RECURRING TEMPLATES
 # =============================================================================
 # Column naming follows the schema convention: plural-prefix for all PKs/FKs.

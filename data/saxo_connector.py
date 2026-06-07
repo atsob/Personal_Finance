@@ -648,8 +648,10 @@ def parse_trades(
         spread_cost  = abs(float(t.get("SpreadCostAccountCurrency", 0) or 0))
         # Additional SAXO fields that may carry the full closing cost for
         # Sell (close) trades.  Present on some account types / instrument types.
-        total_cost   = abs(float(t.get("TotalCostAccountCurrency", 0) or 0))
-        comm_field   = abs(float(t.get("CommissionAccountCurrency", 0) or 0))
+        total_cost        = abs(float(t.get("TotalCostAccountCurrency", 0) or 0))
+        comm_field        = abs(float(t.get("CommissionAccountCurrency", 0) or 0))
+        cross_ccy_position = False   # set True only for cross-currency position trades
+        notional           = 0.0
 
         if is_position:
             # Use the notional (TradedValue) as the base position value.
@@ -714,17 +716,28 @@ def parse_trades(
 
             # Align with the app convention: Total_Amount = qty×price ± commission
             # (Buy adds commission to cost basis; Sell subtracts from proceeds).
-            # Only valid when instrument and account share the same currency;
-            # for cross-currency positions the notional is kept as-is to avoid
-            # mixing incompatible units (e.g. USD notional + EUR commission).
+            # Same-currency: build total_acc directly from notional ± commission.
+            # Cross-currency: the notional is in security currency (e.g. USD) while
+            # total_acc must be in account currency (e.g. EUR).  We cannot convert
+            # here (no DB access), so we flag the record: total_acc is left as 0
+            # and total_sec_cur carries the notional.  run_import will reverse-FX
+            # to derive total_acc from total_sec_cur at import time.
             acc_currency = t.get("AccountCurrency", "")
-            if currency and acc_currency and currency == acc_currency:
+            cross_ccy_position = bool(
+                currency and acc_currency and currency != acc_currency
+            )
+            if not cross_ccy_position:
                 if action == "Buy":
                     total_acc = notional + commission
                 else:
                     total_acc = max(0.0, notional - commission)
             else:
-                total_acc = notional
+                # Cross-currency: total_acc cannot be built here (no FX access).
+                # run_import derives it from total_sec_cur (notional) + commission
+                # using the historical FX rate:
+                #   total_sec = notional ± commission_acc / fx
+                #   total_acc = total_sec × fx  =  notional×fx ± commission_acc
+                total_acc = 0.0
 
         else:
             # Regular trade: cash flow in account currency (already FX-converted)
@@ -800,6 +813,16 @@ def parse_trades(
             "price":          round(price,      6),
             "commission":     round(commission, 4),
             "total_eur":      round(total_acc,  2),
+            # For cross-currency position instruments (e.g. CfdOnEtf USD in EUR
+            # account): total_acc is 0 because the notional is in security currency.
+            # total_sec_cur carries the security-currency notional so run_import
+            # can reverse-FX it to produce the correct account-currency total.
+            # For cross-currency positions, total_sec_cur carries the raw notional
+            # (TradedValue in security currency).  run_import adds commission
+            # (account currency) converted to security currency via the FX rate,
+            # giving: total_sec = notional ± commission_acc/fx
+            # and:    total_acc = total_sec × fx = notional×fx ± commission_acc
+            "total_sec_cur":  round(notional, 2) if cross_ccy_position else None,
             "exchange":       exchange,
             "account_id_str": t.get("AccountId", ""),
         })
@@ -1261,9 +1284,46 @@ def run_import(
                     _acc_cur_cache[_db_acc_id_int] = int(_ar[0]) if _ar else None
                 _acc_cur_id = _acc_cur_cache[_db_acc_id_int]
 
-                # Resolve FX and security-currency total (SAXO has no explicit FX)
+                # Resolve FX and security-currency total (SAXO has no explicit FX).
+                # Cross-currency position instruments (e.g. CfdOnEtf): total_eur=0
+                # and total_sec_cur holds the notional in security currency.
+                # We reverse-FX to get account-currency total and store both.
+                _known_sec = rec.get("total_sec_cur")   # notional in sec ccy, or None
                 _total_acc = rec["total_eur"] if rec["total_eur"] != 0 else None
-                if _total_acc is not None:
+
+                if _known_sec is not None and _sec_cur_id is not None and _acc_cur_id is not None:
+                    # Look up FX rate: sec → acc direction (e.g. USD→EUR)
+                    cur.execute(
+                        """SELECT fx_rate FROM Historical_FX
+                           WHERE currencies_id_1 = %s AND currencies_id_2 = %s
+                             AND date <= COALESCE(%s::date, CURRENT_DATE)
+                           ORDER BY date DESC LIMIT 1""",
+                        (_sec_cur_id, _acc_cur_id, rec["date"]),
+                    )
+                    _fxrow = cur.fetchone()
+                    if not _fxrow:
+                        # Try inverse direction
+                        cur.execute(
+                            """SELECT fx_rate FROM Historical_FX
+                               WHERE currencies_id_1 = %s AND currencies_id_2 = %s
+                                 AND date <= COALESCE(%s::date, CURRENT_DATE)
+                               ORDER BY date DESC LIMIT 1""",
+                            (_acc_cur_id, _sec_cur_id, rec["date"]),
+                        )
+                        _fxrow = cur.fetchone()
+                        _fx = (1.0 / float(_fxrow[0])) if _fxrow else 1.0
+                    else:
+                        _fx = float(_fxrow[0])
+                    # Commission is in account currency; convert to security currency.
+                    # total_sec = notional ± commission_acc / fx
+                    # total_acc = total_sec × fx  =  notional×fx ± commission_acc
+                    _commission_acc = rec.get("commission", 0.0) or 0.0
+                    if rec.get("action") == "Buy":
+                        _sec_amt   = round(_known_sec + (_commission_acc / _fx if _fx else 0), 18)
+                    else:
+                        _sec_amt   = round(max(0.0, _known_sec - (_commission_acc / _fx if _fx else 0)), 18)
+                    _total_acc = round(_sec_amt * _fx, 2)
+                elif _total_acc is not None:
                     _sec_amt, _fx = resolve_investment_fx(
                         cur, _total_acc, _acc_cur_id, _sec_cur_id, rec["date"],
                     )

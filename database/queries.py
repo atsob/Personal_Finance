@@ -4015,6 +4015,150 @@ def get_all_payees():
     return df
 
 
+def get_investment_consistency_data(account_ids=None):
+    """Return all Investments rows with account/security currency for consistency checks."""
+    conn = get_connection()
+    acct_filter = (
+        f"AND i.Accounts_Id IN ({','.join(str(int(x)) for x in account_ids)})"
+        if account_ids else ""
+    )
+    df = pd.read_sql(f"""
+        SELECT
+            i.Investments_Id                        AS investments_id,
+            i.Date                                  AS date,
+            a.Accounts_Name                         AS account,
+            s.Securities_Name                       AS security,
+            i.Action::text                          AS action,
+            i.Quantity                              AS quantity,
+            i.Price_Per_Share                       AS price,
+            i.Commission                            AS commission,
+            i.Total_Amount_AccCur                   AS total_acc,
+            i.Total_Amount_SecCur                   AS total_sec,
+            i.FX_Rate                               AS fx_rate,
+            i.Instrument_Type::text                 AS instrument_type,
+            acc_cur.Currencies_ShortName            AS acc_currency,
+            sec_cur.Currencies_ShortName            AS sec_currency
+        FROM Investments i
+        JOIN Accounts a      ON a.Accounts_Id    = i.Accounts_Id
+        JOIN Securities s    ON s.Securities_Id  = i.Securities_Id
+        JOIN Currencies acc_cur ON acc_cur.Currencies_Id = a.Currencies_Id
+        JOIN Currencies sec_cur ON sec_cur.Currencies_Id = s.Currencies_Id
+        WHERE i.Action IN ('Buy','Sell','Dividend','IntInc','RtrnCap',
+                           'CashIn','CashOut','MiscExp','Reinvest','ShrIn','ShrOut')
+          {acct_filter}
+        ORDER BY i.Date DESC, i.Investments_Id DESC
+    """, conn)
+    conn.close()
+    if not df.empty:
+        df["date"] = pd.to_datetime(df["date"])
+    return df
+
+
+def update_investment_row(investments_id: int, fields: dict):
+    """Update editable numeric fields on an Investments row.
+
+    ``fields`` may contain any subset of:
+        quantity, price, commission, total_acc, total_sec, fx_rate
+    """
+    _col_map = {
+        "quantity":   "Quantity",
+        "price":      "Price_Per_Share",
+        "commission": "Commission",
+        "total_acc":  "Total_Amount_AccCur",
+        "total_sec":  "Total_Amount_SecCur",
+        "fx_rate":    "FX_Rate",
+    }
+    sets, vals = [], []
+    for k, v in fields.items():
+        if k in _col_map:
+            sets.append(f"{_col_map[k]} = %s")
+            vals.append(v)
+    if not sets:
+        return
+    vals.append(investments_id)
+    conn = get_connection()
+    with conn.cursor() as cur:
+        cur.execute(
+            f"UPDATE Investments SET {', '.join(sets)} WHERE Investments_Id = %s",
+            vals,
+        )
+    conn.commit()
+    conn.close()
+
+
+def get_corporate_actions(securities_id: int):
+    """Return all corporate actions recorded for a security, newest first."""
+    conn = get_connection()
+    df = pd.read_sql("""
+        SELECT ca.Corporate_Actions_Id  AS id,
+               ca.Action_Type           AS action_type,
+               ca.Effective_Date        AS effective_date,
+               ca.Ratio_New             AS ratio_new,
+               ca.Ratio_Old             AS ratio_old,
+               ca.Description           AS description,
+               ca.Created_At            AS created_at
+          FROM Corporate_Actions ca
+         WHERE ca.Securities_Id = %s
+         ORDER BY ca.Effective_Date DESC, ca.Corporate_Actions_Id DESC
+    """, conn, params=(securities_id,))
+    conn.close()
+    return df
+
+
+def get_all_securities():
+    """Return all active securities with id, ticker, name and currency shortname."""
+    conn = get_connection()
+    df = pd.read_sql("""
+        SELECT s.Securities_Id   AS securities_id,
+               s.Ticker          AS ticker,
+               s.Securities_Name AS securities_name,
+               c.Currencies_ShortName AS currency
+          FROM Securities s
+          LEFT JOIN Currencies c ON c.Currencies_Id = s.Currencies_Id
+         WHERE s.Is_Active = TRUE
+         ORDER BY s.Securities_Name
+    """, conn)
+    conn.close()
+    return df
+
+
+def get_split_preview(securities_id: int, split_date, account_ids=None):
+    """
+    Return current holdings (quantity as of split_date) per account for a security.
+    This is used to preview what ShrIn / ShrOut delta will be inserted.
+    Columns: accounts_id, account, current_qty
+    """
+    conn = get_connection()
+    acct_filter = (
+        f"AND i.Accounts_Id IN ({','.join(str(int(x)) for x in account_ids)})"
+        if account_ids else ""
+    )
+    df = pd.read_sql(f"""
+        SELECT i.Accounts_Id                                          AS accounts_id,
+               a.Accounts_Name                                        AS account,
+               SUM(CASE
+                     WHEN i.Action IN ('Buy','Reinvest','ShrIn') THEN  i.Quantity
+                     WHEN i.Action IN ('Sell','ShrOut')          THEN -i.Quantity
+                     ELSE 0
+                   END)                                               AS current_qty
+          FROM Investments i
+          JOIN Accounts a ON a.Accounts_Id = i.Accounts_Id
+         WHERE i.Securities_Id = %s
+           AND i.Date < %s
+           AND i.Action IN ('Buy','Sell','Reinvest','ShrIn','ShrOut')
+           {acct_filter}
+         GROUP BY i.Accounts_Id, a.Accounts_Name
+         HAVING SUM(CASE
+                     WHEN i.Action IN ('Buy','Reinvest','ShrIn') THEN  i.Quantity
+                     WHEN i.Action IN ('Sell','ShrOut')          THEN -i.Quantity
+                     ELSE 0
+                   END) <> 0
+         ORDER BY a.Accounts_Name
+    """, conn, params=(securities_id, split_date))
+    conn.close()
+    return df
+
+
 def get_custom_report_data(date_from, date_to, grouping: str,
                            account_ids=None, category_ids=None, payee_names=None,
                            include_transfers=False, security_ids=None,

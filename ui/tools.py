@@ -3,8 +3,8 @@ import streamlit as st
 import pandas as pd
 from database.backup import render_backup_restore
 from database.connection import get_connection
-from database.queries import get_price_anomalies, get_missing_tx_prices, get_investments_with_dummy_prices
-from database.crud import delete_historical_prices, insert_prices_from_transactions, normalize_investment_prices, update_accounts_balances, update_investment_balances
+from database.queries import get_price_anomalies, get_missing_tx_prices, get_investments_with_dummy_prices, get_investment_consistency_data, update_investment_row, get_all_securities, get_split_preview
+from database.crud import delete_historical_prices, insert_prices_from_transactions, normalize_investment_prices, update_accounts_balances, update_investment_balances, apply_stock_split
 from ui.components import copy_df_button
 
 
@@ -871,6 +871,359 @@ def _render_normalize_investments():
         st.caption("Recalculates the Holdings table from Investments data. Run this after normalization to update portfolio quantities and P&L.")
 
 
+def _render_stock_split():
+    """Record a stock split or reverse split as ShrIn / ShrOut delta entries."""
+    st.subheader("Split / Reverse Split")
+    st.caption(
+        "Records a stock split by inserting a **ShrIn** (forward split) or **ShrOut** (reverse split) "
+        "entry for the *delta* shares on the effective date. "
+        "All existing broker records are left untouched. Holdings are refreshed automatically."
+    )
+
+    sec_df = get_all_securities()
+    sec_display = [
+        f"{r['ticker']}  {r['securities_name']}" if r["ticker"] else r["securities_name"]
+        for _, r in sec_df.iterrows()
+    ]
+    sec_id_map = dict(zip(sec_display, sec_df["securities_id"]))
+
+    col1, col2 = st.columns(2)
+    sel_sec = col1.selectbox("Security", ["(select...)"] + sec_display, key="ss_sec")
+    if sel_sec == "(select...)":
+        return
+
+    securities_id = sec_id_map[sel_sec]
+
+    from database.queries import get_all_accounts_for_nwr
+    all_accts = get_all_accounts_for_nwr()
+    acct_name_to_id = dict(zip(all_accts["accounts_name"], all_accts["accounts_id"]))
+    sel_acct_names = col2.multiselect(
+        "Limit to accounts (leave empty = all)",
+        sorted(acct_name_to_id),
+        key="ss_accts",
+    )
+    account_ids = [acct_name_to_id[n] for n in sel_acct_names] or None
+
+    st.markdown("#### Split ratio")
+    rc1, rc2, rc3 = st.columns([1, 1, 3])
+    new_shares = rc1.number_input("New shares", min_value=0.001, value=2.0, step=1.0, key="ss_new")
+    old_shares = rc2.number_input("Old shares", min_value=0.001, value=1.0, step=1.0, key="ss_old")
+    ratio = new_shares / old_shares
+    split_type = "Reverse Split" if new_shares < old_shares else "Stock Split"
+    rc3.markdown(
+        f"<br><span style='font-size:1.1em'>= <b>{ratio:.6g}x</b> ratio | "
+        f"<b>{split_type}</b> ({new_shares:.4g} : {old_shares:.4g})</span>",
+        unsafe_allow_html=True,
+    )
+
+    import datetime
+    split_date = st.date_input("Effective date", value=datetime.date.today(), key="ss_date")
+
+    custom_desc = st.text_input(
+        "Description (leave blank for auto)",
+        value="",
+        key="ss_desc",
+        placeholder=f"{int(new_shares)}:{int(old_shares)} {split_type}",
+    )
+
+    if st.button("Preview", key="ss_preview"):
+        df_prev = get_split_preview(securities_id, split_date, account_ids)
+        st.session_state["ss_preview_df"] = df_prev
+
+    if "ss_preview_df" not in st.session_state:
+        return
+
+    df_prev = st.session_state["ss_preview_df"].copy()
+    if df_prev.empty:
+        st.warning("No holdings found for this security before the selected date.")
+        return
+
+    is_forward = new_shares >= old_shares
+    action_label = "ShrIn" if is_forward else "ShrOut"
+    df_prev["delta_qty"] = df_prev["current_qty"].apply(
+        lambda q: round(q * (ratio - 1), 6) if is_forward else round(q * (1 - ratio), 6)
+    )
+    df_prev["new_total"] = df_prev["current_qty"] + (df_prev["delta_qty"] if is_forward else -df_prev["delta_qty"])
+    df_prev["action"] = action_label
+
+    st.markdown(f"The following **{action_label}** entries will be inserted on **{split_date}**:")
+    st.dataframe(
+        df_prev[["account", "current_qty", "delta_qty", "new_total", "action"]],
+        column_config={
+            "account":     st.column_config.TextColumn("Account"),
+            "current_qty": st.column_config.NumberColumn("Current Qty", format="%.6f"),
+            "delta_qty":   st.column_config.NumberColumn(f"{action_label} Qty (delta)", format="%.6f"),
+            "new_total":   st.column_config.NumberColumn("New Total Qty", format="%.6f"),
+            "action":      st.column_config.TextColumn("Action"),
+        },
+        hide_index=True,
+        use_container_width=True,
+    )
+
+    st.divider()
+    confirm_col, apply_col, _ = st.columns([2, 1, 3])
+    confirmed = confirm_col.checkbox("I understand, apply the split", key="ss_confirm")
+    if apply_col.button("Apply", type="primary", key="ss_apply", disabled=not confirmed):
+        try:
+            holdings = df_prev[["accounts_id", "current_qty"]].to_dict("records")
+            desc = custom_desc.strip() or ""
+            n = apply_stock_split(
+                securities_id=securities_id,
+                split_date=split_date,
+                new_shares=new_shares,
+                old_shares=old_shares,
+                holdings_by_account=holdings,
+                description=desc,
+            )
+            st.success(f"Done: {n} {action_label} row(s) inserted. Holdings refreshed.")
+            st.session_state.pop("ss_preview_df", None)
+            st.session_state["ss_confirm"] = False
+            st.rerun()
+        except Exception as e:
+            st.error(f"Error: {e}")
+
+
+def _render_investment_data_quality():
+    """Investment data consistency / anomaly checker with inline edit & save."""
+    from database.queries import get_all_accounts_for_nwr
+
+    st.subheader("🩺 Investment Data Quality")
+    st.caption(
+        "Detects anomalies in Quantity × Price, Commission, Total (Acc/Sec ccy) and FX Rate. "
+        "Edit any field inline and click **Save Changes** to persist."
+    )
+
+    # ── Anomaly detection helper (used twice: pre-filter + display) ───────────
+    ATOL   = 0.10
+    PTOL   = 0.005
+    TRADEABLE = {"Buy", "Sell", "Reinvest", "ShrIn", "ShrOut"}
+
+    def _detect(row):
+        issues, recs = [], []
+        qty     = row["quantity"]   or 0.0
+        price   = row["price"]      or 0.0
+        comm_raw = row["commission"] or 0.0   # signed (usually negative)
+        comm     = abs(comm_raw)              # unsigned, used for tolerance
+        t_acc   = row["total_acc"]
+        t_sec   = row["total_sec"]
+        fx      = row["fx_rate"]    or 1.0
+        action  = row["action"]
+        same    = row["acc_currency"] == row["sec_currency"]
+        notional = qty * price
+
+        if t_acc is None:
+            issues.append("NULL total_acc")
+            if t_sec is not None:
+                recs.append(f"Set total_acc = {t_sec * fx:.2f} (total_sec × fx)")
+        if t_sec is None and qty and price and action in TRADEABLE:
+            issues.append("NULL total_sec")
+            recs.append(f"Set total_sec ≈ {notional:.2f} (qty × price)")
+
+        if same and abs(fx - 1.0) > 0.001:
+            issues.append(f"Same ccy but FX_Rate={fx:.4f}")
+            recs.append("Set FX_Rate = 1.0")
+        if not same and fx and abs(fx - 1.0) < 0.001:
+            issues.append(f"Cross-ccy ({row['sec_currency']}/{row['acc_currency']}) but FX_Rate=1.0")
+            recs.append("Look up correct FX rate for trade date")
+
+        if t_acc is not None and t_sec is not None and fx:
+            expected_acc = t_sec * fx
+            delta = abs(t_acc - expected_acc)
+            tol   = max(ATOL, abs(expected_acc) * PTOL)
+            if delta > tol:
+                issues.append(f"total_acc ({t_acc:.2f}) != total_sec x fx ({expected_acc:.2f}), delta={delta:.2f}")
+                recs.append(
+                    f"Set total_acc = {expected_acc:.2f}"
+                    f"  OR  fx = {(t_acc / t_sec):.6f}"
+                    f"  OR  total_sec = {(t_acc / fx):.8f}"
+                )
+
+        if t_sec is not None and qty and price and action in TRADEABLE:
+            diff = abs(t_sec - notional)
+            tol  = max(ATOL, comm + abs(notional) * PTOL)
+            if diff > tol:
+                issues.append(f"total_sec ({t_sec:.2f}) != qty x price ({notional:.2f}), delta={diff:.2f}")
+                expected_sec = notional + comm_raw if action in ("Buy","ShrIn","Reinvest") \
+                               else max(0.0, notional + comm_raw)
+                recs.append(f"Expected total_sec ~= {expected_sec:.2f}")
+
+        if action in TRADEABLE:
+            if not qty:
+                issues.append("Quantity is 0 / NULL")
+            if not price:
+                issues.append("Price is 0 / NULL")
+
+        return "; ".join(issues) if issues else "", "; ".join(recs) if recs else ""
+
+    # ── Load ALL data first to detect which accounts have findings ────────────
+    with st.spinner("Scanning all investment records…"):
+        df_all = get_investment_consistency_data(account_ids=None)
+
+    if df_all.empty:
+        st.info("No investment records found.")
+        return
+
+    df_all[["anomalies", "recommendations"]] = df_all.apply(
+        _detect, axis=1, result_type="expand"
+    )
+
+    # Accounts that have at least one anomaly (honour the exclude-zero-price preference)
+    _excl_zero = st.session_state.get("ic_excl_zero_price", True)
+    df_all_anom = df_all["anomalies"].copy()
+    if _excl_zero:
+        df_all_anom = df_all_anom.str.replace(
+            r"(?:;\s*)?Price is 0 / NULL", "", regex=True
+        ).str.replace(r"^;\s*", "", regex=True).str.strip("; ")
+    accts_with_findings = set(
+        df_all.loc[df_all_anom != "", "account"].unique()
+    )
+
+    # Build account map from full data (not from get_all_accounts_for_nwr)
+    all_accts_df = get_all_accounts_for_nwr()
+    acct_name_to_id = dict(zip(all_accts_df["accounts_name"], all_accts_df["accounts_id"]))
+
+    # Only show accounts with at least one finding
+    selectable_accts = sorted(a for a in accts_with_findings if a in acct_name_to_id)
+
+    # ── Filters ──────────────────────────────────────────────────────────────
+    f1, f2, f3, f4 = st.columns(4)
+
+    sel_acct_names = f1.multiselect(
+        "Accounts (with findings only)",
+        selectable_accts,
+        key="ic_accts",
+        help="Only accounts that have at least one anomaly are listed here.",
+    )
+    account_ids = [acct_name_to_id[n] for n in sel_acct_names] or None
+
+    all_actions = ["Buy","Sell","Dividend","IntInc","RtrnCap",
+                   "CashIn","CashOut","MiscExp","Reinvest","ShrIn","ShrOut"]
+    sel_actions = f2.multiselect("Actions", all_actions, key="ic_actions")
+
+    anomalies_only = f3.toggle("Anomalies only", value=True, key="ic_anom_only")
+    exclude_zero_price = f4.toggle("Exclude 'Price is 0 / NULL'", value=True, key="ic_excl_zero_price")
+
+    if st.button("🔍 Run Check", type="primary", key="ic_run"):
+        _df = get_investment_consistency_data(account_ids)
+        _df[["anomalies", "recommendations"]] = _df.apply(_detect, axis=1, result_type="expand")
+        st.session_state["ic_df_raw"] = _df
+
+    if "ic_df_raw" not in st.session_state:
+        # Show summary metrics from the pre-scanned full data
+        n_total  = len(df_all)
+        n_issues = (df_all["anomalies"] != "").sum()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total records", n_total)
+        c2.metric("⚠️ Anomalies",  n_issues)
+        c3.metric("✅ Clean",       n_total - n_issues)
+        st.info("Select accounts / actions above and click **Run Check** to view details.")
+        return
+
+    df = st.session_state["ic_df_raw"].copy()
+    # Re-apply detection in case session state was stored without anomaly columns
+    if "anomalies" not in df.columns:
+        df[["anomalies", "recommendations"]] = df.apply(_detect, axis=1, result_type="expand")
+    if sel_actions:
+        df = df[df["action"].isin(sel_actions)]
+    if account_ids:
+        df = df[df["account"].isin(sel_acct_names)]
+
+    if df.empty:
+        st.info("No investment records found for the selected filters.")
+        return
+
+    if exclude_zero_price:
+        df["anomalies"] = df["anomalies"].str.replace(
+            r"(?:;\s*)?Price is 0 / NULL", "", regex=True
+        ).str.replace(r"^;\s*", "", regex=True).str.strip("; ")
+
+    df_show = df if not anomalies_only else df[df["anomalies"] != ""]
+
+    n_total  = len(df)
+    n_issues = (df["anomalies"] != "").sum()
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total records", n_total)
+    c2.metric("⚠️ Anomalies",  n_issues)
+    c3.metric("✅ Clean",       n_total - n_issues)
+
+    if df_show.empty:
+        st.success("No anomalies found — all investment records look consistent!")
+        return
+
+    st.markdown(f"Showing **{len(df_show)}** record(s).")
+
+    edit_cols = ["investments_id", "date", "account", "security", "action",
+                 "quantity", "price", "commission",
+                 "total_acc", "total_sec", "fx_rate",
+                 "acc_currency", "sec_currency",
+                 "anomalies", "recommendations"]
+    df_edit = df_show[edit_cols].copy()
+    df_edit["date"] = df_edit["date"].dt.strftime("%Y-%m-%d")
+
+    edited = st.data_editor(
+        df_edit,
+        disabled=["investments_id", "date", "account", "security", "action",
+                  "acc_currency", "sec_currency", "anomalies", "recommendations"],
+        column_config={
+            "investments_id":  st.column_config.NumberColumn("ID",           format="%d", width="small"),
+            "date":            st.column_config.TextColumn("Date",           width="small"),
+            "account":         st.column_config.TextColumn("Account"),
+            "security":        st.column_config.TextColumn("Security"),
+            "action":          st.column_config.TextColumn("Action",         width="small"),
+            "quantity":        st.column_config.NumberColumn("Qty",           format="%.6f"),
+            "price":           st.column_config.NumberColumn("Price",         format="%.6f"),
+            "commission":      st.column_config.NumberColumn("Commission",    format="%.4f"),
+            "total_acc":       st.column_config.NumberColumn("Total (acc)",   format="%.4f"),
+            "total_sec":       st.column_config.NumberColumn("Total (sec)",   format="%.4f"),
+            "fx_rate":         st.column_config.NumberColumn("FX Rate",       format="%.6f"),
+            "acc_currency":    st.column_config.TextColumn("Acc Ccy",         width="small"),
+            "sec_currency":    st.column_config.TextColumn("Sec Ccy",         width="small"),
+            "anomalies":       st.column_config.TextColumn("⚠️ Anomalies",    width="large"),
+            "recommendations": st.column_config.TextColumn("💡 Recommendations", width="large"),
+        },
+        hide_index=True,
+        use_container_width=True,
+        key="ic_editor",
+        num_rows="fixed",
+    )
+
+    copy_df_button(df_edit, key="dl_ic_report")
+
+    _editable = ["quantity", "price", "commission", "total_acc", "total_sec", "fx_rate"]
+
+    def _has_changes():
+        for col in _editable:
+            orig = df_edit[col].fillna(0.0)
+            curr = edited[col].fillna(0.0)
+            if not orig.equals(curr):
+                return True
+        return False
+
+    if st.button("💾 Save Changes", key="ic_save", disabled=not _has_changes()):
+        saved, errors = 0, []
+        for i, row in edited.iterrows():
+            orig = df_edit.loc[i]
+            changes = {}
+            for col in _editable:
+                ov = orig[col]
+                nv = row[col]
+                if pd.isna(ov) and pd.isna(nv):
+                    continue
+                if pd.isna(ov) != pd.isna(nv) or (not pd.isna(ov) and abs(float(ov) - float(nv)) > 1e-9):
+                    changes[col] = None if pd.isna(nv) else float(nv)
+            if changes:
+                try:
+                    update_investment_row(int(row["investments_id"]), changes)
+                    saved += 1
+                except Exception as e:
+                    errors.append(f"Row {i+1} (ID {int(row['investments_id'])}): {e}")
+        for e in errors:
+            st.error(e)
+        if saved:
+            st.success(f"Saved {saved} row(s). Re-run the check to refresh anomaly flags.")
+            st.session_state.pop("ic_df_raw", None)
+
+
 def _render_fix_missing_transfer_mirrors():
     st.subheader("🔄 Fix Missing Transfer Mirrors")
     st.caption(
@@ -1181,6 +1534,222 @@ def _render_fix_missing_transfer_mirrors():
             f"Balances recalculated for {len(affected_accounts)} account(s)."
         )
         st.rerun()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 2 — Unlinked existing mirror pairs
+    # Both legs exist independently but are not linked via Transfers_Id.
+    # Source tx has Accounts_Id_Target + Transfers_Id set; a candidate on the
+    # target account matches by date + |amount| but lacks the same Transfers_Id.
+    # Fix = UPDATE the candidate: stamp Transfers_Id + set Accounts_Id_Target.
+    # ══════════════════════════════════════════════════════════════════════════
+    st.divider()
+    st.subheader("🔗 Unlinked Transfer Pairs")
+    st.caption(
+        "Finds cases where **both legs already exist** but are not linked — the source "
+        "transaction has `Accounts_Id_Target` and `Transfers_Id` set, while the matching "
+        "transaction on the target account has no `Transfers_Id` back-link. "
+        "Matching is done by **date + absolute amount**. "
+        "The fix **updates** the existing target transaction (stamps `Transfers_Id` and "
+        "`Accounts_Id_Target`) — no new rows are created."
+    )
+
+    UNLINKED_SQL = """
+        SELECT
+            t.transactions_id                   AS src_tx_id,
+            a_src.accounts_name                 AS source_account,
+            t.accounts_id                       AS src_acc_id,
+            t.date,
+            COALESCE(p.payees_name, '')          AS payee,
+            t.description,
+            t.total_amount                      AS source_amount,
+            t.total_amount_target,
+            a_tgt.accounts_name                 AS target_account,
+            t.accounts_id_target                AS tgt_acc_id,
+            t.transfers_id,
+            cand.transactions_id                AS candidate_tx_id,
+            cand.total_amount                   AS candidate_amount,
+            cand.description                    AS candidate_desc
+        FROM  Transactions t
+        JOIN  Accounts a_src ON a_src.accounts_id = t.accounts_id
+        JOIN  Accounts a_tgt ON a_tgt.accounts_id = t.accounts_id_target
+        LEFT  JOIN Payees p  ON p.payees_id        = t.payees_id
+        -- Confirm the proper mirror (same Transfers_Id on target) is missing
+        LEFT  JOIN Transactions mirror
+               ON  mirror.transfers_id    = t.transfers_id
+               AND mirror.accounts_id     = t.accounts_id_target
+               AND mirror.transactions_id != t.transactions_id
+        -- Find a candidate on the target account matching by date + |amount|
+        JOIN  Transactions cand
+               ON  cand.accounts_id       = t.accounts_id_target
+               AND cand.date              = t.date
+               AND ABS(cand.total_amount) = ABS(COALESCE(t.total_amount_target, t.total_amount))
+               AND cand.transactions_id  != t.transactions_id
+               AND (cand.transfers_id IS NULL OR cand.transfers_id != t.transfers_id)
+        WHERE t.accounts_id_target IS NOT NULL
+          AND t.transfers_id       IS NOT NULL
+          AND mirror.transactions_id IS NULL
+          AND NOT (
+              a_src.accounts_type IN ('Brokerage','Pension','Other Investment','Margin')
+              AND a_src.accounts_id_linked IS NOT NULL
+          )
+          AND NOT (
+              a_tgt.accounts_type IN ('Brokerage','Pension','Other Investment','Margin')
+              AND a_tgt.accounts_id_linked IS NOT NULL
+          )
+        ORDER BY t.date DESC, t.transactions_id DESC
+    """
+
+    conn2 = get_connection()
+    df_ul = pd.read_sql(UNLINKED_SQL, conn2)
+    conn2.close()
+
+    if df_ul.empty:
+        st.success("✅ No unlinked transfer pairs found.")
+    else:
+        # Account filter
+        ul_tgt_names = df_ul[["tgt_acc_id","target_account"]].drop_duplicates().set_index("tgt_acc_id")["target_account"].to_dict()
+        ul_filter = st.selectbox(
+            "Filter by target account:",
+            options=[None] + sorted(df_ul["tgt_acc_id"].unique().tolist()),
+            format_func=lambda x: "All accounts" if x is None else ul_tgt_names.get(x, str(x)),
+            key="ul_mirror_filter",
+        )
+        df_ul_view = df_ul[df_ul["tgt_acc_id"] == ul_filter] if ul_filter is not None else df_ul
+        st.warning(f"⚠️ {len(df_ul_view):,} unlinked pair(s) found.")
+
+        df_ul_display = df_ul_view.copy()
+        df_ul_display["date"] = pd.to_datetime(df_ul_display["date"]).dt.date
+        df_ul_display.insert(0, "Link", False)
+
+        edited_ul = st.data_editor(
+            df_ul_display[[
+                "Link", "src_tx_id", "date", "source_account", "payee",
+                "description", "source_amount",
+                "target_account", "candidate_tx_id", "candidate_amount", "candidate_desc",
+                "transfers_id",
+            ]],
+            column_config={
+                "Link":            st.column_config.CheckboxColumn("Link", default=False, pinned=True),
+                "src_tx_id":       st.column_config.NumberColumn("Source TX", format="%d"),
+                "date":            st.column_config.DateColumn("Date"),
+                "source_account":  st.column_config.TextColumn("Source Account"),
+                "payee":           st.column_config.TextColumn("Payee"),
+                "description":     st.column_config.TextColumn("Description"),
+                "source_amount":   st.column_config.NumberColumn("Source Amount", format="%,.2f"),
+                "target_account":  st.column_config.TextColumn("Target Account"),
+                "candidate_tx_id": st.column_config.NumberColumn("Candidate TX", format="%d"),
+                "candidate_amount":st.column_config.NumberColumn("Candidate Amount", format="%,.2f"),
+                "candidate_desc":  st.column_config.TextColumn("Candidate Description"),
+                "transfers_id":    st.column_config.NumberColumn("Transfers_Id"),
+            },
+            disabled=[
+                "src_tx_id","date","source_account","payee","description",
+                "source_amount","target_account","candidate_tx_id",
+                "candidate_amount","candidate_desc","transfers_id",
+            ],
+            hide_index=True,
+            use_container_width=True,
+            key="ul_mirror_editor",
+        )
+
+        copy_df_button(df_ul_display.drop(columns=["Link"]), key="dl_ul_mirror")
+
+        to_link     = edited_ul[edited_ul["Link"]]
+        ul_sel_count = len(to_link)
+
+        lc1, lc2, _ = st.columns([2, 2, 3])
+        link_sel_btn = lc1.button(
+            f"🔗 Link {ul_sel_count:,} Selected" if ul_sel_count else "🔗 Link Selected",
+            disabled=(ul_sel_count == 0),
+            key="ul_link_sel_btn",
+            width="stretch",
+        )
+        link_all_btn = False
+        if ul_filter is not None:
+            link_all_btn = lc2.button(
+                f"🔗 Link All {len(df_ul_view):,} for this Account",
+                type="primary",
+                key="ul_link_all_btn",
+                width="stretch",
+            )
+
+        if link_sel_btn and ul_sel_count > 0:
+            st.session_state["ul_mirror_pending"] = {
+                "pairs": list(zip(to_link["src_tx_id"], to_link["candidate_tx_id"],
+                                  to_link["transfers_id"], to_link["src_acc_id"],
+                                  to_link["tgt_acc_id"])),
+                "label": f"link **{ul_sel_count:,}** selected pair(s)",
+            }
+            st.rerun()
+
+        if link_all_btn:
+            st.session_state["ul_mirror_pending"] = {
+                "pairs": list(zip(df_ul_view["src_tx_id"], df_ul_view["candidate_tx_id"],
+                                  df_ul_view["transfers_id"], df_ul_view["src_acc_id"],
+                                  df_ul_view["tgt_acc_id"])),
+                "label": f"link **{len(df_ul_view):,}** pair(s) for this account",
+            }
+            st.rerun()
+
+        ul_pending = st.session_state.get("ul_mirror_pending")
+        if ul_pending:
+            n_ul = len(ul_pending["pairs"])
+            st.warning(
+                f"⚠️ Please confirm: {ul_pending['label']}.\n\n"
+                f"This will **UPDATE** {n_ul:,} existing transaction(s) on the target account "
+                "to stamp `Transfers_Id` and `Accounts_Id_Target`. "
+                "**This action cannot be undone automatically.**"
+            )
+            ul_yes, ul_no, _ = st.columns([1, 1, 4])
+            with ul_yes:
+                ul_confirmed = st.button("✅ Yes, link", type="primary",
+                                         key="ul_confirm_yes", width="stretch")
+            with ul_no:
+                if st.button("❌ Cancel", key="ul_confirm_no", width="stretch"):
+                    del st.session_state["ul_mirror_pending"]
+                    st.rerun()
+
+            if ul_confirmed:
+                del st.session_state["ul_mirror_pending"]
+                ul_linked, ul_errors = 0, []
+                ul_affected: set[int] = set()
+                conn3 = get_connection()
+                cur3  = conn3.cursor()
+                try:
+                    for src_id, cand_id, xfr_id, src_acc, tgt_acc in ul_pending["pairs"]:
+                        try:
+                            # Stamp the candidate with the source's Transfers_Id
+                            # and set Accounts_Id_Target pointing back to source
+                            cur3.execute("""
+                                UPDATE Transactions
+                                   SET Transfers_Id       = %s,
+                                       Accounts_Id_Target = %s
+                                 WHERE Transactions_Id    = %s
+                            """, (int(xfr_id), int(src_acc), int(cand_id)))
+                            ul_linked += 1
+                            ul_affected.add(int(src_acc))
+                            ul_affected.add(int(tgt_acc))
+                        except Exception as row_err:
+                            ul_errors.append(f"Pair ({src_id}↔{cand_id}): {row_err}")
+                    conn3.commit()
+                except Exception as outer:
+                    conn3.rollback()
+                    st.error(f"❌ Commit failed: {outer}")
+                finally:
+                    cur3.close()
+                    conn3.close()
+
+                for acc_id in ul_affected:
+                    update_accounts_balances(acc_id)
+
+                for e in ul_errors:
+                    st.warning(e)
+                if ul_linked:
+                    st.success(
+                        f"✅ Linked {ul_linked:,} pair(s). "
+                        f"Balances recalculated for {len(ul_affected)} account(s)."
+                    )
+                    st.rerun()
 
 
 def _render_fix_missing_investment_cash_links():
@@ -2055,6 +2624,7 @@ _CATEGORIES = {
         "📥 Fill Missing Prices",
         "🔍 Price Quality",
         "⚖ Normalize Investments",
+        "🩺 Investment Data Quality",
     ],
     "📋 Logs": [
         "📋 Log Viewer",
@@ -2071,6 +2641,7 @@ _TOOL_RENDERERS = {
     "📥 Fill Missing Prices":           _render_fill_missing_prices,
     "🔍 Price Quality":                 _render_price_quality,
     "⚖ Normalize Investments":         _render_normalize_investments,
+    "🩺 Investment Data Quality":       _render_investment_data_quality,
     "📋 Log Viewer":                    _render_log_viewer,
 }
 
