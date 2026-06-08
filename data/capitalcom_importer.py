@@ -118,11 +118,14 @@ def _build_investment_records(trades_df: pd.DataFrame, funds_df: pd.DataFrame) -
         buy_total = 0.0
         open_qty  = 0.0
 
+        open_fx_sum = 0.0
+
         for _, cr in closes.iterrows():
             exec_id   = cr['Exec Id']
             close_qty = abs(cr['Quantity'])
             # Rpl Converted is in EUR; use funds Amount when available (more precise)
             pnl_eur   = exec_pnl.get(exec_id, cr['Rpl Converted'])
+            # fx = sec_currency per EUR (e.g. USD per EUR)
             fx        = _fx_rate(cr['rpl'], cr['Rpl Converted'],
                                  cr.get('Swap', 0.0), cr.get('Swap Converted', 0.0),
                                  currency)
@@ -134,29 +137,38 @@ def _build_investment_records(trades_df: pd.DataFrame, funds_df: pd.DataFrame) -
             else:
                 buy_total += close_notional + pnl_eur   # short-open proceeds
             open_qty  += close_qty
+            open_fx_sum += fx * close_qty
 
+            # FX_Rate DB convention: acc_cur per sec_cur (EUR per USD) = 1/fx
+            db_fx = round(1.0 / fx, 6) if fx and currency != 'EUR' else 1.0
             records.append({
                 'record_type': 'investment',
                 'desc':     f'{_CAP_PREFIX}CLOSE|{exec_id}',
                 'symbol':   symbol,
                 'name':     name,
+                'currency': currency,
                 'date':     cr['Date'],
                 'action':   'Sell' if is_long else 'Buy',
                 'quantity': round(close_qty, 6),
                 'price':    round(cr['Price'], 4),
                 'total_eur': round(close_notional, 2),
+                'fx_rate':  db_fx,
             })
 
+        # Weighted-average FX rate for the open record
+        open_db_fx = round(1.0 / (open_fx_sum / open_qty), 6) if open_qty and currency != 'EUR' else 1.0
         records.append({
             'record_type': 'investment',
             'desc':     f'{_CAP_PREFIX}OPEN|{trade_id}',
             'symbol':   symbol,
             'name':     name,
+            'currency': currency,
             'date':     open_row['Date'],
             'action':   'Buy' if is_long else 'Sell',
             'quantity': round(open_qty, 6),
             'price':    round(open_row['Price'], 4),
             'total_eur': round(max(buy_total, 0.0), 2),
+            'fx_rate':  open_db_fx,
         })
 
     return records
@@ -456,9 +468,11 @@ def run_import(
                 _scr = cur.fetchone()
                 _sec_cur_id = int(_scr[0]) if _scr and _scr[0] else None
                 _cap_total  = rec['total_eur']
+                _explicit_fx = rec.get('fx_rate')
                 if _cap_total is not None and _cap_total != 0:
                     _cap_sec, _cap_fx = resolve_investment_fx(
                         cur, _cap_total, _acc_cur_id, _sec_cur_id, rec['date'],
+                        explicit_fx_rate=_explicit_fx,
                     )
                 else:
                     _cap_sec, _cap_fx = _cap_total, 1.0

@@ -2204,7 +2204,7 @@ def render_reports():
 
     elif hist_sub_menu == "Securities & Portfolio Analysis":
         # 1. Tabs
-        tab_change, tab_volat, tab_inv_signals, tab_port_signals = st.tabs(["📈 Price Change %", "🌊 Volatility", "🎯 Investment Signals", "📢 Portfolio Action Signals"])
+        tab_change, tab_volat, tab_inv_signals, tab_port_signals, tab_perf = st.tabs(["📈 Price Change %", "🌊 Volatility", "🎯 Investment Signals", "📢 Portfolio Action Signals", "🏆 Performance"])
 
         # Sidebar: Refresh button only — account filter removed (all securities shown,
         # filtering is handled per-tab via the Portfolio Action Signals options).
@@ -2532,6 +2532,7 @@ def render_reports():
             copy_df_button(df_rec, key="dl_rpt_signals")
 
             # Update buttons
+
             # Custom CSS to center the "Update All" button row and add spacing
             st.markdown("""
                 <style>
@@ -2587,8 +2588,168 @@ def render_reports():
 
 
 
- 
- 
+        with tab_perf:
+            st.subheader("🏆 Top & Least Performing Securities")
+
+            # ── Period selector ───────────────────────────────────────────────
+            _perf_period_map = {
+                "All-Time":  ("pnl_net_all_time_eur",     "pnl_net_all_time_percent",  "gross_invested_all_time_eur"),
+                "YTD":       ("pnl_ytd_eur",              "pnl_ytd_percent",            None),
+                "QTD":       ("pnl_qtd_eur",              None,                         None),
+                "MTD":       ("pnl_mtd_eur",              None,                         None),
+                "WTD":       ("pnl_wtd_eur",              None,                         None),
+            }
+            _pc1, _pc2 = st.columns([3, 1])
+            with _pc1:
+                _perf_period = st.radio(
+                    "Period:", list(_perf_period_map.keys()),
+                    horizontal=True, key="perf_period_radio",
+                )
+            with _pc2:
+                _perf_top_n = st.number_input(
+                    "Top N", min_value=3, max_value=50, value=15, step=1,
+                    key="perf_top_n",
+                )
+
+            _pnl_col, _pct_col, _inv_col = _perf_period_map[_perf_period]
+
+            # ── Fetch & aggregate across accounts ────────────────────────────
+            _pnl_df_raw = get_pnl_report_data()
+            if _pnl_df_raw.empty:
+                st.info("No investment data found.")
+            else:
+                # Aggregate by security (sum EUR amounts; weighted-avg % from totals)
+                _agg: dict = {
+                    "current_value_eur":          "sum",
+                    "gross_invested_all_time_eur": "sum",
+                    "pnl_net_all_time_eur":        "sum",
+                    "unrealized_pnl_eur":          "sum",
+                    "realized_pnl_eur":            "sum",
+                    "pnl_ytd_eur":                 "sum",
+                    "pnl_qtd_eur":                 "sum",
+                    "pnl_mtd_eur":                 "sum",
+                    "pnl_wtd_eur":                 "sum",
+                }
+                _pnl_df = (
+                    _pnl_df_raw
+                    .groupby("securities_name", as_index=False)
+                    .agg({k: v for k, v in _agg.items() if k in _pnl_df_raw.columns})
+                )
+
+                # Recompute % for all-time from aggregated sums
+                if "gross_invested_all_time_eur" in _pnl_df.columns:
+                    _pnl_df["pnl_net_all_time_percent"] = (
+                        _pnl_df["pnl_net_all_time_eur"] /
+                        _pnl_df["gross_invested_all_time_eur"].replace(0, float("nan"))
+                        * 100
+                    )
+                # Recompute YTD % from aggregated sums
+                if "pnl_ytd_eur" in _pnl_df.columns and "gross_invested_all_time_eur" in _pnl_df.columns:
+                    _pnl_df["pnl_ytd_percent"] = (
+                        _pnl_df["pnl_ytd_eur"] /
+                        _pnl_df["gross_invested_all_time_eur"].replace(0, float("nan"))
+                        * 100
+                    )
+
+                # Select the metric column for this period
+                if _pnl_col not in _pnl_df.columns:
+                    st.warning(f"Column '{_pnl_col}' not available.")
+                else:
+                    _df_valid = _pnl_df.dropna(subset=[_pnl_col]).copy()
+
+                    # Build display columns
+                    _display_cols = ["securities_name", _pnl_col]
+                    _col_cfg: dict = {
+                        "securities_name": st.column_config.TextColumn("Security"),
+                        _pnl_col: st.column_config.NumberColumn("P&L (€)", format="%+,.2f €"),
+                    }
+                    if _pct_col and _pct_col in _pnl_df.columns:
+                        _display_cols.append(_pct_col)
+                        _col_cfg[_pct_col] = st.column_config.NumberColumn("Return %", format="%+.2f%%")
+                    if _inv_col and _inv_col in _pnl_df.columns:
+                        _display_cols.append(_inv_col)
+                        _col_cfg[_inv_col] = st.column_config.NumberColumn("Invested (€)", format="%,.2f €")
+
+                    _top    = _df_valid.nlargest(int(_perf_top_n), _pnl_col)
+                    _bottom = _df_valid.nsmallest(int(_perf_top_n), _pnl_col)
+
+                    # ── Summary metrics ───────────────────────────────────────
+                    _sm1, _sm2, _sm3, _sm4 = st.columns(4)
+                    with _sm1:
+                        st.metric("Securities", len(_df_valid))
+                    with _sm2:
+                        _total_pnl = _df_valid[_pnl_col].sum()
+                        st.metric(f"Total P&L ({_perf_period})", f"€{_total_pnl:+,.0f}",
+                                  delta_color="normal")
+                    with _sm3:
+                        st.metric("Winners", int((_df_valid[_pnl_col] > 0).sum()))
+                    with _sm4:
+                        st.metric("Losers", int((_df_valid[_pnl_col] < 0).sum()))
+
+                    st.divider()
+
+                    # ── Tables side-by-side ───────────────────────────────────
+                    _tcol, _lcol = st.columns(2)
+                    with _tcol:
+                        st.success(f"📈 Top {int(_perf_top_n)} Performers")
+                        st.dataframe(
+                            _top[_display_cols],
+                            column_config=_col_cfg,
+                            hide_index=True,
+                            use_container_width=True,
+                        )
+                        copy_df_button(_top, key="dl_rpt_top_perf")
+
+                    with _lcol:
+                        st.error(f"📉 Least {int(_perf_top_n)} Performers")
+                        st.dataframe(
+                            _bottom[_display_cols],
+                            column_config=_col_cfg,
+                            hide_index=True,
+                            use_container_width=True,
+                        )
+                        copy_df_button(_bottom, key="dl_rpt_bot_perf")
+
+                    st.divider()
+
+                    # ── Bar chart — combined top + bottom ─────────────────────
+                    _chart_df = pd.concat([_top, _bottom]).drop_duplicates("securities_name")
+                    _chart_df = _chart_df.sort_values(_pnl_col, ascending=True)
+                    _chart_df["_color"] = _chart_df[_pnl_col].apply(
+                        lambda v: "gain" if v >= 0 else "loss"
+                    )
+                    _fig_bar = px.bar(
+                        _chart_df,
+                        x=_pnl_col,
+                        y="securities_name",
+                        orientation="h",
+                        color="_color",
+                        color_discrete_map={"gain": "#2ecc71", "loss": "#e74c3c"},
+                        labels={
+                            _pnl_col: f"P&L (€) — {_perf_period}",
+                            "securities_name": "",
+                            "_color": "",
+                        },
+                        title=f"Top & Least Performers — {_perf_period} P&L (€)",
+                    )
+                    _fig_bar.update_layout(showlegend=False, yaxis={"categoryorder": "total ascending"})
+                    pf_plotly_chart(_fig_bar)
+
+                    # ── Full ranked table ─────────────────────────────────────
+                    with st.expander("📋 All Securities Ranked", expanded=False):
+                        _all_ranked = _df_valid.sort_values(_pnl_col, ascending=False)
+                        _all_ranked["Rank"] = range(1, len(_all_ranked) + 1)
+                        _full_cols = ["Rank"] + _display_cols
+                        _full_cfg  = {"Rank": st.column_config.NumberColumn("Rank", format="%d"), **_col_cfg}
+                        st.dataframe(
+                            _all_ranked[_full_cols],
+                            column_config=_full_cfg,
+                            hide_index=True,
+                            use_container_width=True,
+                        )
+                        copy_df_button(_all_ranked, key="dl_rpt_all_perf")
+
+
     elif hist_sub_menu == "Income & Expense":
         render_income_expense_reports()
 
