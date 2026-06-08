@@ -2455,7 +2455,7 @@ def render_reports():
 
             # 2. Top Efficiency Picks Table
             st.markdown("### 🏆 Top Efficiency Picks (High Sharpe Ratio)")
-            top_picks = df_data.sort_values("sharpe_ratio", ascending=False).head(10)
+            top_picks = df_data.sort_values("sharpe_ratio", ascending=False).head(20)
             
             st.dataframe(
                 top_picks[['securities_name', 'annual_chg_pct', 'vol_1y_ann', 'sharpe_ratio', 'quality_score']],

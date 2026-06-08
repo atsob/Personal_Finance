@@ -538,6 +538,73 @@ def _render_transaction_table(acc_id, payee_options, acc_options, cat_options, t
             st.rerun()
 
 
+@st.dialog("🔍 Transaction Search Results", width="large")
+def _search_dialog(query: str) -> None:
+    """Full-text search across payee, description, memo, category, and account name."""
+    from database.connection import get_connection as _gc
+
+    term = f"%{query.strip()}%"
+
+    conn = _gc()
+    df_res = pd.read_sql("""
+        SELECT DISTINCT
+               t.Transactions_Id                      AS id,
+               t.Date                                 AS date,
+               a.Accounts_Name                        AS account,
+               p.Payees_Name                          AS payee,
+               t.Description                          AS description,
+               t.Total_Amount                         AS amount,
+               t.Cleared                              AS cleared,
+               STRING_AGG(DISTINCT c.Categories_Name, ', ')  AS categories,
+               STRING_AGG(DISTINCT s.Memo,            ', ')  AS memos
+          FROM Transactions t
+          LEFT JOIN Accounts    a ON a.Accounts_Id    = t.Accounts_Id
+          LEFT JOIN Payees      p ON p.Payees_Id      = t.Payees_Id
+          LEFT JOIN Splits      s ON s.Transactions_Id = t.Transactions_Id
+          LEFT JOIN Categories  c ON c.Categories_Id  = s.Categories_Id
+         WHERE t.Description   ILIKE %(term)s
+            OR p.Payees_Name   ILIKE %(term)s
+            OR a.Accounts_Name ILIKE %(term)s
+            OR s.Memo          ILIKE %(term)s
+            OR c.Categories_Name ILIKE %(term)s
+         GROUP BY t.Transactions_Id, t.Date, a.Accounts_Name,
+                  p.Payees_Name, t.Description, t.Total_Amount, t.Cleared
+         ORDER BY t.Date DESC, t.Transactions_Id DESC
+         LIMIT 500
+    """, conn, params={"term": term})
+    conn.close()
+
+    st.caption(f'Results for **"{query}"** — {len(df_res):,} transaction(s) found (max 500)')
+
+    if df_res.empty:
+        st.info("No transactions matched your search.")
+        return
+
+    df_res["date"] = pd.to_datetime(df_res["date"]).dt.strftime("%Y-%m-%d")
+    df_res["amount"] = df_res["amount"].astype(float)
+
+    st.dataframe(
+        df_res,
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "id":          st.column_config.NumberColumn("ID",          width="small"),
+            "date":        st.column_config.TextColumn("Date",          width="small"),
+            "account":     st.column_config.TextColumn("Account"),
+            "payee":       st.column_config.TextColumn("Payee"),
+            "description": st.column_config.TextColumn("Description"),
+            "amount":      st.column_config.NumberColumn("Amount",      format="%,.2f", width="small"),
+            "cleared":     st.column_config.CheckboxColumn("Clr",       width="small"),
+            "categories":  st.column_config.TextColumn("Categories"),
+            "memos":       st.column_config.TextColumn("Memos"),
+        },
+        column_order=["id","date","account","payee","description","amount","cleared","categories","memos"],
+    )
+
+    total = df_res["amount"].sum()
+    st.caption(f"Sum of matched amounts: **{total:,.2f}**")
+
+
 @st.dialog("💰 Accounts Balance Overview", width="large")
 def _multi_account_dialog() -> None:
     """Compact balance overview for all active bank/cash/investment accounts.
@@ -1980,8 +2047,25 @@ def render_register():
  #   df_accs = st.session_state.df_accs
 
 
-    # 1. Add the Checkbox
-    show_inactive = st.checkbox("Display Inactive Accounts", value=False)
+    # 1. Top bar: inactive toggle (left) + transaction search (right)
+    _top_chk_col, _top_srch_col, _top_srch_btn_col = st.columns([2, 2.5, 0.5])
+    with _top_chk_col:
+        show_inactive = st.checkbox("Display Inactive Accounts", value=False)
+    with _top_srch_col:
+        _search_query = st.text_input(
+            "Search transactions",
+            placeholder="Payee, description, category…",
+            key="reg_search_query",
+            label_visibility="collapsed",
+        )
+    with _top_srch_btn_col:
+        _search_clicked = st.button("🔍", key="reg_search_btn",
+                                    help="Search across all accounts",
+                                    use_container_width=True)
+    if _search_clicked and _search_query.strip():
+        _search_dialog(_search_query)
+    elif _search_clicked:
+        st.toast("Please enter a search term first.", icon="⚠️")
 
     # 2. Check if the preference has changed to clear the cache
     if "last_show_inactive" not in st.session_state:

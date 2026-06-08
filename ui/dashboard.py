@@ -120,12 +120,12 @@ def _render_pending_review_banner():
             splits_sum  = row.get('splits_summary') or '—'
 
             c_date, c_amt, c_acc, c_payee, c_splits, c_tmpl, c_confirm, c_discard = st.columns(
-                [1.1, 1.1, 1.4, 1.4, 2.5, 1.6, 0.9, 0.9]
+                [1.5, 1.1, 1.4, 1.4, 2.5, 1.6, 0.9, 0.9]
             )
 
             with c_date:
                 new_date = st.date_input(
-                    "Date", value=tx_date,
+                    "Date", value=tx_date, format="DD/MM/YYYY",
                     key=f"dash_date_{tx_id}", label_visibility="collapsed"
                 )
             with c_amt:
