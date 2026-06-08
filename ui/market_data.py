@@ -6,6 +6,7 @@ from database.crud import (
     save_changes, save_changes_no_serial, save_changes_mid,
     delete_historical_prices, insert_prices_from_transactions, normalize_investment_prices,
     apply_stock_split,
+    apply_writeoff,
 )
 from database.queries import get_price_anomalies, get_split_preview, get_all_accounts_for_nwr, get_corporate_actions
 from ui.components import copy_df_button
@@ -963,13 +964,7 @@ def render_market_data():
 
             # ── Corporate Actions tab ─────────────────────────────────────────
             with st_corp:
-                st.subheader("🏢 Corporate Actions — Stock Split / Reverse Split")
-                st.caption(
-                    "Records a split by inserting a **ShrIn** (forward split) or **ShrOut** "
-                    "(reverse split) entry for the delta shares on the effective date. "
-                    "All existing broker-imported records are left untouched. "
-                    "Holdings are refreshed automatically after applying."
-                )
+                st.subheader("🏢 Corporate Actions")
 
                 # ── History ───────────────────────────────────────────────────
                 df_ca = get_corporate_actions(inv_sec_id)
@@ -999,7 +994,21 @@ def render_market_data():
                     )
                 st.divider()
 
-                # Account filter
+                # ── Event type selector ───────────────────────────────────────
+                import datetime
+
+                sec_name = selected_inv_sec.get("securities_name", "")
+                ticker = selected_inv_sec.get("ticker", "") or ""
+                sec_label = ticker if ticker else sec_name
+
+                corp_event_type = st.radio(
+                    "Event type",
+                    ["Stock Split / Reverse Split", "Default / Delisting"],
+                    horizontal=True,
+                    key=f"corp_event_type_{inv_sec_id}",
+                )
+
+                # Account filter (shared by both event types)
                 all_accts = get_all_accounts_for_nwr()
                 acct_name_to_id = dict(zip(all_accts["accounts_name"], all_accts["accounts_id"]))
                 sel_acct_names = st.multiselect(
@@ -1009,111 +1018,199 @@ def render_market_data():
                 )
                 account_ids = [acct_name_to_id[n] for n in sel_acct_names] or None
 
-                st.markdown("#### Split ratio")
-                rc1, rc2 = st.columns(2)
-                new_shares = rc1.number_input(
-                    "New shares", min_value=0.001, value=2.0, step=1.0,
-                    key=f"corp_new_{inv_sec_id}",
-                )
-                old_shares = rc2.number_input(
-                    "Old shares", min_value=0.001, value=1.0, step=1.0,
-                    key=f"corp_old_{inv_sec_id}",
-                )
-                ratio = new_shares / old_shares
-                is_forward = new_shares >= old_shares
-                split_type = "Stock Split" if is_forward else "Reverse Split"
-                action_label = "ShrIn" if is_forward else "ShrOut"
+                # ── Branch: Split ─────────────────────────────────────────────
+                if corp_event_type == "Stock Split / Reverse Split":
+                    st.caption(
+                        "Records a split by inserting a **ShrIn** (forward split) or **ShrOut** "
+                        "(reverse split) entry for the delta shares on the effective date. "
+                        "All existing broker-imported records are left untouched."
+                    )
 
-                sec_name = selected_inv_sec.get("securities_name", "")
-                ticker = selected_inv_sec.get("ticker", "") or ""
-                sec_label = ticker if ticker else sec_name
+                    st.markdown("#### Split ratio")
+                    rc1, rc2 = st.columns(2)
+                    new_shares = rc1.number_input(
+                        "New shares", min_value=0.001, value=2.0, step=1.0,
+                        key=f"corp_new_{inv_sec_id}",
+                    )
+                    old_shares = rc2.number_input(
+                        "Old shares", min_value=0.001, value=1.0, step=1.0,
+                        key=f"corp_old_{inv_sec_id}",
+                    )
+                    ratio = new_shares / old_shares
+                    is_forward = new_shares >= old_shares
+                    action_label = "ShrIn" if is_forward else "ShrOut"
 
-                # Build default description from inputs
-                if is_forward:
-                    auto_desc = f"{sec_label} {int(new_shares)}-for-{int(old_shares)} Stock Split"
-                else:
-                    auto_desc = f"{sec_label} {int(old_shares)}-for-{int(new_shares)} Reverse Split"
-
-                import datetime
-                split_date = st.date_input(
-                    "Effective date", value=datetime.date.today(),
-                    key=f"corp_date_{inv_sec_id}",
-                )
-                description = st.text_input(
-                    "Description",
-                    value=auto_desc,
-                    key=f"corp_desc_{inv_sec_id}_{int(new_shares)}_{int(old_shares)}",
-                    help="Auto-filled from the ratio above. Edit if needed.",
-                )
-
-                st.divider()
-                if st.button("Preview", key=f"corp_preview_btn_{inv_sec_id}"):
-                    df_prev = get_split_preview(inv_sec_id, split_date, account_ids)
-                    st.session_state[f"corp_preview_df_{inv_sec_id}"] = df_prev
-
-                if f"corp_preview_df_{inv_sec_id}" in st.session_state:
-                    df_prev = st.session_state[f"corp_preview_df_{inv_sec_id}"].copy()
-                    if df_prev.empty:
-                        st.warning(
-                            "No holdings found for this security before the selected date "
-                            "in the chosen accounts."
-                        )
+                    if is_forward:
+                        auto_desc = f"{sec_label} {int(new_shares)}-for-{int(old_shares)} Stock Split"
                     else:
-                        # Recompute delta with current ratio (inputs may have changed)
-                        if is_forward:
-                            df_prev["delta_qty"] = (df_prev["current_qty"] * (ratio - 1)).round(6)
+                        auto_desc = f"{sec_label} {int(old_shares)}-for-{int(new_shares)} Reverse Split"
+
+                    split_date = st.date_input(
+                        "Effective date", value=datetime.date.today(),
+                        min_value=datetime.date(1900, 1, 1),
+                        key=f"corp_date_{inv_sec_id}",
+                    )
+                    description = st.text_input(
+                        "Description",
+                        value=auto_desc,
+                        key=f"corp_desc_{inv_sec_id}_{int(new_shares)}_{int(old_shares)}",
+                        help="Auto-filled from the ratio above. Edit if needed.",
+                    )
+
+                    st.divider()
+                    if st.button("Preview", key=f"corp_preview_btn_{inv_sec_id}"):
+                        df_prev = get_split_preview(inv_sec_id, split_date, account_ids)
+                        st.session_state[f"corp_preview_df_{inv_sec_id}"] = df_prev
+
+                    if f"corp_preview_df_{inv_sec_id}" in st.session_state:
+                        df_prev = st.session_state[f"corp_preview_df_{inv_sec_id}"].copy()
+                        if df_prev.empty:
+                            st.warning(
+                                "No holdings found for this security before the selected date "
+                                "in the chosen accounts."
+                            )
                         else:
-                            df_prev["delta_qty"] = (df_prev["current_qty"] * (1 - ratio)).round(6)
-                        df_prev["new_total"] = (
-                            df_prev["current_qty"] + df_prev["delta_qty"]
-                            if is_forward
-                            else df_prev["current_qty"] - df_prev["delta_qty"]
-                        )
-                        df_prev["action"] = action_label
+                            if is_forward:
+                                df_prev["delta_qty"] = (df_prev["current_qty"] * (ratio - 1)).round(6)
+                            else:
+                                df_prev["delta_qty"] = (df_prev["current_qty"] * (1 - ratio)).round(6)
+                            df_prev["new_total"] = (
+                                df_prev["current_qty"] + df_prev["delta_qty"]
+                                if is_forward
+                                else df_prev["current_qty"] - df_prev["delta_qty"]
+                            )
+                            df_prev["action"] = action_label
 
-                        st.markdown(
-                            f"The following **{action_label}** entr{'ies' if len(df_prev)>1 else 'y'} "
-                            f"will be inserted on **{split_date}**:"
-                        )
-                        st.dataframe(
-                            df_prev[["account", "current_qty", "delta_qty", "new_total", "action"]],
-                            column_config={
-                                "account":     st.column_config.TextColumn("Account"),
-                                "current_qty": st.column_config.NumberColumn("Current Qty", format="%.6f"),
-                                "delta_qty":   st.column_config.NumberColumn(f"{action_label} Qty", format="%.6f"),
-                                "new_total":   st.column_config.NumberColumn("New Total Qty", format="%.6f"),
-                                "action":      st.column_config.TextColumn("Action", width="small"),
-                            },
-                            hide_index=True,
-                            use_container_width=True,
-                        )
+                            st.markdown(
+                                f"The following **{action_label}** entr{'ies' if len(df_prev)>1 else 'y'} "
+                                f"will be inserted on **{split_date}**:"
+                            )
+                            st.dataframe(
+                                df_prev[["account", "current_qty", "delta_qty", "new_total", "action"]],
+                                column_config={
+                                    "account":     st.column_config.TextColumn("Account"),
+                                    "current_qty": st.column_config.NumberColumn("Current Qty",    format="%.6f"),
+                                    "delta_qty":   st.column_config.NumberColumn(f"{action_label} Qty", format="%.6f"),
+                                    "new_total":   st.column_config.NumberColumn("New Total Qty",  format="%.6f"),
+                                    "action":      st.column_config.TextColumn("Action", width="small"),
+                                },
+                                hide_index=True,
+                                use_container_width=True,
+                            )
 
-                        st.divider()
-                        confirmed = st.checkbox(
-                            "I understand this cannot be undone — apply the split",
-                            key=f"corp_confirm_{inv_sec_id}",
-                        )
-                        if st.button(
-                            "Apply", type="primary",
-                            key=f"corp_apply_{inv_sec_id}",
-                            disabled=not confirmed,
-                        ):
-                            try:
-                                holdings = df_prev[["accounts_id", "current_qty"]].to_dict("records")
-                                n = apply_stock_split(
-                                    securities_id=inv_sec_id,
-                                    split_date=split_date,
-                                    new_shares=new_shares,
-                                    old_shares=old_shares,
-                                    holdings_by_account=holdings,
-                                    description=description.strip(),
-                                )
-                                st.success(
-                                    f"Done: {n} {action_label} row(s) inserted. "
-                                    "Holdings have been refreshed."
-                                )
-                                st.session_state.pop(f"corp_preview_df_{inv_sec_id}", None)
-                                st.session_state[f"corp_confirm_{inv_sec_id}"] = False
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"Error applying split: {e}")
+                            st.divider()
+                            confirmed = st.checkbox(
+                                "I understand this cannot be undone — apply the split",
+                                key=f"corp_confirm_{inv_sec_id}",
+                            )
+                            if st.button(
+                                "Apply", type="primary",
+                                key=f"corp_apply_{inv_sec_id}",
+                                disabled=not confirmed,
+                            ):
+                                try:
+                                    holdings = df_prev[["accounts_id", "current_qty"]].to_dict("records")
+                                    n = apply_stock_split(
+                                        securities_id=inv_sec_id,
+                                        split_date=split_date,
+                                        new_shares=new_shares,
+                                        old_shares=old_shares,
+                                        holdings_by_account=holdings,
+                                        description=description.strip(),
+                                    )
+                                    st.success(
+                                        f"Done: {n} {action_label} row(s) inserted. "
+                                        "Holdings have been refreshed."
+                                    )
+                                    st.session_state.pop(f"corp_preview_df_{inv_sec_id}", None)
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Error applying split: {e}")
+
+                # ── Branch: Default / Delisting ───────────────────────────────
+                else:
+                    st.caption(
+                        "Records a company default or delisting by inserting a **ShrOut** for "
+                        "the **full remaining quantity** in each account, bringing the position "
+                        "to zero. All existing broker-imported records are left untouched."
+                    )
+
+                    wo_action_type = st.selectbox(
+                        "Event type",
+                        ["Default", "Delisting"],
+                        key=f"corp_wo_type_{inv_sec_id}",
+                    )
+                    wo_date = st.date_input(
+                        "Effective date", value=datetime.date.today(),
+                        min_value=datetime.date(1900, 1, 1),
+                        key=f"corp_wo_date_{inv_sec_id}",
+                    )
+                    auto_wo_desc = f"{sec_label} — {wo_action_type}"
+                    wo_description = st.text_input(
+                        "Description",
+                        value=auto_wo_desc,
+                        key=f"corp_wo_desc_{inv_sec_id}_{wo_action_type}",
+                        help="Auto-filled. Edit if needed.",
+                    )
+
+                    st.divider()
+                    if st.button("Preview", key=f"corp_wo_preview_btn_{inv_sec_id}"):
+                        df_wo_prev = get_split_preview(inv_sec_id, wo_date, account_ids)
+                        st.session_state[f"corp_wo_preview_df_{inv_sec_id}"] = df_wo_prev
+
+                    if f"corp_wo_preview_df_{inv_sec_id}" in st.session_state:
+                        df_wo_prev = st.session_state[f"corp_wo_preview_df_{inv_sec_id}"].copy()
+                        if df_wo_prev.empty:
+                            st.warning(
+                                "No holdings found for this security before the selected date "
+                                "in the chosen accounts."
+                            )
+                        else:
+                            df_wo_prev["shrout_qty"] = df_wo_prev["current_qty"].round(6)
+                            df_wo_prev["new_total"]  = 0.0
+                            df_wo_prev["action"]     = "ShrOut"
+
+                            st.markdown(
+                                f"The following **ShrOut** entr{'ies' if len(df_wo_prev)>1 else 'y'} "
+                                f"will be inserted on **{wo_date}** (position → 0):"
+                            )
+                            st.dataframe(
+                                df_wo_prev[["account", "current_qty", "shrout_qty", "new_total", "action"]],
+                                column_config={
+                                    "account":     st.column_config.TextColumn("Account"),
+                                    "current_qty": st.column_config.NumberColumn("Current Qty",  format="%.6f"),
+                                    "shrout_qty":  st.column_config.NumberColumn("ShrOut Qty",   format="%.6f"),
+                                    "new_total":   st.column_config.NumberColumn("New Total Qty", format="%.6f"),
+                                    "action":      st.column_config.TextColumn("Action", width="small"),
+                                },
+                                hide_index=True,
+                                use_container_width=True,
+                            )
+
+                            st.divider()
+                            wo_confirmed = st.checkbox(
+                                "I understand this cannot be undone — write off all shares to zero",
+                                key=f"corp_wo_confirm_{inv_sec_id}",
+                            )
+                            if st.button(
+                                "Apply", type="primary",
+                                key=f"corp_wo_apply_{inv_sec_id}",
+                                disabled=not wo_confirmed,
+                            ):
+                                try:
+                                    holdings = df_wo_prev[["accounts_id", "current_qty"]].to_dict("records")
+                                    n = apply_writeoff(
+                                        securities_id=inv_sec_id,
+                                        event_date=wo_date,
+                                        action_type=wo_action_type,
+                                        holdings_by_account=holdings,
+                                        description=wo_description.strip(),
+                                    )
+                                    st.success(
+                                        f"Done: {n} ShrOut row(s) inserted. "
+                                        "Holdings have been refreshed."
+                                    )
+                                    st.session_state.pop(f"corp_wo_preview_df_{inv_sec_id}", None)
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Error applying write-off: {e}")

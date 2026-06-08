@@ -1252,6 +1252,67 @@ def apply_stock_split(
         conn.close()
 
 
+# WRITE-OFF  (Default / Delisting)
+
+
+def apply_writeoff(
+    securities_id: int,
+    event_date,
+    action_type: str,          # 'Default' | 'Delisting'
+    holdings_by_account: list,
+    description: str = "",
+) -> int:
+    """
+    Write off all remaining shares of a security to zero by inserting a ShrOut
+    for the full current quantity per account, and recording a Corporate_Actions
+    event of type 'Default' or 'Delisting'.
+
+    holdings_by_account: list of dicts with keys accounts_id, current_qty.
+
+    Returns the number of ShrOut rows inserted.
+    """
+    label = description or f"{action_type} — shares written off to zero"
+
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        # 1. Insert Corporate_Actions event record
+        cur.execute("""
+            INSERT INTO Corporate_Actions
+                (Securities_Id, Action_Type, Effective_Date,
+                 Ratio_New, Ratio_Old, Description)
+            VALUES (%s, %s::corporate_action_type, %s, NULL, NULL, %s)
+        """, (securities_id, action_type, event_date, label))
+
+        # 2. Insert a ShrOut for the full position per account
+        inserted = 0
+        for row in holdings_by_account:
+            acct_id = int(row["accounts_id"])
+            current_qty = float(row["current_qty"])
+            if current_qty <= 0:
+                continue
+
+            cur.execute("""
+                INSERT INTO Investments
+                    (Accounts_Id, Securities_Id, Date, Action,
+                     Quantity, Price_Per_Share, Commission,
+                     Total_Amount_AccCur, Total_Amount_SecCur, FX_Rate,
+                     Description)
+                VALUES (%s, %s, %s, 'ShrOut', %s, 0, 0, 0, 0, 1, %s)
+            """, (acct_id, securities_id, event_date, current_qty, label))
+            inserted += 1
+
+        conn.commit()
+        update_holdings()
+        return inserted
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
 
 # =============================================================================
 # RECURRING TEMPLATES
