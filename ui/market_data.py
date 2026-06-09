@@ -8,7 +8,10 @@ from database.crud import (
     apply_stock_split,
     apply_writeoff,
 )
-from database.queries import get_price_anomalies, get_split_preview, get_all_accounts_for_nwr, get_corporate_actions
+from database.queries import (get_price_anomalies, get_split_preview, get_all_accounts_for_nwr,
+                               get_corporate_actions, get_watchlist, add_watchlist_item,
+                               remove_watchlist_item, get_alerts, save_alert, delete_alert,
+                               toggle_alert, get_asset_allocation_data)
 from ui.components import copy_df_button
 from data.downloaders import (
     download_historical_fx,
@@ -70,7 +73,7 @@ def render_market_data():
              price anomaly detection, and dummy-price normalization.
     """
     st.title("Market Data")
-    t_curr, t_sec = st.tabs(["💱 Currencies", "📈 Securities"])
+    t_curr, t_sec, t_watch, t_alerts = st.tabs(["💱 Currencies", "📈 Securities", "👀 Watchlist", "🔔 Alerts"])
 
     # ── Shared lookups (all cached) ───────────────────────────────────────────
     df_curr_list = _md_load_currencies()
@@ -1214,3 +1217,354 @@ def render_market_data():
                                     st.rerun()
                                 except Exception as e:
                                     st.error(f"Error applying write-off: {e}")
+
+    # =========================================================================
+    # TAB 3 — WATCHLIST
+    # =========================================================================
+    with t_watch:
+        st.subheader("👀 Watchlist")
+        st.caption(
+            "Track securities you're considering buying. "
+            "Set a target entry price and/or a stop-loss to monitor distance."
+        )
+
+        df_wl = get_watchlist()
+
+        if not df_wl.empty:
+            # ── colour helpers ────────────────────────────────────────────────
+            def _colour_pct(val):
+                if val is None or (isinstance(val, float) and pd.isna(val)):
+                    return ''
+                return 'color:#E74C3C' if float(val) > 0 else 'color:#27AE60'
+
+            def _colour_upside(val):
+                if val is None or (isinstance(val, float) and pd.isna(val)):
+                    return ''
+                return 'color:#27AE60' if float(val) > 0 else 'color:#E74C3C'
+
+            _display_cols = [
+                'securities_name', 'securities_type', 'ticker', 'currency',
+                'current_price', 'price_date',
+                'target_price', 'pct_from_target',
+                'stop_loss', 'pct_from_stop',
+                'analyst_target', 'upside_to_analyst',
+                'dividend_yield', 'already_held', 'note', 'added_date',
+            ]
+            st.dataframe(
+                df_wl[_display_cols].style
+                    .map(_colour_pct,    subset=['pct_from_target', 'pct_from_stop'])
+                    .map(_colour_upside, subset=['upside_to_analyst']),
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    'securities_name':   st.column_config.TextColumn('Security'),
+                    'securities_type':   st.column_config.TextColumn('Type'),
+                    'ticker':            st.column_config.TextColumn('Ticker'),
+                    'currency':          st.column_config.TextColumn('Ccy'),
+                    'current_price':     st.column_config.NumberColumn('Current Price', format='%,.4f'),
+                    'price_date':        st.column_config.DateColumn('Price Date', format='DD/MM/YYYY'),
+                    'target_price':      st.column_config.NumberColumn('Target Entry', format='%,.4f'),
+                    'pct_from_target':   st.column_config.NumberColumn('% vs Target',  format='%+.2f%%',
+                                             help='Positive = price is above your target (expensive); '
+                                                  'Negative = price is below target (on sale).'),
+                    'stop_loss':         st.column_config.NumberColumn('Stop Loss',    format='%,.4f'),
+                    'pct_from_stop':     st.column_config.NumberColumn('% vs Stop',    format='%+.2f%%',
+                                             help='Negative = price is below stop-loss.'),
+                    'analyst_target':    st.column_config.NumberColumn('Analyst Target', format='%,.4f'),
+                    'upside_to_analyst': st.column_config.NumberColumn('Upside %',     format='%+.2f%%'),
+                    'dividend_yield':    st.column_config.NumberColumn('Div Yield %',  format='%.2f%%'),
+                    'already_held':      st.column_config.CheckboxColumn('In Portfolio'),
+                    'note':              st.column_config.TextColumn('Note'),
+                    'added_date':        st.column_config.DateColumn('Added', format='DD/MM/YYYY'),
+                },
+            )
+
+            # ── Remove button ─────────────────────────────────────────────────
+            with st.expander("🗑️ Remove from Watchlist"):
+                names = df_wl['securities_name'].tolist()
+                to_remove = st.selectbox("Select security to remove", names,
+                                         key="wl_remove_sel")
+                if st.button("Remove", key="wl_remove_btn", type="secondary"):
+                    wid = int(df_wl[df_wl['securities_name'] == to_remove]['watchlist_id'].iloc[0])
+                    remove_watchlist_item(wid)
+                    st.success(f"{to_remove} removed from watchlist.")
+                    st.rerun()
+        else:
+            st.info("Your watchlist is empty. Add securities below.")
+
+        # ── Add to Watchlist ──────────────────────────────────────────────────
+        st.divider()
+        st.markdown("#### ➕ Add to Watchlist")
+
+        # Use the already-loaded securities list
+        sec_opts = df_sec_list.set_index('securities_id')['securities_name'].to_dict()
+        # Exclude already-watched
+        watched_ids = set(df_wl['securities_id'].tolist()) if not df_wl.empty else set()
+        avail = {k: v for k, v in sec_opts.items() if k not in watched_ids}
+
+        if avail:
+            add_col1, add_col2, add_col3 = st.columns(3)
+            with add_col1:
+                sel_add = st.selectbox(
+                    "Security", options=list(avail.keys()),
+                    format_func=lambda x: avail[x],
+                    key="wl_add_sec",
+                )
+            with add_col2:
+                wl_target = st.number_input("Target Entry Price (optional)",
+                                            min_value=0.0, value=0.0, step=0.01,
+                                            format="%.4f", key="wl_add_target")
+                wl_stop   = st.number_input("Stop Loss Price (optional)",
+                                            min_value=0.0, value=0.0, step=0.01,
+                                            format="%.4f", key="wl_add_stop")
+            with add_col3:
+                wl_note = st.text_area("Note (optional)", key="wl_add_note", height=98)
+
+            if st.button("➕ Add to Watchlist", key="wl_add_btn", type="primary"):
+                add_watchlist_item(
+                    securities_id=sel_add,
+                    target_price=wl_target if wl_target > 0 else None,
+                    stop_loss=wl_stop   if wl_stop   > 0 else None,
+                    note=wl_note.strip() or None,
+                )
+                st.success(f"{avail[sel_add]} added to watchlist.")
+                st.rerun()
+        else:
+            st.info("All securities are already on your watchlist.")
+
+    # =========================================================================
+    # TAB 4 — ALERTS
+    # =========================================================================
+    with t_alerts:
+        st.subheader("🔔 Alerts")
+        st.caption(
+            "Active alerts are checked every time you open the Dashboard and shown as banners. "
+            "Supported types: **Price Above**, **Price Below**, **Allocation Drift**."
+        )
+
+        df_alerts = get_alerts()
+
+        if not df_alerts.empty:
+            _TYPE_LABEL = {
+                'price_above':      '🔔 Above',
+                'price_below':      '🔻 Below',
+                'allocation_drift': '⚖️ Drift',
+            }
+            _ALERT_TYPES = {
+                'price_above':      '🔔 Price Above Threshold',
+                'price_below':      '🔻 Price Below Threshold',
+                'allocation_drift': '⚖️ Allocation Drift from Target',
+            }
+            sec_opts = df_sec_list.set_index('securities_id')['securities_name'].to_dict()
+
+            # Header row
+            hc = st.columns([2, 3, 1.5, 1.5, 1.5, 2, 1, 1, 1])
+            for col, hdr in zip(hc, ['Type', 'Security / Asset Type', 'Threshold',
+                                      'Current Price', 'Price Date', 'Note', '', '', '']):
+                col.markdown(f"<small><b>{hdr}</b></small>", unsafe_allow_html=True)
+            st.divider()
+
+            for _, row in df_alerts.iterrows():
+                aid    = int(row['alert_id'])
+                active = bool(row['is_active'])
+                label  = _TYPE_LABEL.get(str(row['alert_type']), str(row['alert_type']))
+
+                if row['alert_type'] in ('price_above', 'price_below'):
+                    subject = row.get('securities_name') or '—'
+                else:
+                    subject = row.get('asset_type') or '—'
+
+                thr = f"{float(row['threshold']):,.4f}" if row['threshold'] is not None else '—'
+
+                cur_px = row.get('current_price')
+                px_str = f"{float(cur_px):,.4f}" if cur_px is not None else '—'
+
+                px_date = row.get('price_date')
+                pd_str  = pd.Timestamp(px_date).strftime('%d/%m/%Y') if px_date is not None else '—'
+
+                note = row.get('note') or ''
+                dim  = '' if active else 'opacity:0.45;'
+
+                c1, c2, c3, c4, c5, c6, c7, c8, c9 = st.columns([2, 3, 1.5, 1.5, 1.5, 2, 1, 1, 1])
+                c1.markdown(f"<span style='{dim}'>{label}</span>", unsafe_allow_html=True)
+                c2.markdown(f"<span style='{dim}'>{subject}</span>", unsafe_allow_html=True)
+                c3.markdown(f"<span style='{dim}'>`{thr}`</span>", unsafe_allow_html=True)
+                c4.markdown(f"<span style='{dim}'>`{px_str}`</span>", unsafe_allow_html=True)
+                c5.markdown(f"<span style='{dim}'>{pd_str}</span>", unsafe_allow_html=True)
+                c6.markdown(f"<span style='{dim};font-style:italic'>{note}</span>",
+                            unsafe_allow_html=True)
+                with c7:
+                    tog_label = "✅" if active else "⏸"
+                    if st.button(tog_label, key=f"alert_tog_{aid}",
+                                 help="Toggle active/inactive"):
+                        toggle_alert(aid, not active)
+                        st.rerun()
+                with c8:
+                    if st.button("✏️", key=f"alert_edit_btn_{aid}", help="Edit alert"):
+                        current = st.session_state.get("alert_editing")
+                        st.session_state["alert_editing"] = None if current == aid else aid
+                        st.rerun()
+                with c9:
+                    if st.button("🗑️", key=f"alert_del_{aid}", help="Delete alert"):
+                        delete_alert(aid)
+                        st.session_state.pop("alert_editing", None)
+                        st.rerun()
+
+                # ── Inline edit form (shown only for the row being edited) ────
+                if st.session_state.get("alert_editing") == aid:
+                    with st.container(border=True):
+                        st.markdown(f"**Edit Alert #{aid}**")
+                        ea1, ea2 = st.columns(2)
+                        with ea1:
+                            e_type = st.selectbox(
+                                "Type",
+                                options=list(_ALERT_TYPES.keys()),
+                                format_func=lambda x: _ALERT_TYPES[x],
+                                index=list(_ALERT_TYPES.keys()).index(row['alert_type'])
+                                      if row['alert_type'] in _ALERT_TYPES else 0,
+                                key=f"e_type_{aid}",
+                            )
+                        with ea2:
+                            e_note = st.text_input(
+                                "Note",
+                                value=row.get('note') or '',
+                                key=f"e_note_{aid}",
+                            )
+
+                        e_sec_id = row.get('securities_id')
+                        e_asset  = row.get('asset_type')
+                        e_thresh = float(row['threshold']) if row['threshold'] is not None else 0.0
+
+                        eb1, eb2 = st.columns(2)
+                        if e_type in ('price_above', 'price_below'):
+                            with eb1:
+                                e_sec_id = st.selectbox(
+                                    "Security",
+                                    options=list(sec_opts.keys()),
+                                    format_func=lambda x: sec_opts[x],
+                                    index=(list(sec_opts.keys()).index(int(e_sec_id))
+                                           if e_sec_id and int(e_sec_id) in sec_opts else 0),
+                                    key=f"e_sec_{aid}",
+                                )
+                            with eb2:
+                                e_thresh = st.number_input(
+                                    "Price Threshold",
+                                    min_value=0.0, value=e_thresh,
+                                    step=0.01, format="%.4f",
+                                    key=f"e_thresh_{aid}",
+                                )
+                            e_asset = None
+                            e_dir   = 'above' if e_type == 'price_above' else 'below'
+                        else:
+                            df_alloc_e = get_asset_allocation_data()
+                            asset_types_e = (df_alloc_e['securities_type'].tolist()
+                                             if not df_alloc_e.empty else [])
+                            with eb1:
+                                e_asset = st.selectbox(
+                                    "Asset Type", asset_types_e,
+                                    index=(asset_types_e.index(e_asset)
+                                           if e_asset in asset_types_e else 0),
+                                    key=f"e_asset_{aid}",
+                                ) if asset_types_e else st.text_input(
+                                    "Asset Type", value=e_asset or '',
+                                    key=f"e_asset_{aid}")
+                            with eb2:
+                                e_thresh = st.number_input(
+                                    "Max drift (% points)",
+                                    min_value=0.1, value=e_thresh,
+                                    step=0.5, format="%.1f",
+                                    key=f"e_thresh_{aid}",
+                                )
+                            e_sec_id = None
+                            e_dir    = None
+
+                        save_col, cancel_col = st.columns([1, 5])
+                        if save_col.button("💾 Save", type="primary",
+                                           key=f"e_save_{aid}"):
+                            if e_thresh and e_thresh > 0:
+                                save_alert(
+                                    alert_type=e_type,
+                                    securities_id=e_sec_id,
+                                    asset_type=e_asset,
+                                    threshold=e_thresh,
+                                    direction=e_dir,
+                                    note=e_note.strip() or None,
+                                    alert_id=aid,
+                                )
+                                st.session_state.pop("alert_editing", None)
+                                st.success("Alert updated.")
+                                st.rerun()
+                            else:
+                                st.error("Threshold must be greater than 0.")
+                        if cancel_col.button("Cancel", key=f"e_cancel_{aid}"):
+                            st.session_state.pop("alert_editing", None)
+                            st.rerun()
+        else:
+            st.info("No alerts configured yet.")
+
+        # ── Add new alert ─────────────────────────────────────────────────────
+        st.markdown("#### ➕ New Alert")
+
+        _ALERT_TYPES = {
+            'price_above':      '🔔 Price Above Threshold',
+            'price_below':      '🔻 Price Below Threshold',
+            'allocation_drift': '⚖️ Allocation Drift from Target',
+        }
+        new_type = st.selectbox(
+            "Alert Type",
+            options=list(_ALERT_TYPES.keys()),
+            format_func=lambda x: _ALERT_TYPES[x],
+            key="new_alert_type",
+        )
+
+        na_sec_id = None
+        na_asset  = None
+        na_thresh = None
+        na_dir    = None
+
+        if new_type in ('price_above', 'price_below'):
+            # Reuse the already-loaded securities list
+            sec_opts = df_sec_list.set_index('securities_id')['securities_name'].to_dict()
+            na_sec_id = st.selectbox(
+                "Security",
+                options=list(sec_opts.keys()),
+                format_func=lambda x: sec_opts[x],
+                key="new_alert_sec",
+            )
+            na_thresh = st.number_input(
+                "Price Threshold (in security's native currency)",
+                min_value=0.0, value=0.0, step=0.01, format="%.4f",
+                key="new_alert_thresh",
+            )
+            na_dir = 'above' if new_type == 'price_above' else 'below'
+
+        elif new_type == 'allocation_drift':
+            df_alloc = get_asset_allocation_data()
+            asset_types = df_alloc['securities_type'].tolist() if not df_alloc.empty else []
+            if asset_types:
+                na_asset = st.selectbox("Asset Type", asset_types,
+                                        key="new_alert_asset")
+            else:
+                st.warning("No holdings found — add assets first.")
+            na_thresh = st.number_input(
+                "Max acceptable drift (% points)",
+                min_value=0.1, value=5.0, step=0.5, format="%.1f",
+                key="new_alert_drift",
+            )
+
+        na_note = st.text_input("Note (optional)", key="new_alert_note")
+
+        if st.button("➕ Add Alert", type="primary", key="new_alert_add_btn"):
+            if na_thresh and na_thresh > 0:
+                save_alert(
+                    alert_type=new_type,
+                    securities_id=na_sec_id,
+                    asset_type=na_asset,
+                    threshold=na_thresh,
+                    direction=na_dir,
+                    note=na_note.strip() or None,
+                )
+                st.success("Alert saved.")
+                st.rerun()
+            else:
+                st.error("Please enter a threshold greater than 0.")

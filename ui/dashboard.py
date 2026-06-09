@@ -2,7 +2,10 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 from ui.components import format_qty_display, color_negative_red, style_qty_display, copy_df_button
-from database.queries import get_hist_net_worth_data, get_transaction_anomalies, get_weekly_summaries, get_all_accounts_for_nwr, get_nwr_account_selection, get_savings_rate_data, get_cash_flow_forecast, get_category_hierarchy
+from database.queries import (get_hist_net_worth_data, get_transaction_anomalies, get_weekly_summaries,
+                               get_all_accounts_for_nwr, get_nwr_account_selection,
+                               get_savings_rate_data, get_cash_flow_forecast, get_category_hierarchy,
+                               check_triggered_alerts)
 from database.connection import get_connection
 from database.crud import update_accounts_balances, update_holdings, update_investment_balances, update_pension_balances, save_nwr_account_selection, get_draft_transactions, confirm_draft_transaction
 from datetime import datetime
@@ -179,6 +182,17 @@ def _render_pending_review_banner():
 def render_dashboard(conn):
     """Render the Dashboard page."""
     st.title("🏛 Net Worth")
+
+    # ── Alert banners ─────────────────────────────────────────────────────
+    try:
+        _triggered = check_triggered_alerts()
+        for _alert in _triggered:
+            if _alert.get('level') == 'error':
+                st.error(_alert['message'])
+            else:
+                st.warning(_alert['message'])
+    except Exception:
+        pass  # alerts are best-effort; never block the dashboard
 
     # ── Pending review banner ─────────────────────────────────────────────
     _render_pending_review_banner()

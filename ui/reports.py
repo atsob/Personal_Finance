@@ -10,8 +10,8 @@ from database.queries import (
     get_net_worth_report_data, get_all_accounts_for_nwr, get_nwr_account_selection,
     get_nwr_security_detail,
     get_pnl_report_data, get_income_expense_data, get_portfolio_signals,
-    get_cash_flow_forecast, get_dividend_tracker_data, get_asset_allocation_data,
-    get_sector_allocation_data, get_allocation_targets, save_allocation_targets,
+    get_cash_flow_forecast, get_dividend_tracker_data, get_dividend_forecast_data, get_asset_allocation_data,
+    get_sector_allocation_data, get_allocation_targets, save_allocation_targets, get_rebalancing_plan,
     get_fx_exposure_data, get_bond_schedule_data,
     get_savings_rate_data,
     upsert_budget, delete_budget, get_budget_vs_actual, get_annual_income,
@@ -1112,8 +1112,8 @@ def render_reports():
 
         _risk_acct_ids = _perf_sel_ids
 
-        tab_report, tab_perf, tab_movers, tab_savings, tab_dividends, tab_bonds, tab_bm, tab_risk, tab_corr, tab_monte, tab_returns = st.tabs([
-            "📊 P&L Report", "🏆 Performance", "🚀 Top Movers", "💰 Savings", "💸 Dividend Tracker",
+        tab_report, tab_perf, tab_savings, tab_dividends, tab_bonds, tab_bm, tab_risk, tab_corr, tab_monte, tab_returns = st.tabs([
+            "📊 P&L Report", "🏆 Performance", "💰 Savings", "💸 Dividend Tracker",
             "📋 Bond Schedule", "📈 Benchmark", "⚡ Risk Metrics", "🔗 Correlation", "🎲 Monte Carlo",
             "📐 TWR / MWR",
         ])
@@ -1716,56 +1716,6 @@ def render_reports():
                 st.error(f"Error: {e}")
                 st.exception(e)
 
-        with tab_movers:
-            st.subheader("🔝 Investment Top Movers (Daily)")
-            
-            mover_col = st.radio(
-                "Sort by:", 
-                ["Daily P&L (€)", "Daily Change (%)"], 
-                horizontal=True,
-                key="mover_sort_radio"
-            )
-            df_pnl = get_pnl_report_data()
-            df_pnl['daily_change_pct'] = (df_pnl['pnl_dtd_eur'] / (df_pnl['current_value_eur'] - df_pnl['pnl_dtd_eur'])) * 100
-            
-            df_movers = df_pnl[['securities_name', 'accounts_name', 'pnl_dtd_eur', 'daily_change_pct']].copy()
-            df_movers.columns = ['Security', 'Account', 'Daily P&L (€)', 'Daily Change (%)']
-            
-            col_to_sort = 'Daily P&L (€)' if mover_col == "Daily P&L (€)" else 'Daily Change (%)'
-            
-            gainer_col, loser_col = st.columns(2)
-            
-            with gainer_col:
-                st.success("📈 Top Gainers")
-                top_gainers = df_movers.sort_values(by=col_to_sort, ascending=False).head(10)
-                st.dataframe(top_gainers.style.format({
-                    'Daily P&L (€)': "{:,.2f} €",
-                    'Daily Change (%)': "{:,.2f}%"
-                }), hide_index=True, width="stretch",
-                column_config={
-                    "securities_name": st.column_config.TextColumn("Security", width="small"),
-                    "accounts_name": st.column_config.TextColumn("Account", width="small"),
-                    "Daily P&L (€)": st.column_config.NumberColumn("P&L (€)", format="%.2f €", width="small"),
-                    "Daily Change (%)": st.column_config.NumberColumn("Day %", format="%.2f%%", width="small"),
-                }
-                )
-                copy_df_button(top_gainers, key="dl_rpt_pnl_gainers")
-
-            with loser_col:
-                st.error("📉 Top Losers")
-                top_losers = df_movers.sort_values(by=col_to_sort, ascending=True).head(10)
-                st.dataframe(top_losers.style.format({
-                    'Daily P&L (€)': "{:,.2f} €",
-                    'Daily Change (%)': "{:,.2f}%"
-                }), hide_index=True, width="stretch",
-                column_config={
-                    "securities_name": st.column_config.TextColumn("Security", width="small"),
-                    "accounts_name": st.column_config.TextColumn("Account", width="small"),
-                    "Daily P&L (€)": st.column_config.NumberColumn("P&L (€)", format="%.2f €", width="small"),
-                    "Daily Change (%)": st.column_config.NumberColumn("Day %", format="%.2f%%", width="small"),
-                }
-                )
-                copy_df_button(top_losers, key="dl_rpt_pnl_losers")
 
         with tab_savings:
             st.subheader("💰 Savings Accounts — Yield over Cost & APY")
@@ -2203,31 +2153,41 @@ def render_reports():
             render_twr_mwr(account_ids=_risk_acct_ids)
 
         with tab_perf:
-            st.subheader("🏆 Top & Least Performing Securities")
+            st.subheader("🏆 Best & Worst Performing Securities")
 
-            # ── Period selector ───────────────────────────────────────────────
-            _perf_period_map = {
-                "All-Time": ("pnl_net_all_time_eur",  "pnl_net_all_time_percent", "gross_invested_all_time_eur"),
-                "YTD":      ("pnl_ytd_eur",           "pnl_ytd_percent",          None),
-                "QTD":      ("pnl_qtd_eur",           None,                       None),
-                "MTD":      ("pnl_mtd_eur",           None,                       None),
-                "WTD":      ("pnl_wtd_eur",           None,                       None),
-            }
-            _pc1, _pc2 = st.columns([3, 1])
+            # ── Controls ──────────────────────────────────────────────────────
+            _pc1, _pc2, _pc3 = st.columns([4, 2, 1])
             with _pc1:
                 _perf_period = st.radio(
-                    "Period:", list(_perf_period_map.keys()),
+                    "Period:",
+                    ["Daily", "WTD", "MTD", "QTD", "YTD", "All-Time"],
                     horizontal=True, key="perf_period_radio",
                 )
             with _pc2:
+                _perf_view = st.radio(
+                    "View by:",
+                    ["€ Change", "% Change"],
+                    horizontal=True, key="perf_view_radio",
+                )
+            with _pc3:
                 _perf_top_n = st.number_input(
                     "Top N", min_value=3, max_value=50, value=15, step=1,
                     key="perf_top_n",
                 )
 
+            # period → (eur_col, pct_col, invested_col)
+            _perf_period_map = {
+                "Daily":    ("pnl_dtd_eur",           "pnl_dtd_pct",              None),
+                "WTD":      ("pnl_wtd_eur",           "pnl_wtd_pct",              None),
+                "MTD":      ("pnl_mtd_eur",           "pnl_mtd_pct",              None),
+                "QTD":      ("pnl_qtd_eur",           "pnl_qtd_pct",              None),
+                "YTD":      ("pnl_ytd_eur",           "pnl_ytd_percent",          None),
+                "All-Time": ("pnl_net_all_time_eur",  "pnl_net_all_time_percent", "gross_invested_all_time_eur"),
+            }
             _pnl_col, _pct_col, _inv_col = _perf_period_map[_perf_period]
+            _sort_by_pct = (_perf_view == "% Change")
 
-            # ── Aggregate df_pnl (already loaded above) by security ──────────
+            # ── Aggregate by security ─────────────────────────────────────────
             if df_pnl is not None and not df_pnl.empty:
                 _agg_cols = {
                     "current_value_eur":          "sum",
@@ -2235,6 +2195,7 @@ def render_reports():
                     "pnl_net_all_time_eur":        "sum",
                     "unrealized_pnl_eur":          "sum",
                     "realized_pnl_eur":            "sum",
+                    "pnl_dtd_eur":                 "sum",
                     "pnl_ytd_eur":                 "sum",
                     "pnl_qtd_eur":                 "sum",
                     "pnl_mtd_eur":                 "sum",
@@ -2246,62 +2207,76 @@ def render_reports():
                     .agg({k: v for k, v in _agg_cols.items() if k in df_pnl.columns})
                 )
 
-                # Recompute % from aggregated sums
+                # ── Recompute % columns from aggregated sums ──────────────────
+                _prev_val = (_pnl_by_sec["current_value_eur"]
+                             - _pnl_by_sec.get("pnl_dtd_eur", 0)).replace(0, float("nan"))
+
+                if "pnl_dtd_eur" in _pnl_by_sec.columns:
+                    _prev = (_pnl_by_sec["current_value_eur"]
+                             - _pnl_by_sec["pnl_dtd_eur"]).replace(0, float("nan"))
+                    _pnl_by_sec["pnl_dtd_pct"] = _pnl_by_sec["pnl_dtd_eur"] / _prev * 100
+
                 if "gross_invested_all_time_eur" in _pnl_by_sec.columns:
-                    _pnl_by_sec["pnl_net_all_time_percent"] = (
-                        _pnl_by_sec["pnl_net_all_time_eur"] /
-                        _pnl_by_sec["gross_invested_all_time_eur"].replace(0, float("nan")) * 100
-                    )
-                    _pnl_by_sec["pnl_ytd_percent"] = (
-                        _pnl_by_sec["pnl_ytd_eur"] /
-                        _pnl_by_sec["gross_invested_all_time_eur"].replace(0, float("nan")) * 100
-                    )
+                    _inv = _pnl_by_sec["gross_invested_all_time_eur"].replace(0, float("nan"))
+                    _pnl_by_sec["pnl_net_all_time_percent"] = _pnl_by_sec["pnl_net_all_time_eur"] / _inv * 100
+                    _pnl_by_sec["pnl_ytd_percent"]          = _pnl_by_sec["pnl_ytd_eur"]          / _inv * 100
+                    _pnl_by_sec["pnl_wtd_pct"]              = _pnl_by_sec["pnl_wtd_eur"]           / _inv * 100
+                    _pnl_by_sec["pnl_mtd_pct"]              = _pnl_by_sec["pnl_mtd_eur"]           / _inv * 100
+                    _pnl_by_sec["pnl_qtd_pct"]              = _pnl_by_sec["pnl_qtd_eur"]           / _inv * 100
 
                 if _pnl_col not in _pnl_by_sec.columns:
                     st.warning(f"Column '{_pnl_col}' not available.")
                 else:
                     _df_valid = _pnl_by_sec.dropna(subset=[_pnl_col]).copy()
 
-                    # Build display column list
-                    _display_cols = ["securities_name", _pnl_col]
+                    # Primary sort column depends on View toggle
+                    _primary = (_pct_col if _sort_by_pct and _pct_col
+                                         and _pct_col in _pnl_by_sec.columns
+                                else _pnl_col)
+
+                    # Build display columns — always show both € and %, lead with primary
+                    _display_cols = ["securities_name"]
                     _col_cfg: dict = {
                         "securities_name": st.column_config.TextColumn("Security"),
-                        _pnl_col: st.column_config.NumberColumn("P&L (€)", format="%+,.2f €"),
                     }
-                    if _pct_col and _pct_col in _pnl_by_sec.columns:
-                        _display_cols.append(_pct_col)
-                        _col_cfg[_pct_col] = st.column_config.NumberColumn("Return %", format="%+.2f%%")
+                    if _sort_by_pct and _pct_col and _pct_col in _pnl_by_sec.columns:
+                        _display_cols += [_pct_col, _pnl_col]
+                        _col_cfg[_pct_col] = st.column_config.NumberColumn("Change %",  format="%+.2f%%")
+                        _col_cfg[_pnl_col] = st.column_config.NumberColumn("P&L (€)",   format="%+,.2f €")
+                    else:
+                        _display_cols += [_pnl_col]
+                        _col_cfg[_pnl_col] = st.column_config.NumberColumn("P&L (€)",   format="%+,.2f €")
+                        if _pct_col and _pct_col in _pnl_by_sec.columns:
+                            _display_cols.append(_pct_col)
+                            _col_cfg[_pct_col] = st.column_config.NumberColumn("Change %", format="%+.2f%%")
                     if _inv_col and _inv_col in _pnl_by_sec.columns:
                         _display_cols.append(_inv_col)
                         _col_cfg[_inv_col] = st.column_config.NumberColumn("Invested (€)", format="%,.2f €")
 
-                    _top    = _df_valid.nlargest(int(_perf_top_n), _pnl_col)
-                    _bottom = _df_valid.nsmallest(int(_perf_top_n), _pnl_col)
+                    _df_sort = _df_valid.dropna(subset=[_primary])
+                    _top    = _df_sort.nlargest(int(_perf_top_n),  _primary)
+                    _bottom = _df_sort.nsmallest(int(_perf_top_n), _primary)
 
                     # ── Summary metrics ───────────────────────────────────────
                     _sm1, _sm2, _sm3, _sm4 = st.columns(4)
-                    with _sm1:
-                        st.metric("Securities", len(_df_valid))
-                    with _sm2:
-                        st.metric(f"Total P&L ({_perf_period})", f"€{_df_valid[_pnl_col].sum():+,.0f}")
-                    with _sm3:
-                        st.metric("Winners", int((_df_valid[_pnl_col] > 0).sum()))
-                    with _sm4:
-                        st.metric("Losers", int((_df_valid[_pnl_col] < 0).sum()))
+                    _sm1.metric("Securities", len(_df_valid))
+                    _sm2.metric(f"Total P&L ({_perf_period})", f"€ {_df_valid[_pnl_col].sum():+,.2f}")
+                    _sm3.metric("Winners", int((_df_valid[_pnl_col] > 0).sum()))
+                    _sm4.metric("Losers",  int((_df_valid[_pnl_col] < 0).sum()))
 
                     st.divider()
 
                     # ── Tables side-by-side ───────────────────────────────────
                     _tcol, _lcol = st.columns(2)
                     with _tcol:
-                        st.success(f"📈 Top {int(_perf_top_n)} Performers")
+                        st.success(f"📈 Top {int(_perf_top_n)} Gainers")
                         st.dataframe(
                             _top[_display_cols], column_config=_col_cfg,
                             hide_index=True, use_container_width=True,
                         )
                         copy_df_button(_top, key="dl_rpt_top_perf")
                     with _lcol:
-                        st.error(f"📉 Least {int(_perf_top_n)} Performers")
+                        st.error(f"📉 Top {int(_perf_top_n)} Losers")
                         st.dataframe(
                             _bottom[_display_cols], column_config=_col_cfg,
                             hide_index=True, use_container_width=True,
@@ -2310,31 +2285,35 @@ def render_reports():
 
                     st.divider()
 
-                    # ── Bar chart — top + bottom combined ─────────────────────
-                    _chart_df = pd.concat([_top, _bottom]).drop_duplicates("securities_name")
-                    _chart_df = _chart_df.sort_values(_pnl_col, ascending=True)
-                    _chart_df["_color"] = _chart_df[_pnl_col].apply(
+                    # ── Bar chart ─────────────────────────────────────────────
+                    _chart_col = _primary
+                    _chart_df  = pd.concat([_top, _bottom]).drop_duplicates("securities_name")
+                    _chart_df  = _chart_df.sort_values(_chart_col, ascending=True)
+                    _chart_df["_color"] = _chart_df[_chart_col].apply(
                         lambda v: "gain" if v >= 0 else "loss"
                     )
+                    _x_label = (f"Change % — {_perf_period}" if _sort_by_pct
+                                else f"P&L (€) — {_perf_period}")
                     _fig_bar = px.bar(
                         _chart_df,
-                        x=_pnl_col, y="securities_name", orientation="h",
+                        x=_chart_col, y="securities_name", orientation="h",
                         color="_color",
                         color_discrete_map={"gain": "#2ecc71", "loss": "#e74c3c"},
-                        labels={
-                            _pnl_col: f"P&L (€) — {_perf_period}",
-                            "securities_name": "", "_color": "",
-                        },
-                        title=f"Top & Least Performers — {_perf_period} P&L (€)",
+                        labels={_chart_col: _x_label, "securities_name": "", "_color": ""},
+                        title=f"Top & Least Performers — {_perf_period} ({_perf_view})",
                     )
-                    _fig_bar.update_layout(showlegend=False, yaxis={"categoryorder": "total ascending"})
+                    _fig_bar.update_layout(showlegend=False,
+                                           yaxis={"categoryorder": "total ascending"})
+                    if _sort_by_pct:
+                        _fig_bar.update_xaxes(ticksuffix="%")
                     pf_plotly_chart(_fig_bar)
 
                     # ── Full ranked table ─────────────────────────────────────
                     with st.expander("📋 All Securities Ranked", expanded=False):
-                        _all_ranked = _df_valid.sort_values(_pnl_col, ascending=False).copy()
+                        _all_ranked = _df_valid.sort_values(_primary, ascending=False).copy()
                         _all_ranked.insert(0, "Rank", range(1, len(_all_ranked) + 1))
-                        _full_cfg = {"Rank": st.column_config.NumberColumn("Rank", format="%d"), **_col_cfg}
+                        _full_cfg = {"Rank": st.column_config.NumberColumn("Rank", format="%d"),
+                                     **_col_cfg}
                         st.dataframe(
                             _all_ranked[["Rank"] + _display_cols],
                             column_config=_full_cfg,
@@ -3674,13 +3653,269 @@ def render_income_expense_reports():
 # DIVIDEND TRACKER
 # ======================================================
 
+def _render_dividend_forecast():
+    """Forecast tab: projected 12-month dividend income for currently-held securities."""
+    import datetime as _dt
+    from dateutil.relativedelta import relativedelta
+
+    today = pd.Timestamp.now().date()
+
+    df_fc = get_dividend_forecast_data()
+    if df_fc.empty:
+        st.info("No dividend-paying securities found in current holdings.")
+        return
+
+    # ── Frequency → payments per year ────────────────────────────────────────
+    _FREQ_MAP = {
+        "monthly":     12,
+        "quarterly":    4,
+        "semi-annual":  2,
+        "bi-annual":    2,
+        "annual":       1,
+        "yearly":       1,
+    }
+
+    def _payments_per_year(freq_str) -> int:
+        if pd.isna(freq_str) or not str(freq_str).strip():
+            return 4  # assume quarterly when unknown
+        return _FREQ_MAP.get(str(freq_str).strip().lower(), 4)
+
+    def _next_payment_dates(anchor_date, freq_str, horizon_months: int = 12) -> list:
+        """Generate expected payment dates for the next `horizon_months` months."""
+        ppy = _payments_per_year(freq_str)
+        interval_months = max(round(12 / ppy), 1)
+        dates = []
+        # Start from the anchor; if it's in the past advance to the nearest future date
+        d = pd.Timestamp(anchor_date).date() if pd.notna(anchor_date) else today
+        while d <= today:
+            d += relativedelta(months=interval_months)
+        cutoff = today + relativedelta(months=horizon_months)
+        while d <= cutoff:
+            dates.append(d)
+            d += relativedelta(months=interval_months)
+        return dates
+
+    # ── Compute annual projected income per security ──────────────────────────
+    rows = []
+    for _, r in df_fc.iterrows():
+        mv   = float(r.get('market_value_eur') or 0)
+        cost = float(r.get('cost_basis_eur')   or 0)
+        qty  = float(r.get('total_qty')         or 0)
+        fx   = 1.0  # market_value_eur is already converted
+
+        # Priority: Dividend_Rate (annual per share, sec ccy) → Fwd Yield → trailing 12m
+        dr   = r.get('dividend_rate')
+        dy   = r.get('dividend_yield')
+        t12  = float(r.get('trailing_12m_income_eur') or 0)
+
+        if pd.notna(dr) and float(dr) > 0 and mv > 0:
+            # Dividend_Rate is in security currency per share; market_value_eur already in EUR
+            # annual_income = qty × rate_sec_ccy × fx_rate ≈ (rate / price) × market_value
+            price = mv / qty if qty else 0
+            annual = (float(dr) / price * mv) if price else 0
+            method = "Dividend Rate"
+        elif pd.notna(dy) and float(dy) > 0 and mv > 0:
+            annual = mv * float(dy) / 100
+            method = "Fwd Yield"
+        elif t12 > 0:
+            annual = t12
+            method = "Trailing 12m"
+        else:
+            continue  # no data to forecast
+
+        if annual <= 0:
+            continue
+
+        freq       = r.get('dividend_frequency')
+        ppy        = _payments_per_year(freq)
+        per_pmt    = annual / ppy
+
+        # Ex-date anchor → future ex-dates
+        ex_anchor  = r.get('ex_dividend_date') or r.get('last_ex_date')
+        ex_dates   = _next_payment_dates(ex_anchor, freq, horizon_months=13)
+
+        # Pay-date anchor → future pay-dates (offset from ex-dates by the known lag)
+        raw_ex  = r.get('ex_dividend_date')
+        raw_pay = r.get('dividend_pay_date')
+        if pd.notna(raw_ex) and pd.notna(raw_pay):
+            _lag = (pd.Timestamp(raw_pay).date() - pd.Timestamp(raw_ex).date()).days
+            _lag = max(_lag, 0)  # guard against reversed data
+        else:
+            _lag = 0  # no lag info — use ex-date as cash-flow date
+
+        pay_anchor = r.get('dividend_pay_date') or ex_anchor
+        pay_dates  = _next_payment_dates(pay_anchor, freq, horizon_months=13)
+
+        next_expected_ex  = ex_dates[0]  if ex_dates  else None
+        next_expected_pay = pay_dates[0] if pay_dates else next_expected_ex
+
+        rows.append({
+            'securities_name':       r['securities_name'],
+            'securities_type':       r['securities_type'],
+            'total_qty':             qty,
+            'market_value_eur':      mv,
+            'cost_basis_eur':        cost,
+            'annual_forecast_eur':   round(annual, 2),
+            'per_payment_eur':       round(per_pmt, 2),
+            'payments_per_year':     ppy,
+            'frequency':             freq or 'Quarterly (assumed)',
+            'method':                method,
+            'dividend_yield':        r.get('dividend_yield'),
+            'next_expected_ex_date': next_expected_ex,
+            'next_expected_pay_date': next_expected_pay,
+            'last_known_ex_date':    r.get('ex_dividend_date'),
+            'last_known_pay_date':   r.get('dividend_pay_date'),
+            'pay_lag_days':          _lag if _lag else None,
+            'ex_dates':              ex_dates,
+            'next_pay_dates':        pay_dates,
+        })
+
+    if not rows:
+        st.info("No forecast data available — no securities with dividend yield, rate or trailing income.")
+        return
+
+    df_rows = pd.DataFrame(rows)
+    total_annual  = df_rows['annual_forecast_eur'].sum()
+    total_monthly = total_annual / 12
+
+    # ── Summary metrics ───────────────────────────────────────────────────────
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Projected Annual Income",  f"€ {total_annual:,.2f}")
+    m2.metric("Projected Monthly Avg",    f"€ {total_monthly:,.2f}")
+    m3.metric("Securities forecasted",    str(len(df_rows)))
+    _fwd_yoc = (total_annual / df_rows['cost_basis_eur'].sum() * 100) if df_rows['cost_basis_eur'].sum() > 0 else 0
+    m4.metric("Portfolio Yield on Cost",  f"{_fwd_yoc:.2f}%")
+
+    st.divider()
+
+    # ── Monthly forecast bar chart — bucketed by payment date ────────────────
+    # Use pay dates (when cash arrives) rather than ex-dates for cash-flow accuracy.
+    _monthly: dict = {}
+    for _, r in df_rows.iterrows():
+        for d in r['next_pay_dates']:
+            key = d.replace(day=1)
+            _monthly[key] = _monthly.get(key, 0) + r['per_payment_eur']
+
+    if _monthly:
+        df_monthly_fc = (
+            pd.DataFrame(list(_monthly.items()), columns=['month', 'income_eur'])
+            .sort_values('month')
+            .head(12)
+        )
+        df_monthly_fc['month'] = pd.to_datetime(df_monthly_fc['month'])
+        fig_fc = px.bar(
+            df_monthly_fc, x='month', y='income_eur',
+            title="<b>Projected Monthly Dividend Income (€) — Next 12 Months</b>",
+            labels={'income_eur': 'Projected Income (€)', 'month': 'Month'},
+            template='plotly_dark',
+            color_discrete_sequence=['#3498DB'],
+        )
+        fig_fc.update_layout(margin=dict(l=0, r=0, t=50, b=0))
+        pf_plotly_chart(fig_fc)
+
+    # ── Per-security forecast table ───────────────────────────────────────────
+    st.markdown("#### Projected Income by Security")
+
+    _tbl_cols = ['securities_name', 'securities_type', 'annual_forecast_eur',
+                 'per_payment_eur', 'frequency', 'dividend_yield',
+                 'next_expected_ex_date', 'next_expected_pay_date',
+                 'last_known_ex_date', 'last_known_pay_date', 'pay_lag_days',
+                 'method', 'market_value_eur', 'cost_basis_eur']
+
+    st.dataframe(
+        df_rows[_tbl_cols].sort_values('annual_forecast_eur', ascending=False),
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            'securities_name':        st.column_config.TextColumn("Security"),
+            'securities_type':        st.column_config.TextColumn("Type"),
+            'annual_forecast_eur':    st.column_config.NumberColumn("Annual Forecast (€)",  format="%,.2f €"),
+            'per_payment_eur':        st.column_config.NumberColumn("Per Payment (€)",      format="%,.2f €"),
+            'frequency':              st.column_config.TextColumn("Frequency"),
+            'dividend_yield':         st.column_config.NumberColumn("Fwd Yield %",          format="%.2f%%"),
+            'next_expected_ex_date':  st.column_config.DateColumn(
+                "Next Expected Ex-Div", format="DD/MM/YYYY",
+                help="Projected next ex-dividend date — last known date advanced by the "
+                     "payment frequency. Must hold shares before this date to qualify."),
+            'next_expected_pay_date': st.column_config.DateColumn(
+                "Next Expected Pay Date", format="DD/MM/YYYY",
+                help="Projected date cash arrives in your account, estimated from the "
+                     "payment date stored in Yahoo Finance advanced by the frequency. "
+                     "Where no payment date is available, equals the ex-dividend date."),
+            'last_known_ex_date':     st.column_config.DateColumn(
+                "Last Known Ex-Div", format="DD/MM/YYYY",
+                help="Most recent ex-dividend date from Yahoo Finance (may be in the past)."),
+            'last_known_pay_date':    st.column_config.DateColumn(
+                "Last Known Pay Date", format="DD/MM/YYYY",
+                help="Most recent payment date from Yahoo Finance (may be in the past)."),
+            'pay_lag_days':           st.column_config.NumberColumn(
+                "Pay Lag (days)", format="%d days",
+                help="Days between ex-dividend date and payment date for this security."),
+            'method':                 st.column_config.TextColumn("Basis",
+                                          help="Dividend Rate = from broker data (most accurate); "
+                                               "Fwd Yield = market price × yield; "
+                                               "Trailing 12m = last year's actual income"),
+            'market_value_eur':       st.column_config.NumberColumn("Market Value (€)",     format="%,.2f €"),
+            'cost_basis_eur':         st.column_config.NumberColumn("Cost Basis (€)",       format="%,.2f €"),
+        }
+    )
+    copy_df_button(df_rows[_tbl_cols], key="dl_rpt_div_forecast")
+
+    # ── Payment calendar (next 3 months detail) ───────────────────────────────
+    with st.expander("📅 Upcoming Payments Detail (next 3 months)", expanded=False):
+        _upcoming = []
+        cutoff_3m = today + relativedelta(months=3)
+        for _, r in df_rows.iterrows():
+            for ex_d, pay_d in zip(r['ex_dates'], r['next_pay_dates']):
+                if ex_d <= cutoff_3m:
+                    _upcoming.append({
+                        'ex_date':          ex_d,
+                        'pay_date':         pay_d,
+                        'security':         r['securities_name'],
+                        'per_payment_eur':  r['per_payment_eur'],
+                        'frequency':        r['frequency'],
+                        'method':           r['method'],
+                    })
+        if _upcoming:
+            df_up = pd.DataFrame(_upcoming).sort_values('ex_date')
+            st.dataframe(
+                df_up,
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    'ex_date':         st.column_config.DateColumn("Ex-Date",        format="DD/MM/YYYY",
+                                           help="Must hold shares before this date to receive the dividend."),
+                    'pay_date':        st.column_config.DateColumn("Pay Date",        format="DD/MM/YYYY",
+                                           help="Estimated date cash arrives in your account."),
+                    'security':        st.column_config.TextColumn("Security"),
+                    'per_payment_eur': st.column_config.NumberColumn("Amount (€)",   format="%,.2f €"),
+                    'frequency':       st.column_config.TextColumn("Frequency"),
+                    'method':          st.column_config.TextColumn("Basis"),
+                }
+            )
+        else:
+            st.info("No payments expected in the next 3 months.")
+
+
 def render_dividend_tracker():
     st.subheader("💸 Dividend & Interest Income Tracker")
 
-    # ── Inline period controls (sidebar is shared across all P&L tabs) ────────
+    # ── Actual vs Forecast selector ───────────────────────────────────────────
     import datetime as _dt
     today = pd.Timestamp.now().date()
 
+    view_mode = st.radio(
+        "View:",
+        ["📋 Actual", "🔮 Forecast"],
+        horizontal=True,
+        key="div_view_mode",
+    )
+
+    if view_mode == "🔮 Forecast":
+        _render_dividend_forecast()
+        return
+
+    # ── ACTUAL view ───────────────────────────────────────────────────────────
     ctrl_col1, ctrl_col2 = st.columns([2, 2])
     with ctrl_col1:
         period_opt = st.radio(
@@ -4243,6 +4478,100 @@ def render_asset_allocation():
         }
     )
     copy_df_button(df_display, key="dl_rpt_alloc")
+
+    # ── Rebalancing Action Plan ───────────────────────────────────────────────
+    st.divider()
+    st.markdown("#### ⚖️ Rebalancing Action Plan")
+    st.caption(
+        "Trades are distributed proportionally within each asset type. "
+        "Only types with a saved target are included. "
+        "Positive = buy, negative = sell."
+    )
+
+    available_cash = st.number_input(
+        "Available cash to deploy (€)",
+        min_value=0.0, value=0.0, step=100.0,
+        format="%.2f",
+        key="rebal_cash_input",
+        help="Extra cash you can invest. It is added to under-weight types first.",
+    )
+
+    df_plan = get_rebalancing_plan()
+
+    if df_plan.empty:
+        st.info("No holdings or no allocation targets saved yet.")
+    else:
+        # Apply cash top-up: distribute available_cash proportionally to under-weight types
+        if available_cash > 0 and not df_plan.empty:
+            underweight_types = df_plan[df_plan['type_delta_pct'] > 0]['securities_type'].unique()
+            total_under_delta = df_plan[df_plan['securities_type'].isin(underweight_types)]['suggested_delta_eur'].clip(lower=0).sum()
+            if total_under_delta > 0:
+                df_plan = df_plan.copy()
+                mask = df_plan['securities_type'].isin(underweight_types)
+                df_plan.loc[mask, 'suggested_delta_eur'] = (
+                    df_plan.loc[mask, 'suggested_delta_eur']
+                    + (df_plan.loc[mask, 'suggested_delta_eur'].clip(lower=0)
+                       / total_under_delta * available_cash)
+                )
+
+        df_plan_display = df_plan.copy()
+        df_plan_display['trade_action'] = df_plan_display['suggested_delta_eur'].apply(
+            lambda x: '🟢 BUY' if x > 1 else ('🔴 SELL' if x < -1 else '✅ OK')
+        )
+        # Suggested shares to trade (approximate)
+        df_plan_display['suggested_qty'] = (
+            df_plan_display['suggested_delta_eur']
+            / (df_plan_display['current_price'] * df_plan_display['fx_rate'])
+        ).where(df_plan_display['current_price'] > 0).round(4)
+
+        # Only show rows with meaningful action
+        df_show = df_plan_display[df_plan_display['suggested_delta_eur'].abs() > 0.5].copy()
+
+        if df_show.empty:
+            st.success("Portfolio is within balance — no trades needed.")
+        else:
+            _cols = ['trade_action', 'securities_name', 'securities_type', 'ticker',
+                     'currency', 'current_qty', 'current_price',
+                     'value_eur', 'current_pct',
+                     'type_actual_pct', 'type_target_pct', 'type_delta_pct',
+                     'suggested_delta_eur', 'suggested_qty']
+
+            st.dataframe(
+                df_show[_cols].style.map(
+                    lambda v: 'color:#27AE60' if isinstance(v, str) and 'BUY' in v
+                    else ('color:#E74C3C' if isinstance(v, str) and 'SELL' in v else ''),
+                    subset=['trade_action']
+                ).map(
+                    color_negative_red, subset=['suggested_delta_eur', 'type_delta_pct']
+                ),
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    'trade_action':       st.column_config.TextColumn('Action'),
+                    'securities_name':    st.column_config.TextColumn('Security'),
+                    'securities_type':    st.column_config.TextColumn('Type'),
+                    'ticker':             st.column_config.TextColumn('Ticker'),
+                    'currency':           st.column_config.TextColumn('Ccy'),
+                    'current_qty':        st.column_config.NumberColumn('Qty',          format='%,.4f'),
+                    'current_price':      st.column_config.NumberColumn('Price',        format='%,.4f'),
+                    'value_eur':          st.column_config.NumberColumn('Value (€)',    format='%,.2f €'),
+                    'current_pct':        st.column_config.NumberColumn('Weight %',     format='%.2f%%'),
+                    'type_actual_pct':    st.column_config.NumberColumn('Type Act %',   format='%.2f%%'),
+                    'type_target_pct':    st.column_config.NumberColumn('Type Tgt %',   format='%.2f%%'),
+                    'type_delta_pct':     st.column_config.NumberColumn('Type Δ %',     format='%+.2f%%'),
+                    'suggested_delta_eur':st.column_config.NumberColumn('Trade (€)',    format='%+,.2f €'),
+                    'suggested_qty':      st.column_config.NumberColumn('Est. Shares',  format='%+,.4f'),
+                },
+            )
+            copy_df_button(df_show[_cols], key="dl_rpt_rebal_plan")
+
+            # Summary
+            total_buy  = df_show[df_show['suggested_delta_eur'] > 0]['suggested_delta_eur'].sum()
+            total_sell = df_show[df_show['suggested_delta_eur'] < 0]['suggested_delta_eur'].sum()
+            sb, ss, sc = st.columns(3)
+            sb.metric("Total to Buy",  f"€ {total_buy:,.2f}")
+            ss.metric("Total to Sell", f"€ {total_sell:,.2f}")
+            sc.metric("Net Cash Needed", f"€ {(total_buy + total_sell):,.2f}")
 
 
 # ======================================================

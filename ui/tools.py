@@ -3,7 +3,9 @@ import streamlit as st
 import pandas as pd
 from database.backup import render_backup_restore
 from database.connection import get_connection
-from database.queries import get_price_anomalies, get_missing_tx_prices, get_investments_with_dummy_prices, get_investment_consistency_data, update_investment_row, get_all_securities, get_split_preview
+from database.queries import (get_price_anomalies, get_missing_tx_prices, get_investments_with_dummy_prices,
+                               get_investment_consistency_data, update_investment_row,
+                               get_all_securities, get_split_preview, export_all_data)
 from database.crud import delete_historical_prices, insert_prices_from_transactions, normalize_investment_prices, update_accounts_balances, update_investment_balances, apply_stock_split
 from ui.components import copy_df_button
 
@@ -2611,11 +2613,57 @@ def _render_log_viewer():
         )
 
 
+def _render_data_export():
+    import io
+    st.subheader("📤 Full Data Export")
+    st.caption(
+        "Exports all major tables to a single Excel workbook (.xlsx). "
+        "Historical prices and FX rates are limited to the last 2 years to keep the file size manageable. "
+        "Transaction rows are capped at 100 000."
+    )
+
+    if st.button("⬇️ Generate & Download Export", type="primary", key="export_gen_btn"):
+        with st.spinner("Fetching data from all tables…"):
+            data = export_all_data()
+
+        if not data:
+            st.error("No data returned — check your database connection.")
+            return
+
+        with st.spinner("Building Excel workbook…"):
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                for sheet_name, df in data.items():
+                    # Excel sheet names max 31 chars
+                    safe_name = sheet_name[:31]
+                    df.to_excel(writer, sheet_name=safe_name, index=False)
+
+        buf.seek(0)
+        import datetime as _dt
+        fname = f"personal_finance_export_{_dt.date.today()}.xlsx"
+        st.download_button(
+            label="📥 Download Excel File",
+            data=buf,
+            file_name=fname,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="export_download_btn",
+        )
+
+        # Summary
+        st.success(f"Export ready — {len(data)} sheets.")
+        summary_rows = [
+            {"Sheet": k, "Rows": len(v), "Columns": len(v.columns)}
+            for k, v in data.items()
+        ]
+        st.dataframe(pd.DataFrame(summary_rows), hide_index=True, use_container_width=True)
+
+
 _CATEGORIES = {
     "💾 Database": [
         "💾 Backup & Restore",
         "🔧 DB Maintenance",
         "🛢 SQL Interface",
+        "📤 Data Export",
         "🔄 Fix Missing Transfer Mirrors",
         "🔀 Fix Transfer Sign Mismatches",
         "🔗 Fix Missing Investment Cash Links",
@@ -2635,6 +2683,7 @@ _TOOL_RENDERERS = {
     "💾 Backup & Restore":              render_backup_restore,
     "🛢 SQL Interface":                 _render_sql_interface,
     "🔧 DB Maintenance":                _render_db_maintenance,
+    "📤 Data Export":                   _render_data_export,
     "🔄 Fix Missing Transfer Mirrors":  _render_fix_missing_transfer_mirrors,
     "🔀 Fix Transfer Sign Mismatches":  _render_fix_transfer_sign_mismatches,
     "🔗 Fix Missing Investment Cash Links": _render_fix_missing_investment_cash_links,

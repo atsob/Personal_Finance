@@ -702,3 +702,4 @@ def render_static_data():
             save_df = edited_acc.drop(columns=["Balance"])
             save_changes(df.drop(columns=["Balance"]), save_df, "Accounts", "accounts_id")
             _sd_load_accounts_list.clear()
+

@@ -2410,6 +2410,99 @@ def get_dividend_tracker_data(start_date: str, end_date: str):
     return df
 
 
+@st.cache_data(ttl=3600)
+def get_dividend_forecast_data() -> "pd.DataFrame":
+    """Return one row per currently-held, dividend-paying security with enough
+    metadata to build a 12-month forward income forecast.
+
+    Columns returned
+    ----------------
+    securities_id, securities_name, securities_type,
+    total_qty, market_value_eur, cost_basis_eur,
+    dividend_yield, dividend_rate, five_year_avg_yield,
+    ex_dividend_date, dividend_pay_date, dividend_frequency,
+    last_ex_date, last_amount,          <- most recent Securities_Dividends row
+    trailing_12m_income_eur             <- actual income paid over the last 12 months
+    """
+    conn = get_connection()
+    df = pd.read_sql("""
+        WITH fx_latest AS (
+            SELECT DISTINCT ON (Currencies_Id_1)
+                   Currencies_Id_1, FX_Rate
+            FROM   Historical_FX
+            ORDER  BY Currencies_Id_1, Date DESC
+        ),
+        price_latest AS (
+            SELECT DISTINCT ON (Securities_Id)
+                   Securities_Id, Close
+            FROM   Historical_Prices
+            ORDER  BY Securities_Id, Date DESC
+        ),
+        holdings_agg AS (
+            SELECT
+                h.Securities_Id,
+                SUM(h.Quantity)                                          AS total_qty,
+                SUM(h.Quantity * COALESCE(h.Fifo_Avg_Cost_EUR,
+                    h.Fifo_Avg_Price * COALESCE(fx.FX_Rate, 1), 0))     AS cost_basis_eur
+            FROM   Holdings h
+            JOIN   Accounts a ON h.Accounts_Id = a.Accounts_Id
+            LEFT JOIN fx_latest fx ON fx.Currencies_Id_1 = a.Currencies_Id
+            WHERE  h.Quantity > 0
+            GROUP  BY h.Securities_Id
+        ),
+        last_div AS (
+            SELECT DISTINCT ON (Securities_Id)
+                   Securities_Id,
+                   Ex_Date  AS last_ex_date,
+                   Amount   AS last_amount
+            FROM   Securities_Dividends
+            ORDER  BY Securities_Id, Ex_Date DESC
+        ),
+        trailing_income AS (
+            SELECT
+                i.Securities_Id,
+                SUM(i.Total_Amount_AccCur * COALESCE(fx.FX_Rate, 1)) AS trailing_12m_income_eur
+            FROM   Investments i
+            JOIN   Accounts a ON i.Accounts_Id = a.Accounts_Id
+            LEFT JOIN fx_latest fx ON fx.Currencies_Id_1 = a.Currencies_Id
+            WHERE  i.Action IN ('Dividend','IntInc','Reinvest')
+              AND  i.Date >= CURRENT_DATE - INTERVAL '12 months'
+            GROUP  BY i.Securities_Id
+        )
+        SELECT
+            s.Securities_Id            AS securities_id,
+            s.Securities_Name          AS securities_name,
+            s.Securities_Type          AS securities_type,
+            ha.total_qty,
+            ha.cost_basis_eur,
+            ROUND((ha.total_qty * COALESCE(pl.Close, 0) * COALESCE(fx2.FX_Rate, 1))::numeric, 2)
+                                       AS market_value_eur,
+            s.Dividend_Yield           AS dividend_yield,
+            s.Dividend_Rate            AS dividend_rate,
+            s.Five_Year_Avg_Yield      AS five_year_avg_yield,
+            s.Ex_Dividend_Date         AS ex_dividend_date,
+            s.Dividend_Pay_Date        AS dividend_pay_date,
+            s.Dividend_Frequency       AS dividend_frequency,
+            ld.last_ex_date,
+            ld.last_amount,
+            COALESCE(ti.trailing_12m_income_eur, 0) AS trailing_12m_income_eur
+        FROM   Securities s
+        JOIN   holdings_agg ha ON ha.Securities_Id = s.Securities_Id
+        LEFT JOIN price_latest pl  ON pl.Securities_Id  = s.Securities_Id
+        LEFT JOIN fx_latest    fx2 ON fx2.Currencies_Id_1 = s.Currencies_Id
+        LEFT JOIN last_div     ld  ON ld.Securities_Id  = s.Securities_Id
+        LEFT JOIN trailing_income ti ON ti.Securities_Id = s.Securities_Id
+        WHERE (
+            s.Dividend_Yield  IS NOT NULL
+            OR s.Dividend_Rate IS NOT NULL
+            OR ti.trailing_12m_income_eur > 0
+        )
+        ORDER BY s.Securities_Name
+    """, conn)
+    conn.close()
+    return df
+
+
 # ======================================================
 # ASSET ALLOCATION VS TARGET
 # ======================================================
@@ -5242,3 +5335,446 @@ def save_statement_history(accounts_id: int, rows: list[dict]):
             })
     conn.commit()
     conn.close()
+
+
+# ======================================================
+# WATCHLIST
+# ======================================================
+
+def _ensure_watchlist_table():
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS Watchlist (
+                    Watchlist_Id    SERIAL PRIMARY KEY,
+                    Securities_Id   INTEGER NOT NULL
+                                    REFERENCES Securities(Securities_Id) ON DELETE CASCADE,
+                    Target_Price    NUMERIC(20,8),
+                    Stop_Loss       NUMERIC(20,8),
+                    Note            TEXT,
+                    Added_Date      DATE DEFAULT CURRENT_DATE,
+                    UNIQUE(Securities_Id)
+                )
+            """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_watchlist() -> pd.DataFrame:
+    _ensure_watchlist_table()
+    conn = get_connection()
+    df = pd.read_sql("""
+        WITH latest_price AS (
+            SELECT DISTINCT ON (Securities_Id)
+                   Securities_Id, Close AS current_price, Date AS price_date
+            FROM   Historical_Prices
+            ORDER  BY Securities_Id, Date DESC
+        ),
+        fx AS (
+            SELECT DISTINCT ON (Currencies_Id_1) Currencies_Id_1, FX_Rate
+            FROM   Historical_FX ORDER BY Currencies_Id_1, Date DESC
+        ),
+        held AS (
+            SELECT Securities_Id, SUM(Quantity) AS qty
+            FROM   Holdings WHERE Quantity > 0
+            GROUP  BY Securities_Id
+        )
+        SELECT
+            w.Watchlist_Id                                              AS watchlist_id,
+            s.Securities_Id                                             AS securities_id,
+            s.Securities_Name                                           AS securities_name,
+            s.Securities_Type::text                                     AS securities_type,
+            s.Ticker                                                    AS ticker,
+            c.Currencies_ShortName                                      AS currency,
+            lp.current_price,
+            lp.price_date,
+            ROUND((lp.current_price * COALESCE(fx.FX_Rate,1))::numeric,2)
+                                                                        AS current_price_eur,
+            w.Target_Price                                              AS target_price,
+            w.Stop_Loss                                                 AS stop_loss,
+            s.Analyst_Target_Price                                      AS analyst_target,
+            s.Dividend_Yield                                            AS dividend_yield,
+            CASE
+                WHEN w.Target_Price IS NOT NULL AND lp.current_price IS NOT NULL
+                THEN ROUND(((lp.current_price - w.Target_Price)
+                            / NULLIF(w.Target_Price,0) * 100)::numeric, 2)
+            END                                                         AS pct_from_target,
+            CASE
+                WHEN w.Stop_Loss IS NOT NULL AND lp.current_price IS NOT NULL
+                THEN ROUND(((lp.current_price - w.Stop_Loss)
+                            / NULLIF(w.Stop_Loss,0) * 100)::numeric, 2)
+            END                                                         AS pct_from_stop,
+            CASE
+                WHEN s.Analyst_Target_Price IS NOT NULL AND lp.current_price IS NOT NULL
+                THEN ROUND(((s.Analyst_Target_Price - lp.current_price)
+                            / NULLIF(lp.current_price,0) * 100)::numeric, 2)
+            END                                                         AS upside_to_analyst,
+            COALESCE(h.qty, 0) > 0                                      AS already_held,
+            w.Note                                                      AS note,
+            w.Added_Date                                                AS added_date
+        FROM   Watchlist w
+        JOIN   Securities s  ON s.Securities_Id  = w.Securities_Id
+        JOIN   Currencies c  ON c.Currencies_Id  = s.Currencies_Id
+        LEFT JOIN latest_price lp ON lp.Securities_Id = w.Securities_Id
+        LEFT JOIN fx              ON fx.Currencies_Id_1 = s.Currencies_Id
+        LEFT JOIN held h          ON h.Securities_Id   = w.Securities_Id
+        ORDER  BY s.Securities_Name
+    """, conn)
+    conn.close()
+    return df
+
+
+def add_watchlist_item(securities_id: int, target_price=None,
+                       stop_loss=None, note: str = None):
+    _ensure_watchlist_table()
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO Watchlist (Securities_Id, Target_Price, Stop_Loss, Note)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (Securities_Id) DO UPDATE SET
+                    Target_Price = EXCLUDED.Target_Price,
+                    Stop_Loss    = EXCLUDED.Stop_Loss,
+                    Note         = EXCLUDED.Note
+            """, (securities_id,
+                  float(target_price) if target_price else None,
+                  float(stop_loss)    if stop_loss    else None,
+                  note or None))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def remove_watchlist_item(watchlist_id: int):
+    _ensure_watchlist_table()
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM Watchlist WHERE Watchlist_Id = %s",
+                        (watchlist_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ======================================================
+# ALERTS
+# ======================================================
+
+def _ensure_alerts_table():
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS Alerts (
+                    Alert_Id      SERIAL PRIMARY KEY,
+                    Alert_Type    TEXT NOT NULL,
+                    Securities_Id INTEGER REFERENCES Securities(Securities_Id)
+                                  ON DELETE CASCADE,
+                    Asset_Type    TEXT,
+                    Threshold     NUMERIC(20,8),
+                    Direction     TEXT,
+                    Is_Active     BOOLEAN DEFAULT TRUE,
+                    Note          TEXT,
+                    Created_At    TIMESTAMP DEFAULT NOW()
+                )
+            """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_alerts() -> pd.DataFrame:
+    _ensure_alerts_table()
+    conn = get_connection()
+    df = pd.read_sql("""
+        WITH latest_price AS (
+            SELECT DISTINCT ON (Securities_Id)
+                   Securities_Id, Close AS current_price, Date AS price_date
+            FROM   Historical_Prices
+            ORDER  BY Securities_Id, Date DESC
+        )
+        SELECT a.Alert_Id        AS alert_id,
+               a.Alert_Type      AS alert_type,
+               a.Securities_Id   AS securities_id,
+               s.Securities_Name AS securities_name,
+               a.Asset_Type      AS asset_type,
+               a.Threshold       AS threshold,
+               a.Direction       AS direction,
+               a.Is_Active       AS is_active,
+               a.Note            AS note,
+               a.Created_At      AS created_at,
+               lp.current_price  AS current_price,
+               lp.price_date     AS price_date
+        FROM   Alerts a
+        LEFT JOIN Securities s    ON s.Securities_Id  = a.Securities_Id
+        LEFT JOIN latest_price lp ON lp.Securities_Id = a.Securities_Id
+        ORDER  BY a.Created_At DESC
+    """, conn)
+    conn.close()
+    return df
+
+
+def save_alert(alert_type: str, securities_id=None, asset_type: str = None,
+               threshold=None, direction: str = None, note: str = None,
+               alert_id: int = None):
+    _ensure_alerts_table()
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            if alert_id:
+                cur.execute("""
+                    UPDATE Alerts
+                    SET Alert_Type=%s, Securities_Id=%s, Asset_Type=%s,
+                        Threshold=%s, Direction=%s, Note=%s
+                    WHERE Alert_Id=%s
+                """, (alert_type, securities_id, asset_type,
+                      threshold, direction, note, alert_id))
+            else:
+                cur.execute("""
+                    INSERT INTO Alerts
+                        (Alert_Type, Securities_Id, Asset_Type, Threshold, Direction, Note)
+                    VALUES (%s,%s,%s,%s,%s,%s)
+                """, (alert_type, securities_id, asset_type,
+                      threshold, direction, note))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def toggle_alert(alert_id: int, is_active: bool):
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE Alerts SET Is_Active=%s WHERE Alert_Id=%s",
+                        (is_active, alert_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_alert(alert_id: int):
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM Alerts WHERE Alert_Id=%s", (alert_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def check_triggered_alerts() -> list:
+    """Return list of triggered alert dicts ({level, message}).
+    Never raises — returns [] on any error.
+    """
+    try:
+        _ensure_alerts_table()
+        conn = get_connection()
+        alerts_df = pd.read_sql(
+            "SELECT * FROM Alerts WHERE Is_Active = TRUE", conn)
+        conn.close()
+        if alerts_df.empty:
+            return []
+
+        results = []
+
+        # ── price alerts ──────────────────────────────────────────────────────
+        price_rows = alerts_df[
+            alerts_df['alert_type'].isin(['price_above', 'price_below'])
+            & alerts_df['securities_id'].notna()
+        ]
+        if not price_rows.empty:
+            sec_ids = price_rows['securities_id'].astype(int).tolist()
+            conn = get_connection()
+            df_p = pd.read_sql("""
+                SELECT DISTINCT ON (hp.Securities_Id)
+                       hp.Securities_Id AS securities_id,
+                       hp.Close         AS current_price,
+                       s.Securities_Name AS securities_name
+                FROM   Historical_Prices hp
+                JOIN   Securities s ON s.Securities_Id = hp.Securities_Id
+                WHERE  hp.Securities_Id = ANY(%s)
+                ORDER  BY hp.Securities_Id, hp.Date DESC
+            """, conn, params=(sec_ids,))
+            conn.close()
+            prices_map = df_p.set_index('securities_id').to_dict('index')
+
+            for _, row in price_rows.iterrows():
+                sid  = int(row['securities_id'])
+                info = prices_map.get(sid)
+                if not info or row['threshold'] is None:
+                    continue
+                cur_px = float(info['current_price'])
+                thr    = float(row['threshold'])
+                name   = info['securities_name']
+                suffix = f" _{row['note']}_" if row.get('note') else ''
+                if row['alert_type'] == 'price_above' and cur_px > thr:
+                    results.append({
+                        'level': 'warning',
+                        'message': (f"🔔 **Price Alert** — {name} is at "
+                                    f"**{cur_px:,.4f}**, above your threshold "
+                                    f"of {thr:,.4f}.{suffix}"),
+                    })
+                elif row['alert_type'] == 'price_below' and cur_px < thr:
+                    results.append({
+                        'level': 'error',
+                        'message': (f"🔻 **Price Alert** — {name} is at "
+                                    f"**{cur_px:,.4f}**, below your threshold "
+                                    f"of {thr:,.4f}.{suffix}"),
+                    })
+
+        # ── allocation drift alerts ───────────────────────────────────────────
+        drift_rows = alerts_df[alerts_df['alert_type'] == 'allocation_drift']
+        if not drift_rows.empty:
+            alloc = get_asset_allocation_data()
+            if not alloc.empty:
+                for _, row in drift_rows.iterrows():
+                    at  = row.get('asset_type')
+                    thr = float(row['threshold']) if row['threshold'] is not None else None
+                    if not at or thr is None:
+                        continue
+                    match = alloc[alloc['securities_type'] == at]
+                    if match.empty:
+                        continue
+                    delta = abs(float(match.iloc[0]['delta_pct']))
+                    if delta > thr:
+                        suffix = f" _{row['note']}_" if row.get('note') else ''
+                        results.append({
+                            'level': 'warning',
+                            'message': (f"⚖️ **Allocation Drift** — {at} is "
+                                        f"**{delta:.1f}%** off target "
+                                        f"(threshold: {thr:.1f}%).{suffix}"),
+                        })
+
+        return results
+    except Exception:
+        return []
+
+
+# ======================================================
+# REBALANCING PLAN
+# ======================================================
+
+def get_rebalancing_plan() -> pd.DataFrame:
+    """Per-security rebalancing data based on asset-type allocation targets.
+
+    Each row is one currently-held security.  The suggested_delta_eur column
+    shows how much EUR-value to buy (positive) or sell (negative) for that
+    security, distributed proportionally to its weight within its asset type.
+    """
+    conn = get_connection()
+    df = pd.read_sql("""
+        WITH fx AS (
+            SELECT DISTINCT ON (Currencies_Id_1) Currencies_Id_1, FX_Rate
+            FROM   Historical_FX ORDER BY Currencies_Id_1, Date DESC
+        ),
+        prices AS (
+            SELECT DISTINCT ON (Securities_Id) Securities_Id, Close
+            FROM   Historical_Prices ORDER BY Securities_Id, Date DESC
+        ),
+        holding_vals AS (
+            SELECT
+                s.Securities_Id,
+                s.Securities_Name,
+                s.Securities_Type::text                                    AS securities_type,
+                s.Ticker,
+                c.Currencies_ShortName                                     AS currency,
+                COALESCE(p.Close, 0)                                       AS current_price,
+                COALESCE(fx.FX_Rate, 1)                                    AS fx_rate,
+                SUM(h.Quantity)                                            AS current_qty,
+                ROUND((SUM(h.Quantity) * COALESCE(p.Close,0)
+                       * COALESCE(fx.FX_Rate,1))::numeric, 2)              AS value_eur
+            FROM   Holdings h
+            JOIN   Securities s  ON s.Securities_Id  = h.Securities_Id
+            JOIN   Currencies c  ON c.Currencies_Id  = s.Currencies_Id
+            JOIN   Accounts a    ON a.Accounts_Id    = h.Accounts_Id
+            LEFT JOIN prices p   ON p.Securities_Id  = h.Securities_Id
+            LEFT JOIN fx         ON fx.Currencies_Id_1 = s.Currencies_Id
+            WHERE  h.Quantity > 0
+            GROUP  BY s.Securities_Id, s.Securities_Name, s.Securities_Type,
+                      s.Ticker, c.Currencies_ShortName, p.Close, fx.FX_Rate
+        ),
+        grand AS (SELECT SUM(value_eur) AS total FROM holding_vals),
+        type_vals AS (
+            SELECT securities_type, SUM(value_eur) AS type_eur
+            FROM   holding_vals GROUP BY securities_type
+        )
+        SELECT
+            hv.Securities_Id                                               AS securities_id,
+            hv.Securities_Name                                             AS securities_name,
+            hv.securities_type,
+            hv.Ticker                                                      AS ticker,
+            hv.currency,
+            hv.current_qty,
+            hv.current_price,
+            hv.fx_rate,
+            hv.value_eur,
+            ROUND((hv.value_eur / NULLIF(g.total,0)*100)::numeric,2)       AS current_pct,
+            COALESCE(at.Target_Pct, 0)                                     AS type_target_pct,
+            ROUND((tv.type_eur    / NULLIF(g.total,0)*100)::numeric,2)     AS type_actual_pct,
+            ROUND((COALESCE(at.Target_Pct,0)
+                   - tv.type_eur / NULLIF(g.total,0)*100)::numeric,2)      AS type_delta_pct,
+            -- proportional share: security's EUR / type EUR × type delta EUR
+            ROUND((hv.value_eur / NULLIF(tv.type_eur,0)
+                   * ((COALESCE(at.Target_Pct,0) - tv.type_eur / NULLIF(g.total,0)*100)
+                      / 100 * g.total))::numeric, 2)                       AS suggested_delta_eur,
+            g.total                                                        AS portfolio_total_eur
+        FROM   holding_vals hv
+        CROSS  JOIN grand g
+        JOIN   type_vals tv        ON tv.securities_type = hv.securities_type
+        LEFT JOIN Allocation_Targets at ON at.Securities_Type = hv.securities_type
+        ORDER  BY ABS(COALESCE(at.Target_Pct,0)
+                      - tv.type_eur / NULLIF(g.total,0)*100) DESC,
+                  ABS(hv.value_eur / NULLIF(tv.type_eur,0)
+                      * ((COALESCE(at.Target_Pct,0)
+                          - tv.type_eur / NULLIF(g.total,0)*100)
+                         / 100 * g.total)) DESC
+    """, conn)
+    conn.close()
+    return df
+
+
+# ======================================================
+# FULL DATA EXPORT
+# ======================================================
+
+def export_all_data() -> dict:
+    """Return {sheet_name: DataFrame} for all major tables (for Excel export)."""
+    conn = get_connection()
+    _TABLES = {
+        "Accounts":           "SELECT * FROM Accounts ORDER BY Accounts_Name",
+        "Transactions":       ("SELECT * FROM Transactions "
+                               "ORDER BY Date DESC LIMIT 100000"),
+        "Splits":             ("SELECT * FROM Splits "
+                               "ORDER BY Splits_Id DESC LIMIT 500000"),
+        "Investments":        "SELECT * FROM Investments ORDER BY Date DESC",
+        "Holdings":           "SELECT * FROM Holdings",
+        "Securities":         "SELECT * FROM Securities ORDER BY Securities_Name",
+        "Categories":         "SELECT * FROM Categories ORDER BY Categories_Name",
+        "Payees":             "SELECT * FROM Payees ORDER BY Payees_Name",
+        "Currencies":         "SELECT * FROM Currencies ORDER BY Currencies_ShortName",
+        "Institutions":       "SELECT * FROM Institutions ORDER BY Institutions_Name",
+        "Prices_2yr":         ("SELECT * FROM Historical_Prices "
+                               "WHERE Date >= CURRENT_DATE - INTERVAL '2 years' "
+                               "ORDER BY Securities_Id, Date DESC"),
+        "FX_2yr":             ("SELECT * FROM Historical_FX "
+                               "WHERE Date >= CURRENT_DATE - INTERVAL '2 years' "
+                               "ORDER BY Currencies_Id_1, Date DESC"),
+        "Goals":              "SELECT * FROM Goals",
+        "Budgets":            "SELECT * FROM Budgets",
+        "Allocation_Targets": "SELECT * FROM Allocation_Targets",
+        "Recurring_Templates":"SELECT * FROM Recurring_Templates",
+        "Watchlist":          "SELECT * FROM Watchlist",
+        "Alerts":             "SELECT * FROM Alerts",
+    }
+    result = {}
+    for label, sql in _TABLES.items():
+        try:
+            result[label] = pd.read_sql(sql, conn)
+        except Exception:
+            pass
+    conn.close()
+    return result
