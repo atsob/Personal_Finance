@@ -1602,7 +1602,92 @@ def _get_or_create_account_fee_security(cur, currency: str = "EUR") -> int:
     return cur.fetchone()[0]
 
 
-def apply_pdf_commissions(pdf_path: "str | Path") -> "tuple[int, list[str]]":
+def preview_pdf_commissions(pdf_path: "str | Path") -> "tuple[list[dict], list[str]]":
+    """Parse PDF commissions and return a preview list without writing to the DB.
+
+    Each entry in the returned list is a dict with keys:
+      trade_id, security_name, action, date, current_commission,
+      pdf_commission, current_total, new_total, status, selected
+
+    status is one of: 'ready' | 'already_set' | 'not_in_db'
+    selected defaults to True for 'ready' rows.
+    Returns (preview_rows, warnings).
+    """
+    from data.saxo_pdf_parser import parse_trade_commissions
+
+    commissions = parse_trade_commissions(pdf_path)
+    if not commissions:
+        return [], ["No trade commissions found in PDF."]
+
+    rows: list[dict] = []
+    warnings: list[str] = []
+    prefix = "SAXO|TRADE|"
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            for trade_id, comm_eur in commissions.items():
+                desc_pattern = f"%{prefix}{trade_id}%"
+                cur.execute(
+                    """SELECT i.Investments_Id, i.Action, i.Total_Amount_AccCur,
+                              i.Transactions_Id, i.Commission,
+                              COALESCE(s.Securities_Name, i.Description) AS sec_name,
+                              i.Date
+                         FROM Investments i
+                         LEFT JOIN Securities s ON s.Securities_Id = i.Securities_Id
+                        WHERE i.Description LIKE %s""",
+                    (desc_pattern,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    warnings.append(
+                        f"TradeID {trade_id} ({comm_eur:.2f} EUR): not in DB — "
+                        f"trade was not imported (outside API fetch range)."
+                    )
+                    rows.append({
+                        "trade_id": trade_id,
+                        "security_name": "",
+                        "action": "",
+                        "date": None,
+                        "current_commission": None,
+                        "pdf_commission": comm_eur,
+                        "current_total": None,
+                        "new_total": None,
+                        "status": "not_in_db",
+                        "selected": False,
+                    })
+                    continue
+
+                inv_id, action, total_acc_cur, tx_id, cur_comm, sec_name, trade_date = row
+                already_set = cur_comm is not None and float(cur_comm) != 0
+                if already_set:
+                    warnings.append(
+                        f"TradeID {trade_id} ({comm_eur:.2f} EUR): commission already "
+                        f"set to {float(cur_comm):.4f} EUR."
+                    )
+
+                delta = comm_eur if action == "Buy" else -comm_eur
+                new_total = (float(total_acc_cur) + delta) if total_acc_cur is not None else delta
+
+                rows.append({
+                    "trade_id": trade_id,
+                    "security_name": sec_name or "",
+                    "action": action or "",
+                    "date": trade_date,
+                    "current_commission": float(cur_comm) if cur_comm is not None else None,
+                    "pdf_commission": comm_eur,
+                    "current_total": float(total_acc_cur) if total_acc_cur is not None else None,
+                    "new_total": new_total,
+                    "status": "already_set" if already_set else "ready",
+                    "selected": not already_set,
+                })
+
+    return rows, warnings
+
+
+def apply_pdf_commissions(
+    pdf_path: "str | Path",
+    selected_trade_ids: "set[str] | None" = None,
+) -> "tuple[int, list[str]]":
     """Read Booked Costs from a SAXO Transaction PDF and update Investment records.
 
     Matches each trade's commission to the Investment row via its Description
@@ -1615,6 +1700,7 @@ def apply_pdf_commissions(pdf_path: "str | Path") -> "tuple[int, list[str]]":
         adjusts Transactions.Total_Amount by the same signed delta so the cash
         account balance stays correct.
 
+    Pass ``selected_trade_ids`` to restrict updates to a specific subset of trades.
     Returns (rows_updated, warnings).
     """
     from data.saxo_pdf_parser import parse_trade_commissions
@@ -1622,6 +1708,11 @@ def apply_pdf_commissions(pdf_path: "str | Path") -> "tuple[int, list[str]]":
     commissions = parse_trade_commissions(pdf_path)
     if not commissions:
         return 0, ["No trade commissions found in PDF."]
+
+    if selected_trade_ids is not None:
+        commissions = {k: v for k, v in commissions.items() if k in selected_trade_ids}
+    if not commissions:
+        return 0, ["No selected trades to apply."]
 
     updated   = 0
     warnings: list[str] = []

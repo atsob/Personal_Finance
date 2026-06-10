@@ -1164,19 +1164,24 @@ def get_portfolio_signals(selected_acc_id=None): # Προσθήκη '=' εδώ
         portfolio_status AS (
             SELECT sig.*,
                 SUM(COALESCE(h.Quantity, 0)) as current_qty,
-                (SUM(COALESCE(h.Quantity, 0)) * sig.price_today) as market_value_base_curr
+                (SUM(COALESCE(h.Quantity, 0)) * sig.price_today) as market_value_base_curr,
+                SUM(COALESCE(h.Fifo_Avg_Cost_EUR, 0) * COALESCE(h.Quantity, 0)) as total_cost_eur
             FROM investment_signals sig
             LEFT JOIN Holdings h ON sig.Securities_Id = h.Securities_Id
-                AND (%s IS NULL OR h.Accounts_Id = %s) 
-			GROUP BY sig.Securities_Id, sig.Securities_Name, sig.price_today, sig.daily_chg_pct, sig.weekly_chg_pct, 
-                     sig.monthly_chg_pct, sig.quarterly_chg_pct, sig.semiannual_chg_pct, sig.annual_chg_pct, 
-                     sig.triannual_chg_pct, sig.ytd_chg_pct, sig.vol_1m_ann, sig.vol_3m_ann, sig.vol_1y_ann, 
+                AND (%s IS NULL OR h.Accounts_Id = %s)
+			GROUP BY sig.Securities_Id, sig.Securities_Name, sig.price_today, sig.daily_chg_pct, sig.weekly_chg_pct,
+                     sig.monthly_chg_pct, sig.quarterly_chg_pct, sig.semiannual_chg_pct, sig.annual_chg_pct,
+                     sig.triannual_chg_pct, sig.ytd_chg_pct, sig.vol_1m_ann, sig.vol_3m_ann, sig.vol_1y_ann,
                      sig.vol_ytd_ann, sig.quality_score, sig.sharpe_ratio
         ),
         recommendations AS (
-            SELECT 
-                sig.*, 
+            SELECT
+                sig.*,
                 sig.market_value_base_curr * COALESCE((SELECT FX_Rate FROM Historical_FX WHERE Currencies_Id_1 = sec.Currencies_Id AND Date <= CURRENT_DATE ORDER BY Date DESC LIMIT 1), 1) as current_value_eur,
+                CASE WHEN sig.total_cost_eur > 0 THEN
+                    sig.market_value_base_curr * COALESCE((SELECT FX_Rate FROM Historical_FX WHERE Currencies_Id_1 = sec.Currencies_Id AND Date <= CURRENT_DATE ORDER BY Date DESC LIMIT 1), 1)
+                    - sig.total_cost_eur
+                ELSE NULL END as unrealized_pnl_eur,
                 sec.Analyst_Rating as wall_street_view,
                 sec.Analyst_Target_Price as target_price,
                 ROUND((((sec.Analyst_Target_Price / NULLIF(sig.price_today, 0)) - 1) * 100)::numeric, 2) as upside_pct,

@@ -7,6 +7,7 @@ from database.crud import (
     delete_historical_prices, insert_prices_from_transactions, normalize_investment_prices,
     apply_stock_split,
     apply_writeoff,
+    apply_dividend,
 )
 from database.queries import (get_price_anomalies, get_split_preview, get_all_accounts_for_nwr,
                                get_corporate_actions, get_watchlist, add_watchlist_item,
@@ -1006,7 +1007,7 @@ def render_market_data():
 
                 corp_event_type = st.radio(
                     "Event type",
-                    ["Stock Split / Reverse Split", "Default / Delisting"],
+                    ["Stock Split / Reverse Split", "Default / Delisting", "Dividend"],
                     horizontal=True,
                     key=f"corp_event_type_{inv_sec_id}",
                 )
@@ -1131,7 +1132,7 @@ def render_market_data():
                                     st.error(f"Error applying split: {e}")
 
                 # ── Branch: Default / Delisting ───────────────────────────────
-                else:
+                elif corp_event_type == "Default / Delisting":
                     st.caption(
                         "Records a company default or delisting by inserting a **ShrOut** for "
                         "the **full remaining quantity** in each account, bringing the position "
@@ -1217,6 +1218,113 @@ def render_market_data():
                                     st.rerun()
                                 except Exception as e:
                                     st.error(f"Error applying write-off: {e}")
+
+                # ── Branch: Dividend ──────────────────────────────────────────
+                elif corp_event_type == "Dividend":
+                    st.caption(
+                        "Records a dividend payment by inserting a **Dividend** entry "
+                        "per account based on current holdings. "
+                        "Enter the gross amount per share and the applicable withholding "
+                        "tax rate; the net amount is computed automatically."
+                    )
+
+                    div_dc1, div_dc2 = st.columns(2)
+                    div_gross = div_dc1.number_input(
+                        "Gross amount per share",
+                        min_value=0.0, value=0.0, step=0.01, format="%.10f",
+                        key=f"corp_div_gross_{inv_sec_id}",
+                    )
+                    div_tax = div_dc2.number_input(
+                        "Withholding tax rate (%)",
+                        min_value=0.0, max_value=100.0, value=15.0, step=0.5,
+                        format="%.2f",
+                        key=f"corp_div_tax_{inv_sec_id}",
+                    )
+                    div_net = div_gross * (1.0 - div_tax / 100.0)
+                    st.caption(f"Net per share: **{div_net:.10f}**  (gross {div_gross:.10f} − {div_tax:.2f}% tax)")
+
+                    div_date = st.date_input(
+                        "Payment date", value=datetime.date.today(),
+                        min_value=datetime.date(1900, 1, 1),
+                        key=f"corp_div_date_{inv_sec_id}",
+                    )
+                    auto_div_desc = (
+                        f"{sec_label} Dividend — {div_gross} gross / {div_net} net per share"
+                    )
+                    div_description = st.text_input(
+                        "Description",
+                        value=auto_div_desc,
+                        key=f"corp_div_desc_{inv_sec_id}_{div_gross}_{div_tax}",
+                        help="Auto-filled. Edit if needed.",
+                    )
+
+                    st.divider()
+                    if st.button("Preview", key=f"corp_div_preview_btn_{inv_sec_id}"):
+                        df_div_prev = get_split_preview(inv_sec_id, div_date, account_ids)
+                        st.session_state[f"corp_div_preview_df_{inv_sec_id}"] = df_div_prev
+
+                    if f"corp_div_preview_df_{inv_sec_id}" in st.session_state:
+                        df_div_prev = st.session_state[f"corp_div_preview_df_{inv_sec_id}"].copy()
+                        if df_div_prev.empty:
+                            st.warning(
+                                "No holdings found for this security before the selected date "
+                                "in the chosen accounts."
+                            )
+                        else:
+                            net_factor = 1.0 - div_tax / 100.0
+                            df_div_prev["gross_per_share"] = div_gross
+                            df_div_prev["net_per_share"]   = round(div_gross * net_factor, 10)
+                            df_div_prev["gross_total"]     = (df_div_prev["current_qty"] * div_gross).round(10)
+                            df_div_prev["net_total"]       = (df_div_prev["gross_total"] * net_factor).round(10)
+
+                            st.markdown(
+                                f"The following **Dividend** entr{'ies' if len(df_div_prev) > 1 else 'y'} "
+                                f"will be inserted on **{div_date}**:"
+                            )
+                            st.dataframe(
+                                df_div_prev[["account", "current_qty",
+                                             "gross_per_share", "net_per_share",
+                                             "gross_total", "net_total"]],
+                                column_config={
+                                    "account":         st.column_config.TextColumn("Account"),
+                                    "current_qty":     st.column_config.NumberColumn("Shares",          format="%.6f"),
+                                    "gross_per_share": st.column_config.NumberColumn("Gross / Share",   format="%.10f"),
+                                    "net_per_share":   st.column_config.NumberColumn("Net / Share",     format="%.10f"),
+                                    "gross_total":     st.column_config.NumberColumn("Gross Total",     format="%.4f"),
+                                    "net_total":       st.column_config.NumberColumn("Net Total",       format="%.4f"),
+                                },
+                                hide_index=True,
+                                use_container_width=True,
+                            )
+
+                            st.divider()
+                            div_confirmed = st.checkbox(
+                                "I understand this cannot be undone — record the dividend",
+                                key=f"corp_div_confirm_{inv_sec_id}",
+                            )
+                            if st.button(
+                                "Apply", type="primary",
+                                key=f"corp_div_apply_{inv_sec_id}",
+                                disabled=not div_confirmed,
+                            ):
+                                try:
+                                    holdings = df_div_prev[["accounts_id", "current_qty"]].to_dict("records")
+                                    n = apply_dividend(
+                                        securities_id=inv_sec_id,
+                                        event_date=div_date,
+                                        gross_per_share=div_gross,
+                                        tax_rate_pct=div_tax,
+                                        holdings_by_account=holdings,
+                                        description=div_description.strip(),
+                                    )
+                                    st.success(
+                                        f"Done: {n} Dividend row(s) inserted. "
+                                        "Holdings have been refreshed."
+                                    )
+                                    st.session_state.pop(f"corp_div_preview_df_{inv_sec_id}", None)
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Error recording dividend: {e}")
 
     # =========================================================================
     # TAB 3 — WATCHLIST

@@ -4603,40 +4603,121 @@ app database) lasts ~1 year and is used to auto-renew without asking you to log 
                         "records. This reads 'Booked Costs' from the PDF and "
                         "updates Commission + Total on already-imported trades."
                     )
+
+                    # ── Step 1: Preview ──────────────────────────────────────
                     if st.button(
-                        "💰 Apply Commissions from PDF",
-                        key="saxo_apply_commissions_btn",
+                        "🔍 Preview Commissions from PDF",
+                        key="saxo_preview_commissions_btn",
                     ):
                         _pdf_bytes = st.session_state.get("saxo_pdf_bytes")
                         if not _pdf_bytes:
                             st.warning("Re-upload and parse the PDF first.")
                         else:
-                            # Recreate temp file from stored bytes (original may be gone)
                             with tempfile.NamedTemporaryFile(
                                 suffix=".pdf", delete=False
                             ) as _tmp_c:
                                 _tmp_c.write(_pdf_bytes)
-                                _tmp_comm = _tmp_c.name
+                                _tmp_prev = _tmp_c.name
                             try:
-                                from data.saxo_connector import apply_pdf_commissions
-                                with st.spinner("Updating commissions…"):
-                                    _upd, _warns = apply_pdf_commissions(_tmp_comm)
-                                if _upd:
-                                    st.success(f"Updated {_upd} investment record(s).")
-                                else:
-                                    st.info("No records updated (all already have commissions or no trades matched).")
-                                for _w in _warns:
-                                    st.warning(_w)
+                                from data.saxo_connector import preview_pdf_commissions
+                                with st.spinner("Loading commission preview…"):
+                                    _prev_rows, _prev_warns = preview_pdf_commissions(_tmp_prev)
+                                st.session_state["saxo_comm_preview"] = _prev_rows
+                                st.session_state["saxo_comm_preview_warns"] = _prev_warns
                             except Exception as _exc:
-                                st.error(f"Commission update failed: {_exc}")
+                                st.error(f"Preview failed: {_exc}")
                                 st.code(traceback.format_exc())
 
+                    # ── Step 2: Show table & Apply ───────────────────────────
+                    _prev_rows = st.session_state.get("saxo_comm_preview")
+                    if _prev_rows is not None:
+                        import pandas as _pd
+
+                        _prev_warns = st.session_state.get("saxo_comm_preview_warns", [])
+                        for _w in _prev_warns:
+                            st.warning(_w)
+
+                        _df = _pd.DataFrame([
+                            {
+                                "Apply": r["selected"],
+                                "Trade ID": r["trade_id"],
+                                "Security": r["security_name"],
+                                "Action": r["action"],
+                                "Date": str(r["date"]) if r["date"] else "",
+                                "Commission (EUR)": r["pdf_commission"],
+                                "Current Total": r["current_total"],
+                                "New Total": r["new_total"],
+                                "Status": r["status"],
+                            }
+                            for r in _prev_rows
+                        ])
+
+                        _edited = st.data_editor(
+                            _df,
+                            column_config={
+                                "Apply": st.column_config.CheckboxColumn(
+                                    "Apply", help="Select rows to update"
+                                ),
+                                "Commission (EUR)": st.column_config.NumberColumn(format="%.4f"),
+                                "Current Total": st.column_config.NumberColumn(format="%.4f"),
+                                "New Total": st.column_config.NumberColumn(format="%.4f"),
+                                "Status": st.column_config.TextColumn(disabled=True),
+                            },
+                            disabled=[
+                                "Trade ID", "Security", "Action", "Date",
+                                "Commission (EUR)", "Current Total", "New Total", "Status",
+                            ],
+                            use_container_width=True,
+                            key="saxo_comm_preview_editor",
+                            hide_index=True,
+                        )
+
+                        _ready_count = int(_edited["Apply"].sum())
+                        st.caption(f"{_ready_count} of {len(_edited)} trades selected.")
+
+                        if st.button(
+                            f"💰 Apply {_ready_count} Selected Commission(s)",
+                            key="saxo_apply_commissions_btn",
+                            disabled=_ready_count == 0,
+                        ):
+                            _pdf_bytes = st.session_state.get("saxo_pdf_bytes")
+                            if not _pdf_bytes:
+                                st.warning("Re-upload and parse the PDF first.")
+                            else:
+                                _sel_ids = set(
+                                    _edited.loc[_edited["Apply"], "Trade ID"].astype(str).tolist()
+                                )
+                                with tempfile.NamedTemporaryFile(
+                                    suffix=".pdf", delete=False
+                                ) as _tmp_c:
+                                    _tmp_c.write(_pdf_bytes)
+                                    _tmp_comm = _tmp_c.name
+                                try:
+                                    from data.saxo_connector import apply_pdf_commissions
+                                    with st.spinner("Updating commissions…"):
+                                        _upd, _warns = apply_pdf_commissions(
+                                            _tmp_comm, selected_trade_ids=_sel_ids
+                                        )
+                                    if _upd:
+                                        st.success(f"Updated {_upd} investment record(s).")
+                                        st.session_state.pop("saxo_comm_preview", None)
+                                        st.session_state.pop("saxo_comm_preview_warns", None)
+                                    else:
+                                        st.info("No records updated.")
+                                    for _w in _warns:
+                                        st.warning(_w)
+                                except Exception as _exc:
+                                    st.error(f"Commission update failed: {_exc}")
+                                    st.code(traceback.format_exc())
+
                     if st.button("🔄 Clear PDF / Re-upload", key="saxo_pdf_clear"):
-                        st.session_state.pop("saxo_pdf_parsed",      None)
-                        st.session_state.pop("saxo_pdf_charges",     None)
-                        st.session_state.pop("saxo_pdf_sec_matches", None)
-                        st.session_state.pop("saxo_pdf_tmp_path",    None)
-                        st.session_state.pop("saxo_pdf_bytes",       None)
+                        st.session_state.pop("saxo_pdf_parsed",        None)
+                        st.session_state.pop("saxo_pdf_charges",       None)
+                        st.session_state.pop("saxo_pdf_sec_matches",   None)
+                        st.session_state.pop("saxo_pdf_tmp_path",      None)
+                        st.session_state.pop("saxo_pdf_bytes",         None)
+                        st.session_state.pop("saxo_comm_preview",      None)
+                        st.session_state.pop("saxo_comm_preview_warns",None)
                         st.rerun()
 
 

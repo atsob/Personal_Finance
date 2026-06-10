@@ -1315,6 +1315,75 @@ def apply_writeoff(
 
 
 # =============================================================================
+# DIVIDEND
+# =============================================================================
+
+
+def apply_dividend(
+    securities_id: int,
+    event_date,
+    gross_per_share: float,
+    tax_rate_pct: float,        # e.g. 15.0 for 15 %
+    holdings_by_account: list,  # dicts with accounts_id, current_qty
+    description: str = "",
+) -> int:
+    """
+    Record a dividend payment by inserting a Dividend investment row per account.
+
+    Price_Per_Share     = net_per_share  (gross × (1 - tax_rate/100))
+    Total_Amount_SecCur = net total    (qty × net_per_share)
+    Total_Amount_AccCur = net total    (same — keeps all three columns consistent at FX 1.0)
+
+    Also logs a Corporate_Actions record of type 'Dividend'.
+
+    Returns the number of Dividend rows inserted.
+    """
+    net_factor = 1.0 - tax_rate_pct / 100.0
+    label = description or f"Dividend — {gross_per_share} gross per share"
+
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO Corporate_Actions
+                (Securities_Id, Action_Type, Effective_Date, Description)
+            VALUES (%s, 'Dividend'::corporate_action_type, %s, %s)
+        """, (securities_id, event_date, label))
+
+        inserted = 0
+        for row in holdings_by_account:
+            acct_id = int(row["accounts_id"])
+            qty = float(row["current_qty"])
+            if qty <= 0:
+                continue
+
+            net_per_share = gross_per_share * net_factor
+            net_total     = qty * net_per_share
+
+            cur.execute("""
+                INSERT INTO Investments
+                    (Accounts_Id, Securities_Id, Date, Action,
+                     Quantity, Price_Per_Share, Commission,
+                     Total_Amount_SecCur, Total_Amount_AccCur, FX_Rate,
+                     Description)
+                VALUES (%s, %s, %s, 'Dividend', %s, %s, 0, %s, %s, 1, %s)
+            """, (acct_id, securities_id, event_date,
+                  qty, net_per_share,
+                  net_total, net_total, label))
+            inserted += 1
+
+        conn.commit()
+        update_holdings()
+        return inserted
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+# =============================================================================
 # RECURRING TEMPLATES
 # =============================================================================
 # Column naming follows the schema convention: plural-prefix for all PKs/FKs.

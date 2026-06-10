@@ -2627,14 +2627,26 @@ def render_reports():
                 if 'CONTRARIAN' in v:                               return 'color: darkorange; font-weight: bold'
                 return ''
 
+            def color_pnl(val):
+                if val is None or (hasattr(val, '__float__') and val != val):
+                    return ''
+                try:
+                    return 'color: green; font-weight: bold' if float(val) >= 0 else 'color: red; font-weight: bold'
+                except (TypeError, ValueError):
+                    return ''
+
+            _display_cols = ['final_signal', 'recommendation_signal', 'wall_street_view', 'securities_name', 'current_value_eur', 'unrealized_pnl_eur', 'sharpe_ratio', 'quality_score', 'price_today', 'upside_pct', 'target_price']
             st.dataframe(
-                df_rec[['final_signal', 'recommendation_signal', 'wall_street_view', 'securities_name', 'current_value_eur', 'sharpe_ratio', 'quality_score', 'price_today', 'upside_pct', 'target_price']].style.map(color_rec, subset=['recommendation_signal', 'final_signal']),
+                df_rec[_display_cols].style
+                    .map(color_rec, subset=['recommendation_signal', 'final_signal'])
+                    .map(color_pnl, subset=['unrealized_pnl_eur']),
                 column_config={
                     "final_signal": st.column_config.TextColumn("Final Signal", help="Conviction signals appear when our math matches Analyst views"),
                     "recommendation_signal": "Math Signal",
                     "wall_street_view": st.column_config.TextColumn("Analyst View"),
                     "securities_name": st.column_config.TextColumn("Security", width="medium"),
                     "current_value_eur": st.column_config.NumberColumn("Value", format="%,.2f €", width="small"),
+                    "unrealized_pnl_eur": st.column_config.NumberColumn("Unreal. P&L", format="%,.2f €", help="Unrealized P&L in EUR (market value minus FIFO cost basis)"),
                     "sharpe_ratio": st.column_config.NumberColumn("Sharpe", format="%.2f"),
                     "quality_score": st.column_config.NumberColumn("Quality", format="%.2f"),
                     "price_today": st.column_config.NumberColumn("Current Price", format="%.2f"),
