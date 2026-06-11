@@ -966,7 +966,7 @@ def _render_new_investment_form(acc_id, acc_type, df_accs, df_securities, get_db
     col1, col2 = st.columns(2)
 
     with col1:
-        inv_date = st.date_input("Date", value=date.today(), key=f"inv_date_{rc}")
+        inv_date = st.date_input("Date", value=date.today(), min_value=date(1900, 1, 1), key=f"inv_date_{rc}")
 
         inv_action = st.selectbox(
             "Action", ALL_ACTIONS,
@@ -1557,7 +1557,7 @@ def _render_edit_investment_form(acc_id, acc_type, df_accs, df_securities, get_d
         inv_date = st.date_input(
             "Date",
             value=sel_row['date'],
-            min_value=date(1990, 1, 1),
+            min_value=date(1900, 1, 1),
             key=f"inv_edit_date_{acc_id}",
         )
 

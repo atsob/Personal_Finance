@@ -1104,6 +1104,8 @@ def _render_investment_data_quality():
 
     anomalies_only = f3.toggle("Anomalies only", value=True, key="ic_anom_only")
     exclude_zero_price = f4.toggle("Exclude 'Price is 0 / NULL'", value=True, key="ic_excl_zero_price")
+    _, f5 = st.columns([3, 1])
+    exclude_zero_qty = f5.toggle("Exclude 'Quantity is 0 / NULL'", value=False, key="ic_excl_zero_qty")
 
     if st.button("🔍 Run Check", type="primary", key="ic_run"):
         _df = get_investment_consistency_data(account_ids)
@@ -1137,6 +1139,10 @@ def _render_investment_data_quality():
     if exclude_zero_price:
         df["anomalies"] = df["anomalies"].str.replace(
             r"(?:;\s*)?Price is 0 / NULL", "", regex=True
+        ).str.replace(r"^;\s*", "", regex=True).str.strip("; ")
+    if exclude_zero_qty:
+        df["anomalies"] = df["anomalies"].str.replace(
+            r"(?:;\s*)?Quantity is 0 / NULL", "", regex=True
         ).str.replace(r"^;\s*", "", regex=True).str.strip("; ")
 
     df_show = df if not anomalies_only else df[df["anomalies"] != ""]

@@ -491,15 +491,24 @@ def download_dividend_history(target_sec_id=None):
     custom_session = get_custom_session()
 
     def _infer_frequency(dividends: "pd.Series") -> "str | None":
-        """Return frequency label from a yfinance dividends Series."""
+        """Return frequency label from a yfinance dividends Series.
+
+        Strategy:
+        1. Try the most recent *completed* calendar year (i.e. not the current
+           partial year) — most reliable signal.
+        2. If no completed year has data, fall back to a trailing-12-month
+           window anchored to the latest ex-date.
+        3. As a last resort, use the current partial year.
+
+        This avoids mis-classifying a quarterly payer as Semi-Annual simply
+        because only 2 of 4 payments have occurred in the current year.
+        """
         if dividends is None or dividends.empty:
             return None
-        # Use the most recent full calendar year with at least one payment
-        years = sorted(dividends.index.year.unique(), reverse=True)
-        for yr in years:
-            count = int((dividends.index.year == yr).sum())
-            if count == 0:
-                continue
+
+        import datetime as _dt
+
+        def _label(count: int) -> str:
             if count >= 10:
                 return "Monthly"
             if count >= 4:
@@ -507,12 +516,45 @@ def download_dividend_history(target_sec_id=None):
             if count >= 2:
                 return "Semi-Annual"
             return "Annual"
+
+        current_year = _dt.date.today().year
+
+        # 1. Most recent completed calendar year with at least one payment
+        completed_years = sorted(
+            [yr for yr in dividends.index.year.unique() if yr < current_year],
+            reverse=True,
+        )
+        for yr in completed_years:
+            count = int((dividends.index.year == yr).sum())
+            if count > 0:
+                return _label(count)
+
+        # 2. Trailing 12-month window anchored to the latest ex-date
+        latest = dividends.index.max()
+        cutoff = latest - pd.DateOffset(months=12)
+        trailing = dividends[dividends.index > cutoff]
+        if not trailing.empty:
+            return _label(len(trailing))
+
+        # 3. Current partial year as last resort
+        count = int((dividends.index.year == current_year).sum())
+        if count > 0:
+            return _label(count)
+
         return None
 
     def _fetch(sec_id, sec_name, symbol):
         try:
-            ticker  = yf.Ticker(symbol, session=custom_session)
-            divs    = ticker.dividends          # pandas Series, index = ex-date
+            import logging as _logging
+            # yfinance logs period errors at ERROR level before raising — suppress them
+            _yf_logger = _logging.getLogger("yfinance")
+            _prev_level = _yf_logger.level
+            _yf_logger.setLevel(_logging.CRITICAL)
+            try:
+                ticker = yf.Ticker(symbol, session=custom_session)
+                divs   = ticker.dividends       # pandas Series, index = ex-date
+            finally:
+                _yf_logger.setLevel(_prev_level)
             if divs is None or divs.empty:
                 return sec_id, sec_name, symbol, [], None, None
             rows = []
