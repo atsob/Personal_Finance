@@ -4955,10 +4955,10 @@ def render_net_worth_report():
         return ''
 
     # ── Tabs ──────────────────────────────────────────────────────────────
-    tab1, tab2, tab3, tab4 = st.tabs(["📊 Overview", "📋 Summary per Type", "🔍 Detail Analysis", "💰 Account Balances"])
+    tab_overview, tab_account_balances, tab_summary, tab_detail = st.tabs(["📊 Overview", "💰 Account Balances", "📋 Summary per Type", "🔍 Detail Analysis"])
 
     # ═══════════════════════════════════════════════════════════════════════
-    with tab1:
+    with tab_overview:
         # ── Chart ─────────────────────────────────────────────────────────
         chart_rows = []
         for p in period_cols:
@@ -5167,7 +5167,7 @@ def render_net_worth_report():
                     copy_df_button(detail_pivot, key="dl_rpt_nwr_detail")
 
     # ═══════════════════════════════════════════════════════════════════════
-    with tab2:
+    with tab_summary:
         GROUP_ORDER = ['Cash & Bank', 'Investments', 'Pension', 'Other Assets',
                        'Credit Cards', 'Loans', 'Other Liabilities']
 
@@ -5210,7 +5210,7 @@ def render_net_worth_report():
         copy_df_button(df_summary, key="dl_rpt_nwr_summary")
 
     # ═══════════════════════════════════════════════════════════════════════
-    with tab3:
+    with tab_detail:
         selected_period = st.selectbox(
             "Select Period:",
             options=period_cols[::-1],
@@ -5278,7 +5278,7 @@ def render_net_worth_report():
                 copy_df_button(df_breakdown, key="dl_rpt_nwr_breakdown")
 
     # ═══════════════════════════════════════════════════════════════════════
-    with tab4:
+    with tab_account_balances:
         # ── Stacked bar chart by account group + Balance line ──────────────
         GROUP_COLORS = {
             'Cash & Bank':       '#FFD700',

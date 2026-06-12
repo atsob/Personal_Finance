@@ -659,7 +659,8 @@ def render_market_data():
                             COALESCE(i.quantity, 0)                AS "Quantity",
                             COALESCE(i.price_per_share, 0)         AS "Price/Share",
                             COALESCE(i.commission, 0)              AS "Commission",
-                            COALESCE(i.total_amount_acccur, 0)     AS "Total Amount",
+                            COALESCE(i.total_amount_seccur, 0)     AS "Total (Sec. Cur.)",
+                            COALESCE(i.total_amount_acccur, 0)     AS "Total (Acc. Cur.)",
                             i.description                          AS "Description"
                         FROM Investments i
                         JOIN Accounts a ON a.accounts_id = i.accounts_id
@@ -684,9 +685,9 @@ def render_market_data():
                                 ELSE 0 END)                                           AS "Qty Held",
                             SUM(CASE
                                 WHEN i.action IN ('Buy','ShrIn','Reinvest','Vest','Grant','Exercise')
-                                     THEN  COALESCE(i.total_amount_acccur, 0)
+                                     THEN  COALESCE(i.total_amount_seccur, i.total_amount_acccur, 0)
                                 WHEN i.action IN ('Sell','ShrOut','Expire')
-                                     THEN -COALESCE(i.total_amount_acccur, 0)
+                                     THEN -COALESCE(i.total_amount_seccur, i.total_amount_acccur, 0)
                                 ELSE 0 END)                                           AS "Cost Basis"
                         FROM Investments i
                         JOIN Accounts a ON a.accounts_id = i.accounts_id
@@ -724,9 +725,9 @@ def render_market_data():
                     st.dataframe(_df_hold_disp, width="stretch", hide_index=True,
                         column_config={
                             "Qty Held":       st.column_config.NumberColumn(format="%,.4f"),
-                            "Cost Basis":     st.column_config.NumberColumn(format="%,.2f"),
+                            "Cost Basis":     st.column_config.NumberColumn(format="%,.2f", help="Cost basis in the security's trading currency (same as the price)"),
                             "Cur. Value":     st.column_config.NumberColumn(format="%,.2f"),
-                            "Unrealised P&L": st.column_config.NumberColumn(format="%,.2f"),
+                            "Unrealised P&L": st.column_config.NumberColumn(format="%,.2f", help="Unrealised P&L in the security's trading currency"),
                         })
                     copy_df_button(_df_hold_disp, key=f"mkt_dl_holdings_{inv_sec_id}")
 
@@ -734,11 +735,12 @@ def render_market_data():
                 if not df_inv_det.empty:
                     st.dataframe(df_inv_det, width="stretch", hide_index=True,
                         column_config={
-                            "Date":         st.column_config.DateColumn(format="DD/MM/YYYY"),
-                            "Quantity":     st.column_config.NumberColumn(format="%,.4f"),
-                            "Price/Share":  st.column_config.NumberColumn(format="%,.4f"),
-                            "Commission":   st.column_config.NumberColumn(format="%,.4f"),
-                            "Total Amount": st.column_config.NumberColumn(format="%,.2f"),
+                            "Date":              st.column_config.DateColumn(format="DD/MM/YYYY"),
+                            "Quantity":          st.column_config.NumberColumn(format="%,.4f"),
+                            "Price/Share":       st.column_config.NumberColumn(format="%,.4f"),
+                            "Commission":        st.column_config.NumberColumn(format="%,.4f"),
+                            "Total (Sec. Cur.)": st.column_config.NumberColumn(format="%,.2f", help="Total amount in the security's trading currency"),
+                            "Total (Acc. Cur.)": st.column_config.NumberColumn(format="%,.2f", help="Total amount in the account's base currency"),
                         })
                     copy_df_button(df_inv_det, key=f"mkt_dl_inv_txns_{inv_sec_id}")
                 else:
