@@ -1154,6 +1154,14 @@ def render_revolut_brokerage_import() -> None:
                     st.session_state["revt_account"] = _row.iloc[0]["accounts_name"]
             except Exception:
                 pass
+    if "revt_replace" not in st.session_state:
+        st.session_state["revt_replace"] = get_app_setting("revt_replace") == "true"
+    if "revt_import_inv" not in st.session_state:
+        _v = get_app_setting("revt_import_inv")
+        st.session_state["revt_import_inv"] = (_v != "false")  # default True
+    if "revt_import_tx" not in st.session_state:
+        _v = get_app_setting("revt_import_tx")
+        st.session_state["revt_import_tx"] = (_v != "false")   # default True
 
     with st.expander("ℹ️ How to export from Revolut Trading (click to expand)", expanded=False):
         st.markdown("""
@@ -1411,6 +1419,9 @@ def render_revolut_brokerage_import() -> None:
                     _import_summary(counts)
                     try:
                         save_app_setting("revt_account_id", str(acc_id))
+                        save_app_setting("revt_replace",    "true" if replace_mode else "false")
+                        save_app_setting("revt_import_inv", "true" if _import_inv  else "false")
+                        save_app_setting("revt_import_tx",  "true" if _import_tx   else "false")
                     except Exception:
                         pass
                     for k in ("revt_parsed", "revt_inv_records", "revt_tx_records",
@@ -1590,7 +1601,7 @@ def render_revolut_savings_import() -> None:
         "(Flexible Cash Funds / money-market) account using the savings statement CSV."
     )
 
-    # ── Restore last-used account (first render only) ────────────────────────
+    # ── Restore last-used settings (first render only) ───────────────────────
     from database.queries import get_app_setting, save_app_setting
     if "revs_account" not in st.session_state:
         _saved = get_app_setting("revs_account_id")
@@ -1602,6 +1613,12 @@ def render_revolut_savings_import() -> None:
                     st.session_state["revs_account"] = _row.iloc[0]["accounts_name"]
             except Exception:
                 pass
+    if "revs_mode" not in st.session_state:
+        _saved_mode = get_app_setting("revs_mode")
+        if _saved_mode:
+            st.session_state["revs_mode"] = _saved_mode
+    if "revs_replace" not in st.session_state:
+        st.session_state["revs_replace"] = get_app_setting("revs_replace") == "true"
 
     with st.expander("ℹ️ How to export from Revolut Savings (click to expand)", expanded=False):
         st.markdown("""
@@ -1954,6 +1971,8 @@ def render_revolut_savings_import() -> None:
                     _import_summary(counts)
                     try:
                         save_app_setting("revs_account_id", str(acc_id))
+                        save_app_setting("revs_mode", import_mode)
+                        save_app_setting("revs_replace", "true" if replace_mode else "false")
                     except Exception:
                         pass
                     for k in ("revs_parsed", "revs_parsed_mode",
@@ -4785,7 +4804,7 @@ def render_revolut_import() -> None:
         "CSV statement export from the Revolut app."
     )
 
-    # ── Restore last-used account (first render only) ────────────────────────
+    # ── Restore last-used settings (first render only) ───────────────────────
     from database.queries import get_app_setting, save_app_setting
     if "rev_account" not in st.session_state:
         _saved = get_app_setting("rev_account_id")
@@ -4797,6 +4816,8 @@ def render_revolut_import() -> None:
                     st.session_state["rev_account"] = _row.iloc[0]["accounts_name"]
             except Exception:
                 pass
+    if "rev_replace" not in st.session_state:
+        st.session_state["rev_replace"] = get_app_setting("rev_replace") == "true"
 
     with st.expander("ℹ️ How to export from Revolut (click to expand)", expanded=False):
         st.markdown("""
@@ -4941,6 +4962,7 @@ def render_revolut_import() -> None:
                 _import_summary(counts)
                 try:
                     save_app_setting("rev_account_id", str(acc_id))
+                    save_app_setting("rev_replace", "true" if replace_mode else "false")
                 except Exception:
                     pass
                 for k in ("rev_parsed", "rev_inv_records", "rev_tx_records", "rev_df_raw"):

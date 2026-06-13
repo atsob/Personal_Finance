@@ -714,8 +714,21 @@ def _render_normalize_investments():
         "Total Amount ÷ Price, leaving Total Amount unchanged so P&L is preserved."
     )
 
+    price_tolerance_pct = st.slider(
+        "Price tolerance vs. historical close (%)",
+        min_value=5.0, max_value=50.0, value=10.0, step=1.0,
+        help=(
+            "Transactions where Quantity is a whole number and the recorded price "
+            "differs from the historical close by **less than this %** are considered "
+            "legitimate execution-price variation and will NOT be flagged. "
+            "Raise this if real trades are incorrectly appearing; lower it to catch "
+            "more aggressive placeholders."
+        ),
+        key="ni_tol_pct",
+    )
+
     with st.spinner("Scanning investments…"):
-        df = get_investments_with_dummy_prices()
+        df = get_investments_with_dummy_prices(price_tolerance_pct=price_tolerance_pct)
 
     if df.empty:
         st.success("No investments with dummy prices found — all transactions already use actual prices.")
@@ -753,28 +766,62 @@ def _render_normalize_investments():
     )
 
     # ── Position-closure sanity check ────────────────────────────────────────
-    # Compute expected net qty per (account, security) after normalization.
-    # Buys contribute +new_qty, sells contribute -new_qty.
+    # Warn only when the flagged set contains BOTH buys and sells for the same
+    # (account, security) and they don't net to zero — that means the position
+    # won't close correctly after normalization.  Pure-buy or pure-sell groups
+    # are open positions and a non-zero net qty is expected.
     pos_check = df_view.copy()
+    pos_check['is_buy']  = pos_check['action'].isin(('Buy', 'Reinvest', 'ShrIn'))
+    pos_check['is_sell'] = pos_check['action'].isin(('Sell', 'ShrOut'))
     pos_check['signed_new_qty'] = pos_check.apply(
-        lambda r: r['new_qty'] if r['action'] in ('Buy', 'Reinvest', 'ShrIn') else -r['new_qty'],
+        lambda r: r['new_qty'] if r['is_buy'] else -r['new_qty'],
         axis=1,
     )
-    net_pos = (
-        pos_check.groupby(['account_name', 'security_name'])['signed_new_qty']
-        .sum()
-        .reset_index()
-        .rename(columns={'signed_new_qty': 'net_qty'})
-    )
-    non_zero = net_pos[net_pos['net_qty'].abs() > 0.0001]
-    if not non_zero.empty:
-        msg = "**Position closure warning** — after normalization the following will have a non-zero net holding:\n"
-        for _, row in non_zero.iterrows():
-            msg += f"- {row['account_name']} / {row['security_name']}: net qty = {row['net_qty']:+.6f}\n"
-        st.warning(msg)
+    grp = pos_check.groupby(['account_name', 'security_name'])
+    mixed_groups = [
+        name for name, g in grp
+        if g['is_buy'].any() and g['is_sell'].any()
+    ]
+    if mixed_groups:
+        net_pos = (
+            pos_check[pos_check.apply(
+                lambda r: (r['account_name'], r['security_name']) in mixed_groups, axis=1
+            )]
+            .groupby(['account_name', 'security_name'])['signed_new_qty']
+            .sum()
+            .reset_index()
+            .rename(columns={'signed_new_qty': 'net_qty'})
+        )
+        non_zero = net_pos[net_pos['net_qty'].abs() > 0.0001]
+        if not non_zero.empty:
+            msg = "**Position closure warning** — these have both buys and sells flagged, but they don't net to zero after normalization:\n"
+            for _, row in non_zero.iterrows():
+                msg += f"- {row['account_name']} / {row['security_name']}: net qty = {row['net_qty']:+.6f}\n"
+            st.warning(msg)
 
     df_display = df_view.copy()
     df_display['date'] = pd.to_datetime(df_display['date']).dt.date
+    df_display['Δ Price'] = df_display['new_price'] - df_display['current_price']
+    df_display['Δ Qty']   = df_display['new_qty']   - df_display['current_qty']
+
+    n_price_change = (df_display['Δ Price'].abs() > 0.00001).sum()
+    n_qty_change   = (df_display['Δ Qty'].abs()   > 0.00001).sum()
+    n_no_change    = ((df_display['Δ Price'].abs() <= 0.00001) & (df_display['Δ Qty'].abs() <= 0.00001)).sum()
+
+    # Only show rows that will actually change
+    df_display = df_display[
+        (df_display['Δ Price'].abs() > 0.00001) | (df_display['Δ Qty'].abs() > 0.00001)
+    ]
+
+    _sum_cols = st.columns(3)
+    _sum_cols[0].metric("Price will change",    n_price_change, help="Rows where Price/Share will be updated")
+    _sum_cols[1].metric("Quantity will change",  n_qty_change,   help="Rows where Quantity will be recalculated")
+    _sum_cols[2].metric("Skipped (already correct)", n_no_change, help="Rows where current values already match the historical price — excluded from the table below")
+
+    if df_display.empty:
+        st.success("All flagged transactions already match their historical price — nothing to normalize.")
+        return
+
     st.dataframe(
         df_display,
         column_config={
@@ -794,6 +841,10 @@ def _render_normalize_investments():
                                    help='Buys: total/hist_price  •  Sells: proportional from buy qty'),
             'new_price':       st.column_config.NumberColumn('New Price', format='%.4f',
                                    help='Buys: hist close  •  Sells: effective realised price (total/qty)'),
+            'Δ Price':         st.column_config.NumberColumn('Δ Price', format='%+.4f',
+                                   help='Difference between New Price and Current Price. Zero = no change.'),
+            'Δ Qty':           st.column_config.NumberColumn('Δ Qty',   format='%+.6f',
+                                   help='Difference between New Qty and Current Qty. Zero = no change.'),
         },
         hide_index=True,
         width="stretch",
@@ -802,7 +853,8 @@ def _render_normalize_investments():
     st.caption(
         "**Buys**: Price ← hist close, Qty ← Total ÷ hist close.  "
         "**Sells**: Qty is distributed from the total buy quantity so the position closes; "
-        "Price is the effective realised price (Total ÷ Qty), not the hist close."
+        "Price is the effective realised price (Total ÷ Qty), not the hist close.  "
+        "Rows where both Δ Price and Δ Qty are 0 are already correct and will not be changed."
     )
 
     col_norm, col_norm_all, col_info = st.columns([1, 1, 3])

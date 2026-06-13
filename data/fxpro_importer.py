@@ -1169,6 +1169,17 @@ def render_fxpro_importer():
         "Upload multiple PDFs at once to import several statements for the same account."
     )
 
+    # ── Restore last-used settings (first render only) ───────────────────────
+    from database.queries import get_app_setting, save_app_setting
+    if "fxp_acc_mode" not in st.session_state:
+        st.session_state["fxp_acc_mode"] = get_app_setting("fxp_acc_mode") or "Existing"
+    if "fxp_acc_select" not in st.session_state:
+        _saved = get_app_setting("fxp_acc_select")
+        if _saved:
+            st.session_state["fxp_acc_select"] = _saved
+    if "fxp_replace_mode" not in st.session_state:
+        st.session_state["fxp_replace_mode"] = get_app_setting("fxp_replace_mode") == "true"
+
     pdf_files = st.file_uploader(
         "FxPro Statement PDFs",
         type="pdf",
@@ -1350,6 +1361,12 @@ def render_fxpro_importer():
                 progress_cb=lambda p: progress.progress(p, text="Importing…"),
             )
             _save_mapping(security_map)   # persist mapping after every successful import
+            try:
+                save_app_setting("fxp_acc_mode",    mode)
+                save_app_setting("fxp_acc_select",  selected_name if mode == "Existing" else "")
+                save_app_setting("fxp_replace_mode", "true" if replace_mode else "false")
+            except Exception:
+                pass
             progress.progress(1.0, text="Done.")
             deleted_msg = (
                 f" Deleted first: {counts['deleted_investments']} investments · "

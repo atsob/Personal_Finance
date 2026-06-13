@@ -665,6 +665,21 @@ def render_capitalcom_importer():
         "Upload both CSV exports from the Capital.com platform."
     )
 
+    # ── Restore last-used settings (first render only) ───────────────────────
+    from database.queries import get_app_setting, save_app_setting
+    if "cap_acc_mode" not in st.session_state:
+        st.session_state["cap_acc_mode"] = get_app_setting("cap_acc_mode") or "Existing"
+    if "cap_acc_select" not in st.session_state:
+        _saved = get_app_setting("cap_acc_select")
+        if _saved:
+            st.session_state["cap_acc_select"] = _saved
+    if "cap_include_swaps" not in st.session_state:
+        st.session_state["cap_include_swaps"] = get_app_setting("cap_include_swaps") != "false"
+    if "cap_include_divs" not in st.session_state:
+        st.session_state["cap_include_divs"] = get_app_setting("cap_include_divs") != "false"
+    if "cap_replace_mode" not in st.session_state:
+        st.session_state["cap_replace_mode"] = get_app_setting("cap_replace_mode") == "true"
+
     col_t, col_f = st.columns(2)
     with col_t:
         trades_file = st.file_uploader(
@@ -833,6 +848,14 @@ def render_capitalcom_importer():
                 f"Skipped (already exist): {counts['investments_skip']} investments · "
                 f"{counts['transactions_skip']} transactions.{deleted_msg}"
             )
+            try:
+                save_app_setting("cap_acc_mode",      mode)
+                save_app_setting("cap_acc_select",    selected_name if mode == "Existing" else "")
+                save_app_setting("cap_include_swaps", "true" if include_swaps    else "false")
+                save_app_setting("cap_include_divs",  "true" if include_dividends else "false")
+                save_app_setting("cap_replace_mode",  "true" if replace_mode     else "false")
+            except Exception:
+                pass
             st.rerun()
         except Exception as e:
             progress.empty()

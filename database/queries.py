@@ -683,12 +683,16 @@ def get_missing_tx_prices() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=60)
-def get_investments_with_dummy_prices() -> pd.DataFrame:
+def get_investments_with_dummy_prices(price_tolerance_pct: float = 1.0) -> pd.DataFrame:
     """Return Investments rows where Quantity or Price_Per_Share looks like a placeholder.
 
     Detection: Price_Per_Share is a whole number (no decimal component) AND either
     a Historical_Price exists (buy side) or there are corresponding buys to match against
     (sell side).
+
+    The second branch (whole-number quantity + price differs from close) uses a
+    percentage-based tolerance so that normal intraday execution-price variation is
+    not flagged as a dummy.  price_tolerance_pct defaults to 1.0 (1 %).
 
     Preview columns:
       • Buys  — new_qty = Total_Amount_SecCur / hist_price  (phase-1 formula)
@@ -698,6 +702,7 @@ def get_investments_with_dummy_prices() -> pd.DataFrame:
     Total_Amount_AccCur is never touched.
     """
     conn = get_connection()
+    tol = float(price_tolerance_pct) / 100.0   # e.g. 1.0 % → 0.01
     df = pd.read_sql("""
         WITH
         -- Identify candidate rows (whole-number price → dummy placeholder)
@@ -710,14 +715,24 @@ def get_investments_with_dummy_prices() -> pd.DataFrame:
               AND i.Price_Per_Share > 0
               AND i.Total_Amount_AccCur    > 0
               AND (
-                  i.Price_Per_Share = FLOOR(i.Price_Per_Share)
+                  -- Whole-number price that also differs from hist close beyond tolerance
+                  (i.Price_Per_Share = FLOOR(i.Price_Per_Share)
+                   AND EXISTS (
+                       SELECT 1 FROM Historical_Prices hp2
+                       WHERE hp2.Securities_Id = i.Securities_Id
+                         AND hp2.Date          = i.Date
+                         AND ABS(i.Price_Per_Share - hp2.Close)
+                             / NULLIF(hp2.Close, 0) > %(tol)s
+                   ))
                   OR
+                  -- Whole-number quantity whose price also differs beyond tolerance
                   (i.Quantity = FLOOR(i.Quantity)
                    AND EXISTS (
                        SELECT 1 FROM Historical_Prices hp2
                        WHERE hp2.Securities_Id = i.Securities_Id
                          AND hp2.Date          = i.Date
-                         AND ABS(i.Price_Per_Share - hp2.Close) > 0.001
+                         AND ABS(i.Price_Per_Share - hp2.Close)
+                             / NULLIF(hp2.Close, 0) > %(tol)s
                    ))
               )
         ),
@@ -780,7 +795,7 @@ def get_investments_with_dummy_prices() -> pd.DataFrame:
         WHERE (c.action IN ('Buy','Reinvest','ShrIn') AND hp.Close IS NOT NULL)
            OR (c.action IN ('Sell','ShrOut')           AND bt.total_buy_qty IS NOT NULL)
         ORDER BY s.Securities_Name, c.Date
-    """, conn)
+    """, conn, params={"tol": tol})
     conn.close()
     return df
 
