@@ -996,7 +996,7 @@ def render_market_data():
                             "created_at":    st.column_config.TextColumn("Recorded At",  width="medium"),
                         },
                         hide_index=True,
-                        use_container_width=True,
+                        width='stretch',
                     )
                 st.divider()
 
@@ -1101,7 +1101,7 @@ def render_market_data():
                                     "action":      st.column_config.TextColumn("Action", width="small"),
                                 },
                                 hide_index=True,
-                                use_container_width=True,
+                                width='stretch',
                             )
 
                             st.divider()
@@ -1190,7 +1190,7 @@ def render_market_data():
                                     "action":      st.column_config.TextColumn("Action", width="small"),
                                 },
                                 hide_index=True,
-                                use_container_width=True,
+                                width='stretch',
                             )
 
                             st.divider()
@@ -1296,7 +1296,7 @@ def render_market_data():
                                     "net_total":       st.column_config.NumberColumn("Net Total",       format="%.4f"),
                                 },
                                 hide_index=True,
-                                use_container_width=True,
+                                width='stretch',
                             )
 
                             st.divider()
@@ -1365,7 +1365,7 @@ def render_market_data():
                     .map(_colour_pct,    subset=['pct_from_target', 'pct_from_stop'])
                     .map(_colour_upside, subset=['upside_to_analyst']),
                 hide_index=True,
-                use_container_width=True,
+                width='stretch',
                 column_config={
                     'securities_name':   st.column_config.TextColumn('Security'),
                     'securities_type':   st.column_config.TextColumn('Type'),

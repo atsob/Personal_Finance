@@ -539,36 +539,65 @@ def _render_transaction_table(acc_id, payee_options, acc_options, cat_options, t
 
 
 @st.dialog("🔍 Transaction Search Results", width="large")
-def _search_dialog(query: str) -> None:
-    """Full-text search across payee, description, memo, category, and account name."""
+def _search_dialog(query: str, payee_options: dict, acc_options: dict) -> None:
+    """Full-text search across payee, description, memo, category, and account name.
+
+    Results are displayed in an editable table — Payee, Description, Date, Amount,
+    Cleared, and Target Account can all be changed inline and saved back to the DB.
+    """
     from database.connection import get_connection as _gc
 
     term = f"%{query.strip()}%"
 
     conn = _gc()
+    # Fetch the raw Transactions columns needed for editing, plus display extras.
     df_res = pd.read_sql("""
+        WITH RECURSIVE
+        CategoryHierarchy AS (
+            SELECT Categories_Id,
+                   Categories_Name::TEXT AS Full_Path
+              FROM Categories
+             WHERE Categories_Id_Parent IS NULL
+            UNION ALL
+            SELECT c.Categories_Id,
+                   ch.Full_Path || ' : ' || c.Categories_Name
+              FROM Categories c
+              JOIN CategoryHierarchy ch ON c.Categories_Id_Parent = ch.Categories_Id
+        ),
+        SplitSummary AS (
+            SELECT s.Transactions_Id,
+                   STRING_AGG(DISTINCT COALESCE(ch.Full_Path, c.Categories_Name), ', ') AS categories,
+                   STRING_AGG(DISTINCT s.Memo, ', ')                                     AS memos
+              FROM Splits s
+              LEFT JOIN Categories       c  ON c.Categories_Id  = s.Categories_Id
+              LEFT JOIN CategoryHierarchy ch ON ch.Categories_Id = s.Categories_Id
+             GROUP BY s.Transactions_Id
+        )
         SELECT DISTINCT
-               t.Transactions_Id                      AS id,
-               t.Date                                 AS date,
-               a.Accounts_Name                        AS account,
-               p.Payees_Name                          AS payee,
-               t.Description                          AS description,
-               t.Total_Amount                         AS amount,
-               t.Cleared                              AS cleared,
-               STRING_AGG(DISTINCT c.Categories_Name, ', ')  AS categories,
-               STRING_AGG(DISTINCT s.Memo,            ', ')  AS memos
+               t.Transactions_Id     AS transactions_id,
+               t.Date                AS date,
+               a.Accounts_Name       AS account,
+               t.Payees_Id           AS payees_id,
+               t.Description         AS description,
+               t.Total_Amount        AS total_amount,
+               t.Cleared             AS cleared,
+               t.Accounts_Id_Target  AS accounts_id_target,
+               t.Total_Amount_Target AS total_amount_target,
+               t.Transfers_Id        AS transfers_id,
+               ss.categories,
+               ss.memos
           FROM Transactions t
-          LEFT JOIN Accounts    a ON a.Accounts_Id    = t.Accounts_Id
-          LEFT JOIN Payees      p ON p.Payees_Id      = t.Payees_Id
-          LEFT JOIN Splits      s ON s.Transactions_Id = t.Transactions_Id
-          LEFT JOIN Categories  c ON c.Categories_Id  = s.Categories_Id
-         WHERE t.Description   ILIKE %(term)s
-            OR p.Payees_Name   ILIKE %(term)s
-            OR a.Accounts_Name ILIKE %(term)s
-            OR s.Memo          ILIKE %(term)s
+          LEFT JOIN Accounts     a  ON a.Accounts_Id     = t.Accounts_Id
+          LEFT JOIN Payees       p  ON p.Payees_Id       = t.Payees_Id
+          LEFT JOIN SplitSummary ss ON ss.Transactions_Id = t.Transactions_Id
+          -- joins below are only for the WHERE filter
+          LEFT JOIN Splits       s  ON s.Transactions_Id  = t.Transactions_Id
+          LEFT JOIN Categories   c  ON c.Categories_Id   = s.Categories_Id
+         WHERE t.Description     ILIKE %(term)s
+            OR p.Payees_Name     ILIKE %(term)s
+            OR a.Accounts_Name   ILIKE %(term)s
+            OR s.Memo            ILIKE %(term)s
             OR c.Categories_Name ILIKE %(term)s
-         GROUP BY t.Transactions_Id, t.Date, a.Accounts_Name,
-                  p.Payees_Name, t.Description, t.Total_Amount, t.Cleared
          ORDER BY t.Date DESC, t.Transactions_Id DESC
          LIMIT 500
     """, conn, params={"term": term})
@@ -580,29 +609,107 @@ def _search_dialog(query: str) -> None:
         st.info("No transactions matched your search.")
         return
 
-    df_res["date"] = pd.to_datetime(df_res["date"]).dt.strftime("%Y-%m-%d")
-    df_res["amount"] = df_res["amount"].astype(float)
+    df_res["total_amount"] = df_res["total_amount"].astype(float)
 
-    st.dataframe(
+    # _orig_key tracks pre-edit state only within a single dialog session.
+    # It is keyed by query + the earliest transactions_id in the result so that
+    # a fresh DB fetch (different rows or different values) always wins over cache.
+    _freshness = str(df_res["transactions_id"].min()) + str(len(df_res))
+    _orig_key = f"_search_orig_{query}_{_freshness}"
+    if _orig_key not in st.session_state:
+        # Clear any stale snapshot for this query before storing the fresh one
+        for _k in [k for k in st.session_state if k.startswith(f"_search_orig_{query}")]:
+            del st.session_state[_k]
+        st.session_state[_orig_key] = df_res.copy()
+    df_original = st.session_state[_orig_key]
+
+    edited = st.data_editor(
         df_res,
         hide_index=True,
-        use_container_width=True,
+        width='stretch',
+        key=f"_search_editor_{query}",
         column_config={
-            "id":          st.column_config.NumberColumn("ID",          width="small"),
-            "date":        st.column_config.TextColumn("Date",          width="small"),
-            "account":     st.column_config.TextColumn("Account"),
-            "payee":       st.column_config.TextColumn("Payee"),
-            "description": st.column_config.TextColumn("Description"),
-            "amount":      st.column_config.NumberColumn("Amount",      format="%,.2f", width="small"),
-            "cleared":     st.column_config.CheckboxColumn("Clr",       width="small"),
-            "categories":  st.column_config.TextColumn("Categories"),
-            "memos":       st.column_config.TextColumn("Memos"),
+            "transactions_id":    st.column_config.NumberColumn("ID",             width="small",  disabled=True),
+            "date":               st.column_config.DateColumn("Date",             width="small",  format="DD/MM/YYYY"),
+            "account":            st.column_config.TextColumn("Account",                          disabled=True),
+            "payees_id":          st.column_config.SelectboxColumn(
+                                      "Payee",
+                                      options=list(payee_options.keys()),
+                                      format_func=lambda x: payee_options.get(x, "—"),
+                                  ),
+            "description":        st.column_config.TextColumn("Description"),
+            "total_amount":       st.column_config.NumberColumn("Amount",         width="small",  format="%,.2f"),
+            "cleared":            st.column_config.CheckboxColumn("Clr",          width="small"),
+            "accounts_id_target": st.column_config.SelectboxColumn(
+                                      "Target Account",
+                                      options=[None] + list(acc_options.keys()),
+                                      format_func=lambda x: acc_options.get(x, "—") if x else "—",
+                                  ),
+            "total_amount_target": st.column_config.NumberColumn("Target Amt",   width="small",  format="%,.2f"),
+            "transfers_id":       None,
+            "categories":         st.column_config.TextColumn("Categories",                       disabled=True),
+            "memos":              st.column_config.TextColumn("Memos",                            disabled=True),
         },
-        column_order=["id","date","account","payee","description","amount","cleared","categories","memos"],
+        column_order=[
+            "transactions_id", "date", "account", "payees_id", "description",
+            "total_amount", "cleared", "accounts_id_target", "total_amount_target",
+            "categories", "memos",
+        ],
     )
 
-    total = df_res["amount"].sum()
+    total = df_original["total_amount"].sum()
     st.caption(f"Sum of matched amounts: **{total:,.2f}**")
+
+    # Change detection — exclude read-only display columns
+    _cmp_cols = ["transactions_id", "date", "payees_id", "description",
+                 "total_amount", "cleared", "accounts_id_target", "total_amount_target"]
+    try:
+        _has_changes = not edited[_cmp_cols].astype(
+            df_original[_cmp_cols].dtypes.to_dict()
+        ).equals(df_original[_cmp_cols])
+    except Exception:
+        _has_changes = not edited[_cmp_cols].equals(df_original[_cmp_cols])
+
+    if _has_changes:
+        if st.button("💾 Save Changes", type="primary", key=f"_search_save_{query}"):
+            _editable = ["date", "payees_id", "description",
+                         "total_amount", "cleared", "accounts_id_target", "total_amount_target"]
+            from database.crud import _safe_val
+            try:
+                with get_db() as _conn_save:
+                    _cur = _conn_save.cursor()
+                    _n = 0
+                    for _, edit_row in edited.iterrows():
+                        tx_id = int(edit_row["transactions_id"])
+                        orig_rows = df_original[df_original["transactions_id"] == tx_id]
+                        if orig_rows.empty:
+                            continue
+                        orig_row = orig_rows.iloc[0]
+                        # Build SET clause only for columns that actually changed
+                        _sets, _vals = [], []
+                        for col in _editable:
+                            new_v = _safe_val(edit_row[col])
+                            old_v = _safe_val(orig_row[col])
+                            if new_v != old_v:
+                                _sets.append(f"{col} = %s")
+                                _vals.append(new_v)
+                        if not _sets:
+                            continue
+                        _vals.append(tx_id)
+                        _cur.execute(
+                            f"UPDATE Transactions SET {', '.join(_sets)} WHERE Transactions_Id = %s",
+                            tuple(_vals),
+                        )
+                        _n += 1
+                # Clear caches after successful commit (get_db commits on exit)
+                st.session_state.pop(_orig_key, None)
+                st.session_state.pop(f"_search_editor_{query}", None)
+                for _k in ["df_accs", "register_df"]:
+                    st.session_state.pop(_k, None)
+                st.success(f"Saved {_n} transaction(s).")
+                st.rerun()
+            except Exception as _e:
+                st.error(f"Save failed: {_e}")
 
 
 @st.dialog("💰 Accounts Balance Overview", width="large")
@@ -682,7 +789,7 @@ def _multi_account_dialog() -> None:
     st.dataframe(
         df_display,
         hide_index=True,
-        use_container_width=True,
+        width='stretch',
         column_config={
             "name":     st.column_config.TextColumn("Account"),
             "type":     st.column_config.TextColumn("Type",     width="small"),
@@ -2062,9 +2169,8 @@ def render_register():
         _search_clicked = st.button("🔍", key="reg_search_btn",
                                     help="Search across all accounts",
                                     use_container_width=True)
-    if _search_clicked and _search_query.strip():
-        _search_dialog(_search_query)
-    elif _search_clicked:
+    _do_search = _search_clicked and _search_query.strip()
+    if _search_clicked and not _search_query.strip():
         st.toast("Please enter a search term first.", icon="⚠️")
 
     # 2. Check if the preference has changed to clear the cache
@@ -2132,12 +2238,15 @@ def render_register():
     df_cat_list  = st.session_state.df_cat_list
     
     acc_options = {
-        row['accounts_id']: f"{row['accounts_name']} ({row['accounts_balance']:,.2f})" 
+        row['accounts_id']: f"{row['accounts_name']} ({row['accounts_balance']:,.2f})"
         for _, row in df_accs.iterrows()
     }
     acc_ids_list = list(acc_options.keys())
     payee_options = df_payee_list.set_index('payees_id')['payees_name'].to_dict()
     payee_names = df_payee_list['payees_name'].tolist()
+
+    if _do_search:
+        _search_dialog(_search_query, payee_options, acc_options)
     cat_options = df_cat_list.set_index('categories_id')['full_path'].to_dict()
     sec_options = df_securities.set_index('securities_id')['securities_name'].to_dict()
     # Extended options dict that includes currency code for display in forms

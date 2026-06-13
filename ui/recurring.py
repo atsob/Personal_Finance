@@ -235,7 +235,7 @@ def _template_form(accounts: dict, payees: dict, categories: dict,
         edited_splits = st.data_editor(
             splits_df,
             num_rows="dynamic",
-            use_container_width=True,
+            width='stretch',
             key=f"{prefix}_splits",
             column_config={
                 'Category': st.column_config.SelectboxColumn(
@@ -385,7 +385,7 @@ def _render_templates_tab(accounts, payees, categories):
 
     st.dataframe(
         df_display,
-        use_container_width=True,
+        width='stretch',
         hide_index=True,
         column_config={
             'ID':           st.column_config.NumberColumn('ID', width='small'),
@@ -570,7 +570,7 @@ def _render_pending_tab(accounts: dict, payees: dict, categories: dict):
             edited_splits = st.data_editor(
                 pd.DataFrame(initial_splits),
                 num_rows="dynamic",
-                use_container_width=True,
+                width='stretch',
                 key=f"pd_splits_{tx_id}",
                 column_config={
                     'Category': st.column_config.SelectboxColumn(
@@ -680,7 +680,7 @@ def _render_history_tab():
     df_display.columns = ['ID','Date','Account','Payee','Description','Amount','Template','Periodicity']
     st.dataframe(
         df_display,
-        use_container_width=True,
+        width='stretch',
         hide_index=True,
         column_config={
             'ID':     st.column_config.NumberColumn('ID', width='small'),

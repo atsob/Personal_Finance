@@ -3439,7 +3439,7 @@ def _render_saxo_security_mapping(inv_records: list, sec_matches: dict) -> None:
                 }
                 for sym, sid in saved_ids.items()
             ]
-            st.dataframe(pd.DataFrame(_mapping_rows), hide_index=True, use_container_width=True)
+            st.dataframe(pd.DataFrame(_mapping_rows), hide_index=True, width='stretch')
 
             to_delete = st.multiselect(
                 "Remove mappings:", list(saved_ids.keys()), key="saxo_del_mappings"
@@ -3556,7 +3556,7 @@ def _render_saxo_pdf_security_mapping(
                 st.dataframe(
                     pd.DataFrame(_res_rows),
                     hide_index=True,
-                    use_container_width=True,
+                    width='stretch',
                 )
 
         # ── Unresolved instruments ─────────────────────────────────────────
@@ -3650,7 +3650,7 @@ def _render_saxo_pdf_security_mapping(
             st.dataframe(
                 pd.DataFrame(_mapping_rows),
                 hide_index=True,
-                use_container_width=True,
+                width='stretch',
             )
 
             to_delete = st.multiselect(
@@ -3750,7 +3750,7 @@ def _saxo_preview_with_status(
     st.dataframe(
         df_inv,
         hide_index=True,
-        use_container_width=True,
+        width='stretch',
         column_config={
             "status":          "Status",
             "date":            "Date",
@@ -4304,7 +4304,7 @@ app database) lasts ~1 year and is used to auto-renew without asking you to log 
             st.dataframe(
                 _cdf,
                 hide_index=True,
-                use_container_width=True,
+                width='stretch',
                 column_config={
                     "date":        "Date",
                     "charge_type": "Type",
@@ -4528,7 +4528,7 @@ app database) lasts ~1 year and is used to auto-renew without asking you to log 
                     st.dataframe(
                         _rdf,
                         hide_index=True,
-                        use_container_width=True,
+                        width='stretch',
                         column_config={
                             "status":         "Status",
                             "date":           "Date",
@@ -4686,7 +4686,7 @@ app database) lasts ~1 year and is used to auto-renew without asking you to log 
                                 "Trade ID", "Security", "Action", "Date",
                                 "Commission (EUR)", "Current Total", "New Total", "Status",
                             ],
-                            use_container_width=True,
+                            width='stretch',
                             key="saxo_comm_preview_editor",
                             hide_index=True,
                         )

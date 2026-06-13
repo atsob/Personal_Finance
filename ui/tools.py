@@ -1011,7 +1011,7 @@ def _render_stock_split():
             "action":      st.column_config.TextColumn("Action"),
         },
         hide_index=True,
-        use_container_width=True,
+        width='stretch',
     )
 
     st.divider()
@@ -1242,7 +1242,7 @@ def _render_investment_data_quality():
             "recommendations": st.column_config.TextColumn("💡 Recommendations", width="large"),
         },
         hide_index=True,
-        use_container_width=True,
+        width='stretch',
         key="ic_editor",
         num_rows="fixed",
     )
@@ -1708,7 +1708,7 @@ def _render_fix_missing_transfer_mirrors():
                 "candidate_amount","candidate_desc","transfers_id",
             ],
             hide_index=True,
-            use_container_width=True,
+            width='stretch',
             key="ul_mirror_editor",
         )
 
@@ -2713,7 +2713,7 @@ def _render_data_export():
             {"Sheet": k, "Rows": len(v), "Columns": len(v.columns)}
             for k, v in data.items()
         ]
-        st.dataframe(pd.DataFrame(summary_rows), hide_index=True, use_container_width=True)
+        st.dataframe(pd.DataFrame(summary_rows), hide_index=True, width='stretch')
 
 
 _CATEGORIES = {

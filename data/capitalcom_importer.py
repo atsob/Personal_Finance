@@ -643,7 +643,7 @@ def _render_cap_security_mapping(trades_df: pd.DataFrame) -> None:
                 {"Symbol": sym, "Mapped to": id_to_name.get(int(sid), f"id={sid}")}
                 for sym, sid in saved_ids.items()
             ]
-            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width='stretch')
 
             to_delete = st.multiselect(
                 "Remove mappings:", list(saved_ids.keys()), key="cap_del_mappings"

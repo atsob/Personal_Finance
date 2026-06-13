@@ -589,7 +589,7 @@ def render_custom_reports():
                     'account':    st.column_config.TextColumn('Account'),
                 },
                 hide_index=True,
-                use_container_width=True,
+                width='stretch',
             )
             copy_df_button(df_inv_show, key='dl_cr_inv_dd')
     else:
@@ -657,6 +657,8 @@ def render_custom_reports():
             _cats_changed  = not edited['category'].equals(df_edit['category'])
             _notes_changed = not edited['notes'].fillna('').equals(df_edit['notes'].fillna(''))
             _has_changes   = _cats_changed or _notes_changed
+
+            copy_df_button(df_edit.drop(columns=['splits_id']), key='dl_cr_txn_dd')
 
             if st.button('💾 Save Changes', key='cr_dd_save', disabled=not _has_changes):
                 changes, errors = 0, []
@@ -838,7 +840,7 @@ def render_investment_consistency_check():
             "recommendations": st.column_config.TextColumn("💡 Recommendations", width="large"),
         },
         hide_index=True,
-        use_container_width=True,
+        width='stretch',
         key="ic_editor",
         num_rows="fixed",
     )
@@ -2272,14 +2274,14 @@ def render_reports():
                         st.success(f"📈 Top {int(_perf_top_n)} Gainers")
                         st.dataframe(
                             _top[_display_cols], column_config=_col_cfg,
-                            hide_index=True, use_container_width=True,
+                            hide_index=True, width='stretch',
                         )
                         copy_df_button(_top, key="dl_rpt_top_perf")
                     with _lcol:
                         st.error(f"📉 Top {int(_perf_top_n)} Losers")
                         st.dataframe(
                             _bottom[_display_cols], column_config=_col_cfg,
-                            hide_index=True, use_container_width=True,
+                            hide_index=True, width='stretch',
                         )
                         copy_df_button(_bottom, key="dl_rpt_bot_perf")
 
@@ -2317,7 +2319,7 @@ def render_reports():
                         st.dataframe(
                             _all_ranked[["Rank"] + _display_cols],
                             column_config=_full_cfg,
-                            hide_index=True, use_container_width=True,
+                            hide_index=True, width='stretch',
                         )
                         copy_df_button(_all_ranked, key="dl_rpt_all_perf")
 
@@ -3837,7 +3839,7 @@ def _render_dividend_forecast():
     st.dataframe(
         df_rows[_tbl_cols].sort_values('annual_forecast_eur', ascending=False),
         hide_index=True,
-        use_container_width=True,
+        width='stretch',
         column_config={
             'securities_name':        st.column_config.TextColumn("Security"),
             'securities_type':        st.column_config.TextColumn("Type"),
@@ -3893,7 +3895,7 @@ def _render_dividend_forecast():
             st.dataframe(
                 df_up,
                 hide_index=True,
-                use_container_width=True,
+                width='stretch',
                 column_config={
                     'ex_date':         st.column_config.DateColumn("Ex-Date",        format="DD/MM/YYYY",
                                            help="Must hold shares before this date to receive the dividend."),
@@ -4557,7 +4559,7 @@ def render_asset_allocation():
                     color_negative_red, subset=['suggested_delta_eur', 'type_delta_pct']
                 ),
                 hide_index=True,
-                use_container_width=True,
+                width='stretch',
                 column_config={
                     'trade_action':       st.column_config.TextColumn('Action'),
                     'securities_name':    st.column_config.TextColumn('Security'),

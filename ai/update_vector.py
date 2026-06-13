@@ -114,7 +114,7 @@ def update_embeddings(table_name, text_template, id_col, conn, cur):
                         CAST(t.quantity AS DECIMAL(25,8)) as quantity,
                         CAST(t.price_per_share AS DECIMAL(15,2)) as price,
                         CAST(t.commission AS DECIMAL(15,2)) as commission,
-                        CAST(t.total_amount AS DECIMAL(15,2)) as total_amount,
+                        CAST(t.total_amount_acccur AS DECIMAL(15,2)) as total_amount,
                         c.Currencies_ShortName
                 FROM	Investments t
                 JOIN    Accounts a ON t.accounts_id = a.accounts_id
