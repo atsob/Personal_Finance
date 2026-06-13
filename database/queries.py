@@ -1137,6 +1137,30 @@ def get_portfolio_signals(selected_acc_id=None): # Προσθήκη '=' εδώ
             WHERE Date < date_trunc('year', CURRENT_DATE)
             ORDER BY Securities_Id, Date DESC
         ),
+        -- 3-year High/Low using only prices dated AFTER the most recent
+        -- Split/Reverse Split for that security (if one exists in the window).
+        -- This avoids mixing pre- and post-split prices when the data provider
+        -- has not retroactively adjusted historical quotes.
+        -- When no split exists in the window, all 3 years of prices are used.
+        last_split_in_window AS (
+            SELECT Securities_Id,
+                   MAX(Effective_Date) AS split_date
+              FROM Corporate_Actions
+             WHERE Action_Type IN ('Split', 'Reverse Split')
+               AND Effective_Date >= (CURRENT_DATE - INTERVAL '3 years')
+               AND Effective_Date <= CURRENT_DATE
+             GROUP BY Securities_Id
+        ),
+        range_3y AS (
+            SELECT hp.Securities_Id,
+                   ROUND(MAX(hp.Close)::numeric, 4) AS high_3y,
+                   ROUND(MIN(hp.Close)::numeric, 4) AS low_3y
+              FROM Historical_Prices hp
+              LEFT JOIN last_split_in_window ls ON ls.Securities_Id = hp.Securities_Id
+             WHERE hp.Date >= (CURRENT_DATE - INTERVAL '3 years')
+               AND hp.Date >= COALESCE(ls.split_date, (CURRENT_DATE - INTERVAL '3 years'))
+             GROUP BY hp.Securities_Id
+        ),
         latest_only AS (
             SELECT rp.*, yp.price_ytd_start 
             FROM ranked_prices rp
@@ -1200,6 +1224,10 @@ def get_portfolio_signals(selected_acc_id=None): # Προσθήκη '=' εδώ
                 sec.Analyst_Rating as wall_street_view,
                 sec.Analyst_Target_Price as target_price,
                 ROUND((((sec.Analyst_Target_Price / NULLIF(sig.price_today, 0)) - 1) * 100)::numeric, 2) as upside_pct,
+                r3.high_3y,
+                r3.low_3y,
+                ROUND((((sig.price_today / NULLIF(r3.high_3y, 0)) - 1) * 100)::numeric, 2) as pct_from_high_3y,
+                ROUND((((sig.price_today / NULLIF(r3.low_3y,  0)) - 1) * 100)::numeric, 2) as pct_from_low_3y,
                 CASE 
                     WHEN current_qty > 0 AND (sharpe_ratio < 0 OR quality_score < -5) THEN '🔴 SELL / REDUCE'
                     WHEN sharpe_ratio > 1.2 AND quality_score > 10 THEN '🟢 STRONG BUY'
@@ -1210,6 +1238,7 @@ def get_portfolio_signals(selected_acc_id=None): # Προσθήκη '=' εδώ
                 END as recommendation_signal
             FROM portfolio_status sig
             JOIN Securities sec ON sig.Securities_Id = sec.Securities_Id
+            LEFT JOIN range_3y r3 ON r3.Securities_Id = sig.Securities_Id
         )
         SELECT *,
             CASE

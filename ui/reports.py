@@ -2637,27 +2637,45 @@ def render_reports():
                 except (TypeError, ValueError):
                     return ''
 
-            _display_cols = ['final_signal', 'recommendation_signal', 'wall_street_view', 'securities_name', 'current_value_eur', 'unrealized_pnl_eur', 'sharpe_ratio', 'quality_score', 'price_today', 'upside_pct', 'target_price']
+            # P&L % = unrealized P&L / cost basis
+            if "total_cost_eur" in df_rec.columns:
+                df_rec["pnl_pct"] = (
+                    df_rec["unrealized_pnl_eur"] /
+                    df_rec["total_cost_eur"].replace(0, float("nan"))
+                ) * 100
+            else:
+                df_rec["pnl_pct"] = float("nan")
+
+            _display_cols = [
+                'securities_name',
+                'final_signal', 'recommendation_signal', 'wall_street_view',
+                'current_value_eur', 'unrealized_pnl_eur', 'pnl_pct',
+                'sharpe_ratio', 'quality_score',
+                'price_today', 'high_3y', 'pct_from_high_3y', 'low_3y', 'pct_from_low_3y',
+                'upside_pct', 'target_price',
+            ]
+            _style_df = df_rec[[c for c in _display_cols if c in df_rec.columns]].copy()
             st.dataframe(
-                df_rec[_display_cols].style
-                    .map(color_rec, subset=['recommendation_signal', 'final_signal'])
-                    .map(color_pnl, subset=['unrealized_pnl_eur']),
+                _style_df.style
+                    .map(color_rec,  subset=[c for c in ['recommendation_signal', 'final_signal'] if c in _style_df.columns])
+                    .map(color_pnl,  subset=[c for c in ['unrealized_pnl_eur', 'pnl_pct']        if c in _style_df.columns]),
                 column_config={
-                    "final_signal": st.column_config.TextColumn("Final Signal", help="Conviction signals appear when our math matches Analyst views"),
+                    "securities_name":    st.column_config.TextColumn("Security",     width="medium", pinned=True),
+                    "final_signal":       st.column_config.TextColumn("Final Signal", help="Conviction signals appear when our math matches Analyst views"),
                     "recommendation_signal": "Math Signal",
-                    "wall_street_view": st.column_config.TextColumn("Analyst View"),
-                    "securities_name": st.column_config.TextColumn("Security", width="medium"),
-                    "current_value_eur": st.column_config.NumberColumn("Value", format="%,.2f €", width="small"),
-                    "unrealized_pnl_eur": st.column_config.NumberColumn("Unreal. P&L", format="%,.2f €", help="Unrealized P&L in EUR (market value minus FIFO cost basis)"),
-                    "sharpe_ratio": st.column_config.NumberColumn("Sharpe", format="%.2f"),
-                    "quality_score": st.column_config.NumberColumn("Quality", format="%.2f"),
-                    "price_today": st.column_config.NumberColumn("Current Price", format="%.2f"),
-                    "upside_pct": st.column_config.NumberColumn(
-                        "Upside %",
-                        help="Analyst Target Price vs Current Price",
-                        format="%.2f%%"
-                    ),
-                    "target_price": st.column_config.NumberColumn("Target Price", format="%.2f"),
+                    "wall_street_view":   st.column_config.TextColumn("Analyst View"),
+                    "current_value_eur":  st.column_config.NumberColumn("Value",       format="%,.2f €", width="small"),
+                    "unrealized_pnl_eur": st.column_config.NumberColumn("Unreal. P&L", format="%+,.2f €", help="Unrealized P&L in EUR (market value minus FIFO cost basis)"),
+                    "pnl_pct":            st.column_config.NumberColumn("P&L %",       format="%+.2f%%",  help="Unrealized P&L as % of cost basis"),
+                    "sharpe_ratio":       st.column_config.NumberColumn("Sharpe",      format="%.2f"),
+                    "quality_score":      st.column_config.NumberColumn("Quality",     format="%.2f"),
+                    "price_today":        st.column_config.NumberColumn("Current Price", format="%.4f"),
+                    "high_3y":            st.column_config.NumberColumn("3Y High",     format="%.4f", help="Highest price in last 3 years (post-split prices only)"),
+                    "pct_from_high_3y":   st.column_config.NumberColumn("% from High", format="%+.2f%%", help="Current price vs 3-year high"),
+                    "low_3y":             st.column_config.NumberColumn("3Y Low",      format="%.4f", help="Lowest price in last 3 years (post-split prices only)"),
+                    "pct_from_low_3y":    st.column_config.NumberColumn("% from Low",  format="%+.2f%%", help="Current price vs 3-year low"),
+                    "upside_pct":         st.column_config.NumberColumn("Upside %",    format="%+.2f%%", help="Analyst Target Price vs Current Price"),
+                    "target_price":       st.column_config.NumberColumn("Target Price", format="%.2f"),
                 },
                 hide_index=True,
                 width='stretch'

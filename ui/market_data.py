@@ -972,32 +972,221 @@ def render_market_data():
             with st_corp:
                 st.subheader("🏢 Corporate Actions")
 
-                # ── History ───────────────────────────────────────────────────
+                # ── History (editable) ────────────────────────────────────────
                 df_ca = get_corporate_actions(inv_sec_id)
                 if df_ca.empty:
                     st.info("No corporate actions recorded for this security yet.")
                 else:
-                    st.markdown(f"**{len(df_ca)}** corporate action(s) on record:")
-                    df_ca_disp = df_ca.copy()
-                    df_ca_disp["effective_date"] = pd.to_datetime(df_ca_disp["effective_date"]).dt.strftime("%Y-%m-%d")
-                    df_ca_disp["created_at"] = pd.to_datetime(df_ca_disp["created_at"]).dt.strftime("%Y-%m-%d %H:%M")
-                    df_ca_disp["ratio"] = df_ca_disp.apply(
-                        lambda r: f"{r['ratio_new']:.4g} : {r['ratio_old']:.4g}"
-                        if r["ratio_new"] is not None else "",
-                        axis=1,
-                    )
-                    st.dataframe(
-                        df_ca_disp[["effective_date", "action_type", "ratio", "description", "created_at"]],
-                        column_config={
-                            "effective_date": st.column_config.TextColumn("Date",        width="small"),
-                            "action_type":   st.column_config.TextColumn("Type",         width="small"),
-                            "ratio":         st.column_config.TextColumn("Ratio",        width="small"),
-                            "description":   st.column_config.TextColumn("Description"),
-                            "created_at":    st.column_config.TextColumn("Recorded At",  width="medium"),
-                        },
+                    st.markdown(f"**{len(df_ca)}** corporate action(s) on record — edit inline then click **Save**, or delete individual rows:")
+                    _ca_types = ['Split', 'Reverse Split', 'Merger', 'Acquisition', 'Spinoff',
+                                 'Rights Issue', 'Name Change', 'Delisting', 'Other', 'Default', 'Dividend']
+                    df_ca_edit = df_ca.copy()
+                    df_ca_edit["effective_date"] = pd.to_datetime(df_ca_edit["effective_date"]).dt.date
+                    _ca_orig_key = f"ca_orig_{inv_sec_id}"
+                    if _ca_orig_key not in st.session_state:
+                        st.session_state[_ca_orig_key] = df_ca_edit.copy()
+                    df_ca_orig = st.session_state[_ca_orig_key]
+
+                    edited_ca = st.data_editor(
+                        df_ca_orig,
                         hide_index=True,
                         width='stretch',
+                        key=f"ca_editor_{inv_sec_id}",
+                        column_config={
+                            "id":             st.column_config.NumberColumn("ID",          width="small",  disabled=True),
+                            "action_type":    st.column_config.SelectboxColumn("Type",     width="small",  options=_ca_types),
+                            "effective_date": st.column_config.DateColumn("Date",          width="small",  format="YYYY-MM-DD"),
+                            "ratio_new":      st.column_config.NumberColumn("Ratio New",   width="small",  format="%.4g"),
+                            "ratio_old":      st.column_config.NumberColumn("Ratio Old",   width="small",  format="%.4g"),
+                            "description":    st.column_config.TextColumn("Description"),
+                            "created_at":     st.column_config.TextColumn("Recorded At",   width="medium", disabled=True),
+                        },
+                        column_order=["id", "effective_date", "action_type", "ratio_new", "ratio_old", "description", "created_at"],
                     )
+
+                    def _linked_inv_count(cur, ca_id: int, sec_id: int, eff_date, desc: str) -> int:
+                        """Count ShrIn/ShrOut investment rows that were created by this corporate action."""
+                        cur.execute(
+                            """SELECT COUNT(*) FROM Investments
+                                WHERE Securities_Id = %s
+                                  AND Date          = %s
+                                  AND Action        IN ('ShrIn', 'ShrOut')
+                                  AND Description   = %s""",
+                            (sec_id, eff_date, desc),
+                        )
+                        return cur.fetchone()[0]
+
+                    _ca_changed = not edited_ca[["action_type","effective_date","ratio_new","ratio_old","description"]].equals(
+                        df_ca_orig[["action_type","effective_date","ratio_new","ratio_old","description"]]
+                    )
+                    if _ca_changed:
+                        if st.button("💾 Save Changes", key=f"ca_save_{inv_sec_id}", type="primary"):
+                            try:
+                                from database.connection import get_db as _get_db
+                                with _get_db() as _conn:
+                                    _cur = _conn.cursor()
+                                    inv_updates = 0
+                                    for _, row in edited_ca.iterrows():
+                                        orig_rows = df_ca_orig[df_ca_orig["id"] == row["id"]]
+                                        if orig_rows.empty:
+                                            continue
+                                        orig = orig_rows.iloc[0]
+                                        date_changed = row["effective_date"] != orig["effective_date"]
+                                        desc_changed = str(row["description"]) != str(orig["description"])
+                                        if (row["action_type"]   != orig["action_type"] or
+                                            date_changed or
+                                            str(row["ratio_new"]) != str(orig["ratio_new"]) or
+                                            str(row["ratio_old"]) != str(orig["ratio_old"]) or
+                                            desc_changed):
+                                            _cur.execute(
+                                                """UPDATE Corporate_Actions
+                                                      SET Action_Type    = %s::corporate_action_type,
+                                                          Effective_Date = %s,
+                                                          Ratio_New      = %s,
+                                                          Ratio_Old      = %s,
+                                                          Description    = %s
+                                                    WHERE Corporate_Actions_Id = %s""",
+                                                (row["action_type"], row["effective_date"],
+                                                 row["ratio_new"] if pd.notna(row["ratio_new"]) else None,
+                                                 row["ratio_old"] if pd.notna(row["ratio_old"]) else None,
+                                                 row["description"] if pd.notna(row["description"]) else None,
+                                                 int(row["id"])),
+                                            )
+                                            # Sync linked ShrIn/ShrOut investment rows
+                                            new_desc = row["description"] if pd.notna(row["description"]) else orig["description"]
+                                            ratio_changed = (
+                                                str(row["ratio_new"]) != str(orig["ratio_new"]) or
+                                                str(row["ratio_old"]) != str(orig["ratio_old"])
+                                            )
+                                            is_split_type = row["action_type"] in ("Split", "Reverse Split")
+
+                                            if date_changed or desc_changed or ratio_changed:
+                                                # Fetch the linked rows so we know which accounts are affected
+                                                _cur.execute(
+                                                    """SELECT i.Investments_Id, i.Accounts_Id, i.Action, i.Quantity
+                                                         FROM Investments i
+                                                        WHERE i.Securities_Id = %s
+                                                          AND i.Date          = %s
+                                                          AND i.Action        IN ('ShrIn', 'ShrOut')
+                                                          AND i.Description   = %s""",
+                                                    (inv_sec_id, orig["effective_date"], orig["description"]),
+                                                )
+                                                linked_rows = _cur.fetchall()
+
+                                                for inv_id, acct_id, action, old_qty in linked_rows:
+                                                    new_qty = old_qty  # default: no change
+
+                                                    if ratio_changed and is_split_type and pd.notna(row["ratio_new"]) and pd.notna(row["ratio_old"]) and float(row["ratio_old"]) != 0:
+                                                        new_ratio = float(row["ratio_new"]) / float(row["ratio_old"])
+                                                        # Recompute pre-split holdings for this account
+                                                        _cur.execute(
+                                                            """SELECT COALESCE(SUM(
+                                                                   CASE WHEN Action IN ('Buy','Reinvest','ShrIn') THEN  Quantity
+                                                                        WHEN Action IN ('Sell','ShrOut')          THEN -Quantity
+                                                                        ELSE 0 END), 0)
+                                                                 FROM Investments
+                                                                WHERE Securities_Id = %s
+                                                                  AND Accounts_Id   = %s
+                                                                  AND Date          < %s
+                                                                  AND Action        IN ('Buy','Sell','Reinvest','ShrIn','ShrOut')""",
+                                                            (inv_sec_id, acct_id, orig["effective_date"]),
+                                                        )
+                                                        pre_qty = float(_cur.fetchone()[0])
+
+                                                        if new_ratio >= 1:   # forward split → ShrIn
+                                                            new_qty = round(pre_qty * (new_ratio - 1), 10)
+                                                        else:                # reverse split → ShrOut
+                                                            new_qty = round(pre_qty * (1 - new_ratio), 10)
+
+                                                    new_action = action
+                                                    if ratio_changed and is_split_type and pd.notna(row["ratio_new"]) and pd.notna(row["ratio_old"]):
+                                                        new_action = "ShrIn" if float(row["ratio_new"]) >= float(row["ratio_old"]) else "ShrOut"
+
+                                                    _cur.execute(
+                                                        """UPDATE Investments
+                                                              SET Date        = %s,
+                                                                  Description = %s,
+                                                                  Quantity    = %s,
+                                                                  Action      = %s
+                                                            WHERE Investments_Id = %s""",
+                                                        (row["effective_date"], new_desc,
+                                                         abs(new_qty), new_action, inv_id),
+                                                    )
+                                                    inv_updates += 1
+
+                                if inv_updates:
+                                    from database.crud import update_holdings
+                                    update_holdings()
+                                st.session_state.pop(_ca_orig_key, None)
+                                st.session_state.pop(f"ca_editor_{inv_sec_id}", None)
+                                msg = "Corporate actions updated."
+                                if inv_updates:
+                                    msg += f" {inv_updates} linked investment row(s) also updated (quantity, date, description, action)."
+                                st.success(msg)
+                                st.rerun()
+                            except Exception as _e:
+                                st.error(f"Save failed: {_e}")
+
+                    st.markdown("**Delete a corporate action:**")
+                    _del_options = {
+                        row["id"]: f"#{row['id']} — {row['effective_date']} {row['action_type']} {row.get('description','') or ''}"
+                        for _, row in df_ca.iterrows()
+                    }
+                    _del_id = st.selectbox("Select to delete", options=[None] + list(_del_options.keys()),
+                                           format_func=lambda x: "— choose —" if x is None else _del_options[x],
+                                           key=f"ca_del_sel_{inv_sec_id}")
+                    if _del_id is not None:
+                        # Count linked investment rows so we can warn before deleting
+                        _del_row = df_ca[df_ca["id"] == _del_id].iloc[0]
+                        from database.connection import get_db as _get_db
+                        with _get_db() as _chk_conn:
+                            _chk_cur = _chk_conn.cursor()
+                            _linked_n = _linked_inv_count(
+                                _chk_cur, int(_del_id), inv_sec_id,
+                                _del_row["effective_date"], str(_del_row["description"] or ""),
+                            )
+                        if _linked_n:
+                            st.warning(
+                                f"⚠️ This corporate action has **{_linked_n} linked investment "
+                                f"row(s)** (ShrIn/ShrOut on {_del_row['effective_date']}). "
+                                "Deleting will also remove those investment entries and recalculate holdings."
+                            )
+                        _del_confirm = st.checkbox(
+                            f"Confirm deletion of corporate action #{_del_id}" +
+                            (f" and its {_linked_n} investment row(s)" if _linked_n else ""),
+                            key=f"ca_del_confirm_{inv_sec_id}_{_del_id}",
+                        )
+                        if st.button("🗑️ Delete", key=f"ca_del_btn_{inv_sec_id}",
+                                     type="secondary", disabled=not _del_confirm):
+                            try:
+                                with _get_db() as _conn:
+                                    _cur = _conn.cursor()
+                                    if _linked_n:
+                                        _cur.execute(
+                                            """DELETE FROM Investments
+                                                WHERE Securities_Id = %s
+                                                  AND Date          = %s
+                                                  AND Action        IN ('ShrIn', 'ShrOut')
+                                                  AND Description   = %s""",
+                                            (inv_sec_id, _del_row["effective_date"],
+                                             str(_del_row["description"] or "")),
+                                        )
+                                    _cur.execute(
+                                        "DELETE FROM Corporate_Actions WHERE Corporate_Actions_Id = %s",
+                                        (int(_del_id),),
+                                    )
+                                if _linked_n:
+                                    from database.crud import update_holdings
+                                    update_holdings()
+                                st.session_state.pop(_ca_orig_key, None)
+                                st.session_state.pop(f"ca_editor_{inv_sec_id}", None)
+                                st.success(
+                                    f"Corporate action #{_del_id} deleted" +
+                                    (f" along with {_linked_n} investment row(s). Holdings recalculated." if _linked_n else ".")
+                                )
+                                st.rerun()
+                            except Exception as _e:
+                                st.error(f"Delete failed: {_e}")
                 st.divider()
 
                 # ── Event type selector ───────────────────────────────────────
@@ -1071,10 +1260,37 @@ def render_market_data():
                     if f"corp_preview_df_{inv_sec_id}" in st.session_state:
                         df_prev = st.session_state[f"corp_preview_df_{inv_sec_id}"].copy()
                         if df_prev.empty:
-                            st.warning(
-                                "No holdings found for this security before the selected date "
-                                "in the chosen accounts."
+                            st.info(
+                                "No current holdings found for this security — no ShrIn/ShrOut "
+                                "entries will be created. The event will still be recorded in "
+                                "Corporate Actions so that split-adjusted price history works correctly."
                             )
+                            st.divider()
+                            confirmed_no_hold = st.checkbox(
+                                "Record this split/reverse split event with no holdings adjustment",
+                                key=f"corp_confirm_nohold_{inv_sec_id}",
+                            )
+                            if st.button(
+                                "Apply", type="primary",
+                                key=f"corp_apply_nohold_{inv_sec_id}",
+                                disabled=not confirmed_no_hold,
+                            ):
+                                try:
+                                    n = apply_stock_split(
+                                        securities_id=inv_sec_id,
+                                        split_date=split_date,
+                                        new_shares=new_shares,
+                                        old_shares=old_shares,
+                                        holdings_by_account=[],
+                                        description=description.strip(),
+                                    )
+                                    st.success(
+                                        "Corporate Action recorded (0 investment rows — no holdings to adjust)."
+                                    )
+                                    st.session_state.pop(f"corp_preview_df_{inv_sec_id}", None)
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Error recording split: {e}")
                         else:
                             if is_forward:
                                 df_prev["delta_qty"] = (df_prev["current_qty"] * (ratio - 1)).round(6)
